@@ -1,0 +1,15 @@
+# Configuración de vampus (https://github.com/atareao/vampus) para podpot.
+#
+# ⚠️ El esquema REAL de vampus es `current_version` + `replaces` (fichero + patrón
+# regex con el marcador `{{current_version}}`). NO admite `commit`/`tag`/`files`:
+# los campos desconocidos se ignoran y, sin `replaces`, vampus buscaría el
+# `Cargo.toml` de la RAÍZ (que aquí no existe) y no actualizaría nada. El commit
+# y el tag de la release los hace `.github/workflows/release.yml`, no vampus.
+#
+# La versión de la app vive en `backend/Cargo.toml`. `frontend/package.json` está
+# en 0.0.0 a propósito y NO se versiona aquí.
+
+current_version: 0.1.0
+replaces:
+  - file: backend/Cargo.toml
+    pattern: ^version\s*=\s*"{{current_version}}"$

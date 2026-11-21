@@ -1,0 +1,108 @@
+name: CI
+
+# Checks de PR: es exactamente lo que corre `just check-all` en local, partido en
+# dos jobs que van en PARALELO (no hay workspace Cargo en la raíz: el backend es
+# su propio crate en `backend/` y el panel es otra pieza en `frontend/`).
+#
+#   * backend  → `just check`   (fmt → clippy → test)   en backend/
+#   * frontend → `just ui-check` (typecheck → typecheck:test → lint → test → build)
+#
+# `gf-merge` exige `gh pr checks` en verde antes de fusionar; estos son los
+# checks que lo alimentan.
+
+on:
+  pull_request:
+    branches: [main, development]
+  push:
+    branches: [development]
+
+permissions:
+  contents: read
+
+# Un push nuevo al mismo PR cancela el run anterior.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  backend:
+    name: Backend (fmt, clippy, test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (rustfmt + clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets -- -D warnings
+
+      # `backend/tests/systemd_real.rs` se salta solo si no hay bus de usuario:
+      # en el runner no lo hay, así que sus pruebas se ignoran. Es lo esperado.
+      - name: Test
+        run: cargo test
+
+  frontend:
+    name: Frontend (typecheck, lint, test, build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      # Node 24, el mismo que fija la etapa `ui-builder` del Containerfile.
+      # Sin `cache:` aquí: la cache de pnpm necesita el binario `pnpm` ya
+      # instalado, y eso ocurre en el paso siguiente (corepack).
+      - name: Setup Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      # pnpm 12 por corepack, igual que el Containerfile. No se usa
+      # `pnpm/action-setup`: corepack es la fuente única de la versión.
+      - name: Enable pnpm 12 (corepack)
+        run: |
+          corepack enable
+          corepack prepare pnpm@12 --activate
+          pnpm --version
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Los pasos del panel en el MISMO orden que `just ui-check` (y que la
+      # receta `ui-check` del .justfile). Los scripts viven en
+      # frontend/package.json, que es la fuente única: aquí no se invoca `tsc`
+      # ni `vite` a mano.
+      - name: Type-check
+        run: pnpm run typecheck
+
+      - name: Type-check tests
+        run: pnpm run typecheck:test
+
+      - name: Lint
+        run: pnpm run lint
+
+      - name: Test
+        run: pnpm run test
+
+      - name: Build
+        run: pnpm run build

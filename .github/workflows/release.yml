@@ -1,0 +1,200 @@
+name: Release
+
+# Un merge a `main` es una release. Al fusionar el PR `development` → `main`,
+# este workflow, en un solo run:
+#
+#   prepare → sube la versión, actualiza CHANGELOG.md, commitea `chore: release`,
+#             etiqueta `vX.Y.Z`, empuja main+tag y resincroniza `development`.
+#   image   → construye y publica la imagen en ghcr.io (tags X.Y.Z y latest).
+#   release → abre la GitHub Release.
+#
+# ⚠️ El build de la imagen va EN ESTE MISMO workflow, no en uno aparte disparado
+# por tag: un tag empujado con el `GITHUB_TOKEN` por defecto **no** dispara otro
+# workflow (limitación de GitHub). Por eso `image`/`release` van aquí, tras
+# `prepare`, y no en un `on: push: tags`.
+#
+# La guarda `chore: release` evita el bucle: el commit que `prepare` empuja a
+# `main` NO vuelve a disparar esta release.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare:
+    name: Prepare (bump, changelog, tag)
+    # No re-disparar la release con el propio commit de release.
+    if: "!startsWith(github.event.head_commit.message, 'chore: release')"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      # Historial completo: lo necesitan `git describe` (último tag), git-cliff
+      # (changelog) y el push del tag.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      # Bump según los conventional commits desde el último tag:
+      #   * `BREAKING CHANGE` o `!:`  → major
+      #   * `feat(...)`/`feat:`        → minor
+      #   * cualquier otro             → patch
+      # El regex busca el tipo en cualquier posición del asunto porque los
+      # mensajes llevan el emoji de gitmoji delante (`✨ feat(units): ...`).
+      - name: Determine bump
+        id: bump
+        run: |
+          set -euo pipefail
+          range="HEAD"
+          last_tag="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+          if [ -n "${last_tag}" ]; then
+            range="${last_tag}..HEAD"
+          fi
+          echo "Rango de commits: ${range}"
+
+          subjects="$(git log --format='%s' "${range}")"
+          bodies="$(git log --format='%B' "${range}")"
+
+          if printf '%s\n' "${bodies}" | grep -qE 'BREAKING[ -]CHANGE' \
+             || printf '%s\n' "${subjects}" | grep -qE '!:'; then
+            bump="major"
+          elif printf '%s\n' "${subjects}" | grep -qE 'feat(\([^)]*\))?!?:'; then
+            bump="minor"
+          else
+            bump="patch"
+          fi
+
+          echo "Bump decidido: ${bump}"
+          echo "bump=${bump}" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
+
+      # vampus lee `.vampus.yml` y reescribe la versión en `backend/Cargo.toml`.
+      # Desde el repo (no crates.io): es el proyecto propio y va por delante.
+      - name: Install vampus
+        run: cargo install vampus --git https://github.com/atareao/vampus
+
+      - name: Bump version
+        run: vampus upgrade --${{ steps.bump.outputs.bump }}
+
+      # `vampus` reescribe Cargo.toml pero no el lockfile. Sin refrescar la
+      # entrada de `podpot` en Cargo.lock, el `--locked` del Containerfile
+      # fallaría al construir la imagen (la versión del crate ya no cuadra).
+      # `-p podpot` toca SOLO esa entrada: no arrastra el resto de dependencias.
+      - name: Refresh Cargo.lock
+        run: cargo update --manifest-path backend/Cargo.toml -p podpot
+
+      - name: Read new version
+        id: version
+        run: |
+          set -euo pipefail
+          version="$(grep -m1 '^version' backend/Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          echo "Nueva versión: ${version}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Install git-cliff
+        uses: taiki-e/install-action@v2
+        with:
+          tool: git-cliff
+
+      # `--tag` marca los commits aún sin etiquetar como la versión nueva, para
+      # que aparezcan bajo su propia sección y no como `[unreleased]`.
+      - name: Generate CHANGELOG.md
+        run: git-cliff --tag "v${{ steps.version.outputs.version }}" -o CHANGELOG.md
+
+      - name: Commit and tag
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          git add -A
+          git commit -m "chore: release v${version}"
+          # Tag ANOTADO a propósito: `git push --follow-tags` solo empuja tags
+          # anotados, no los ligeros.
+          git tag -a "v${version}" -m "Release v${version}"
+
+      - name: Push main and tag
+        run: git push origin main --follow-tags
+
+      # Deja `development` al día con lo ya liberado. El merge puede fallar por
+      # conflicto; en ese caso se avisa y NO se tumba la release (ya publicada).
+      - name: Sync development with main
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          git fetch origin
+          if git checkout development 2>/dev/null; then
+            if git merge --no-edit origin/main; then
+              git push origin development
+              echo "development sincronizada con main."
+            else
+              git merge --abort || true
+              echo "::warning::No se pudo sincronizar development con main (conflicto). Resuélvelo a mano."
+            fi
+          else
+            echo "::warning::La rama development no existe en el remoto; nada que sincronizar."
+          fi
+
+  image:
+    name: Image (ghcr.io)
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # `file: ./Containerfile` es obligatorio: el valor por defecto de la
+      # acción es `Dockerfile` y aquí el fichero se llama `Containerfile`.
+      # `${{ github.repository }}` resuelve a `atareao/podpot`.
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Containerfile
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ needs.prepare.outputs.version }}
+            ghcr.io/${{ github.repository }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  release:
+    name: GitHub Release
+    needs: [prepare, image]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: podpot ${{ needs.prepare.outputs.tag }}
+          generate_release_notes: true
