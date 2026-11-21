@@ -10,6 +10,7 @@
 
 pub mod auth;
 pub mod health;
+pub mod logs;
 pub mod quadlets;
 pub mod response;
 pub mod stream;
@@ -70,6 +71,10 @@ pub fn router(state: AppState) -> Router {
         // deja claro que son dos recursos distintos. El SSE queda protegido por el
         // mismo *gate* que el resto: no hay ninguna excepción en el router.
         .route("/units/stream", get(stream::stream))
+        // El canal de logs de una unidad: cuatro segmentos, así que no se confunde
+        // con la acción —tres—. Cuelga de la mitad de negocio y por eso el *gate*
+        // lo cubre sin ninguna excepción, igual que el canal en vivo.
+        .route("/units/{name}/logs/stream", get(logs::stream))
         .route("/units/{name}/{action}", post(units::accionar))
         .route("/quadlets", post(quadlets::crear))
         .route(

@@ -26,6 +26,7 @@ pub mod db;
 pub mod error;
 pub mod fanout;
 pub mod quadlet;
+pub mod registros;
 pub mod secret;
 pub mod server;
 pub mod state;

@@ -7,6 +7,7 @@ import { TablaDeUnidades } from './TablaDeUnidades'
 function tabla(unidades: Parameters<typeof TablaDeUnidades>[0]['unidades']) {
   const onAccion = vi.fn()
   const onEditar = vi.fn()
+  const onVerRegistros = vi.fn()
   const onBorrar = vi.fn()
   render(
     <TablaDeUnidades
@@ -14,10 +15,11 @@ function tabla(unidades: Parameters<typeof TablaDeUnidades>[0]['unidades']) {
       cargando={false}
       onAccion={onAccion}
       onEditar={onEditar}
+      onVerRegistros={onVerRegistros}
       onBorrar={onBorrar}
     />,
   )
-  return { onAccion, onEditar, onBorrar }
+  return { onAccion, onEditar, onVerRegistros, onBorrar }
 }
 
 describe('TablaDeUnidades', () => {
@@ -28,6 +30,7 @@ describe('TablaDeUnidades', () => {
         cargando={false}
         onAccion={vi.fn()}
         onEditar={vi.fn()}
+        onVerRegistros={vi.fn()}
         onBorrar={vi.fn()}
       />,
     )
@@ -90,6 +93,7 @@ describe('TablaDeUnidades', () => {
         enCurso="web.service"
         onAccion={vi.fn()}
         onEditar={vi.fn()}
+        onVerRegistros={vi.fn()}
         onBorrar={vi.fn()}
       />,
     )
@@ -105,6 +109,7 @@ describe('TablaDeUnidades', () => {
         cargando={false}
         onAccion={vi.fn()}
         onEditar={vi.fn()}
+        onVerRegistros={vi.fn()}
         onBorrar={vi.fn()}
       />,
     )
@@ -119,6 +124,15 @@ describe('TablaDeUnidades', () => {
     await usuario.click(screen.getByRole('button', { name: 'Editar web.service' }))
 
     expect(onEditar).toHaveBeenCalledWith(expect.objectContaining({ name: 'web.service' }))
+  })
+
+  it('emite la apertura del visor de logs de una fila con su unidad', async () => {
+    const usuario = userEvent.setup()
+    const { onVerRegistros } = tabla([unidad({ name: 'web.service' })])
+
+    await usuario.click(screen.getByRole('button', { name: 'Logs web.service' }))
+
+    expect(onVerRegistros).toHaveBeenCalledWith(expect.objectContaining({ name: 'web.service' }))
   })
 
   it('pide confirmación antes de borrar: no emite nada hasta confirmar', async () => {

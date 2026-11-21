@@ -120,6 +120,25 @@ export type QuadletDetalle = PeticionDeCreacion
 /** Acciones de control admitidas por la API. */
 export type AccionDeUnidad = 'start' | 'stop' | 'restart'
 
+// ─── Registros (logs) ────────────────────────────────────────────────────────
+
+/** Origen de una línea de registro: salida estándar o error estándar. */
+export type OrigenDeRegistro = 'stdout' | 'stderr'
+
+/**
+ * Una línea de registro del contenedor de una quadlet.
+ *
+ * Es el `data` del evento `log` del canal
+ * `GET /api/v1/units/{name}/logs/stream`: cada evento llega envuelto como
+ * `{data: {line, stream}}`, así que esto es lo que devuelve `desenvolver`.
+ */
+export interface LineaDeRegistro {
+  /** La línea, sin el salto final. */
+  line: string
+  /** De qué salida procede. */
+  stream: OrigenDeRegistro
+}
+
 /** Resultado de una acción de control. */
 export interface ResultadoDeAccion {
   name: string

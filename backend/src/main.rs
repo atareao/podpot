@@ -11,6 +11,7 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, watch};
 
 use podpot::config::{Config, DEFAULT_LOG_FILTER, SystemdBackend};
+use podpot::registros::podman::PodmanRegistros;
 use podpot::state::{AppState, CAPACIDAD_DE_EVENTOS};
 use podpot::systemd::dbus::DbusSystemdClient;
 use podpot::systemd::fake::FakeSystemd;
@@ -68,14 +69,20 @@ async fn main() -> ExitCode {
         }
     };
 
-    // 6. Los dos canales del canal en vivo. Sus extremos «de escritura» se quedan
+    // 6. La fuente de registros: el cliente de la API de Podman por su socket. No
+    //    se comprueba que el socket exista —un Podman parado no impide arrancar, y
+    //    el fallo se explica al pedir los registros—, así que aquí no hay rama de
+    //    error: la ruta la resolvió la configuración.
+    let registros = Arc::new(PodmanRegistros::new(config.podman_socket.clone()));
+
+    // 7. Los dos canales del canal en vivo. Sus extremos «de escritura» se quedan
     //    aquí: el de los eventos lo comparte el estado —el fan-out publica por él—
     //    y el del cierre lo dispara la señal de terminación.
     let (eventos, _) = broadcast::channel(CAPACIDAD_DE_EVENTOS);
     let (disparador, apagado) = watch::channel(false);
 
-    // 7. Escucha y apagado: el estado se compone con las piezas ya resueltas.
-    let estado = AppState::new(config, pool.clone(), systemd, eventos, apagado);
+    // 8. Escucha y apagado: el estado se compone con las piezas ya resueltas.
+    let estado = AppState::new(config, pool.clone(), systemd, registros, eventos, apagado);
     let direccion = estado.bind_address();
 
     let listener = match tokio::net::TcpListener::bind(direccion).await {
@@ -89,14 +96,14 @@ async fn main() -> ExitCode {
 
     tracing::info!(%direccion, "escuchando");
 
-    // 8. El fan-out: consume los avisos del vigilante, recalcula la instantánea y
+    // 9. El fan-out: consume los avisos del vigilante, recalcula la instantánea y
     //    la publica en el canal que lee el stream. Se arranca antes de escuchar
     //    para que ningún cambio entre el arranque y la primera petición se pierda.
     let fanout = fanout::arrancar(estado.clone(), vigilante.as_ref());
 
-    // 9. El cierre: la señal de terminación apaga el canal y con él los flujos SSE
-    //    y el fan-out, **antes** de que el apagado ordenado espere a las conexiones
-    //    en curso —si no, un stream perpetuo lo colgaría—.
+    // 10. El cierre: la señal de terminación apaga el canal y con él los flujos SSE
+    //     y el fan-out, **antes** de que el apagado ordenado espere a las conexiones
+    //     en curso —si no, un stream perpetuo lo colgaría—.
     let cierre = async move {
         server::shutdown_signal().await;
         // Sin receptores el envío falla, y no es un error: nadie mira.

@@ -16,6 +16,7 @@ use thiserror::Error;
 use crate::api::response::ErrorResponse;
 use crate::config::ConfigError;
 use crate::quadlet::QuadletError;
+use crate::registros::RegistrosError;
 use crate::systemd::SystemdError;
 
 /// El mensaje con el que el cliente recibe un fallo interno.
@@ -58,6 +59,15 @@ const CODE_SYSTEMD_UNAVAILABLE: &str = "systemd_unavailable";
 /// El código de una recarga de systemd que el gestor no pudo hacer.
 const CODE_SYSTEMD_RELOAD_FAILED: &str = "systemd_reload_failed";
 
+/// El código de una unidad que no tiene contenedor del que leer registros.
+const CODE_UNIT_WITHOUT_CONTAINER: &str = "unit_without_container";
+
+/// El código de una API de Podman que no contesta.
+const CODE_PODMAN_UNAVAILABLE: &str = "podman_unavailable";
+
+/// El código de una API de Podman que contesta algo que no se puede usar.
+const CODE_PODMAN_RESPONSE: &str = "podman_response";
+
 /// El código de una quadlet que ya existe con ese nombre.
 const CODE_DUPLICATE: &str = "duplicate";
 
@@ -95,6 +105,19 @@ const CODE_BAD_GATEWAY: &str = "bad_gateway";
 /// `reqwest`, una URL, un estado HTTP ajeno— es cosa del operador y acaba en el
 /// registro, no en el cuerpo de la respuesta.
 pub const BAD_GATEWAY_MESSAGE: &str = "el proveedor de identidad no está disponible";
+
+/// El mensaje con el que el cliente recibe que la API de Podman no contesta.
+///
+/// Es propio y no el genérico del `500` porque el desenlace no es el mismo: la
+/// petición está bien y lo que no está disponible es Podman, así que lo que quien
+/// pregunta puede hacer es arrancarlo y reintentar.
+pub const PODMAN_UNAVAILABLE_MESSAGE: &str = "la API de Podman del usuario no está disponible";
+
+/// El mensaje con el que el cliente recibe que Podman contestó algo inservible.
+///
+/// No publica la causa —el estado o el cuerpo que llegó son del operador— pero sí
+/// distingue el desenlace: no es que Podman esté caído, es que contestó mal.
+pub const PODMAN_RESPONSE_MESSAGE: &str = "la API de Podman contestó algo que no se puede usar";
 
 /// El error de la aplicación, con el código HTTP que le corresponde.
 #[derive(Debug, Error)]
@@ -136,6 +159,10 @@ pub enum AppError {
     /// La creación de una quadlet falló. Cada variante tiene su traducción.
     #[error(transparent)]
     Quadlet(#[from] QuadletError),
+
+    /// La lectura de los registros del contenedor falló.
+    #[error(transparent)]
+    Registros(#[from] RegistrosError),
 
     /// La configuración no permite atender la petición.
     ///
@@ -184,6 +211,7 @@ impl IntoResponse for AppError {
             }
             Self::Systemd(causa) => traducir_systemd(causa),
             Self::Quadlet(causa) => traducir_quadlet(causa),
+            Self::Registros(causa) => traducir_registros(causa),
             Self::Config(causa) => {
                 tracing::error!(error = %causa, "error de configuración al atender la petición");
                 (
@@ -409,6 +437,49 @@ fn traducir_quadlet(causa: QuadletError) -> (StatusCode, &'static str, String) {
     }
 }
 
+/// Traduce un fallo de la lectura de registros.
+///
+/// La frontera es la de siempre: una unidad sin contenedor es un `4xx` —no ha
+/// fallado nada, el recurso no está— y explica el motivo nombrando la unidad; un
+/// Podman que no contesta es un `503` —la petición está bien y falta poder
+/// atenderla—; y una respuesta inservible es un `502` —el fallo está del otro
+/// lado—. Los `5xx` **no** publican la causa: lleva la ruta del socket y el
+/// `Display` de la biblioteca, que son del operador y acaban en el registro.
+fn traducir_registros(causa: RegistrosError) -> (StatusCode, &'static str, String) {
+    match causa {
+        RegistrosError::SinContenedor { unidad } => (
+            StatusCode::NOT_FOUND,
+            CODE_UNIT_WITHOUT_CONTAINER,
+            format!("la unidad `{unidad}` no tiene contenedor del que leer registros"),
+        ),
+        RegistrosError::Socket { socket, causa } => {
+            tracing::error!(
+                socket = %socket,
+                error = %causa,
+                "no se pudo hablar con la API de Podman"
+            );
+
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                CODE_PODMAN_UNAVAILABLE,
+                PODMAN_UNAVAILABLE_MESSAGE.to_owned(),
+            )
+        }
+        RegistrosError::Podman { causa } => {
+            tracing::error!(
+                error = %causa,
+                "la API de Podman contestó algo que no se puede usar"
+            );
+
+            (
+                StatusCode::BAD_GATEWAY,
+                CODE_PODMAN_RESPONSE,
+                PODMAN_RESPONSE_MESSAGE.to_owned(),
+            )
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use axum::http::StatusCode;
@@ -416,8 +487,12 @@ mod tests {
 
     use crate::test_support::body_json;
 
-    use super::{AppError, INTERNAL_MESSAGE, SYSTEMD_UNAVAILABLE_MESSAGE, SystemdError};
+    use super::{
+        AppError, INTERNAL_MESSAGE, PODMAN_RESPONSE_MESSAGE, PODMAN_UNAVAILABLE_MESSAGE,
+        SYSTEMD_UNAVAILABLE_MESSAGE, SystemdError,
+    };
     use crate::quadlet::QuadletError;
+    use crate::registros::RegistrosError;
 
     /// Requisito «Envoltura JSON única»: un rechazo de la petición explica su
     /// motivo y viaja con la envoltura de error.
@@ -736,5 +811,70 @@ mod tests {
                 .contains("image"),
             "el 400 tiene que nombrar el campo: {cuerpo}"
         );
+    }
+
+    // --- Los registros del contenedor ----------------------------------------
+
+    /// Escenario «Unidad sin contenedor»: `404` con su código propio, nombrando la
+    /// unidad y **sin** abrir ningún flujo.
+    #[tokio::test]
+    async fn una_unidad_sin_contenedor_da_404_nombrandola() {
+        let respuesta = AppError::Registros(RegistrosError::SinContenedor {
+            unidad: "datos-volume.service".to_owned(),
+        })
+        .into_response();
+
+        assert_eq!(respuesta.status(), StatusCode::NOT_FOUND);
+
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(cuerpo["error"]["code"], "unit_without_container");
+        assert!(
+            cuerpo["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("datos-volume.service"),
+            "el 404 tiene que nombrar la unidad: {cuerpo}"
+        );
+    }
+
+    /// Un Podman que no contesta es un `503`: la petición está bien y lo que falta
+    /// es poder atenderla. La causa —la ruta del socket, el `Display` de la
+    /// biblioteca— **no** se publica.
+    #[tokio::test]
+    async fn un_podman_que_no_contesta_da_503_sin_publicar_la_causa() {
+        let respuesta = AppError::Registros(RegistrosError::Socket {
+            socket: "/run/user/1000/podman/podman.sock".to_owned(),
+            causa: Box::new(std::io::Error::other("la ruta secreta del operador")),
+        })
+        .into_response();
+
+        assert_eq!(respuesta.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(cuerpo["error"]["code"], "podman_unavailable");
+        assert_eq!(cuerpo["error"]["message"], PODMAN_UNAVAILABLE_MESSAGE);
+        assert!(
+            !cuerpo.to_string().contains("secreta"),
+            "el 5xx no puede publicar la causa: {cuerpo}"
+        );
+    }
+
+    /// Y una respuesta inservible es un `502`: la petición llegó y lo que falló
+    /// está del otro lado.
+    #[tokio::test]
+    async fn una_respuesta_de_podman_inservible_da_502() {
+        let respuesta = AppError::Registros(RegistrosError::Podman {
+            causa: Box::new(std::io::Error::other("un estado que no era 200")),
+        })
+        .into_response();
+
+        assert_eq!(respuesta.status(), StatusCode::BAD_GATEWAY);
+
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(cuerpo["error"]["code"], "podman_response");
+        assert_eq!(cuerpo["error"]["message"], PODMAN_RESPONSE_MESSAGE);
     }
 }

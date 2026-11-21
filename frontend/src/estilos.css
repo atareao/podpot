@@ -16,3 +16,29 @@ body {
   margin: 0 auto;
   padding: 24px;
 }
+
+/* Visor de logs: fondo oscuro y monoespaciado, como una consola. */
+.podpot-registros__lineas {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 60vh;
+  overflow: auto;
+  padding: 12px;
+  border-radius: 6px;
+  background: #1f1f1f;
+  color: #e6e6e6;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.podpot-registro {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* `stderr` se distingue del `stdout` por color. */
+.podpot-registro--stderr {
+  color: #ff7875;
+}

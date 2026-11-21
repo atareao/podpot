@@ -35,6 +35,12 @@ impl Proceso {
             .env("BIND_ADDRESS", direccion.to_string())
             .env("DATABASE_URL", dsn)
             .env("PODPOT_SYSTEMD", "fake")
+            // El socket se declara para que el arranque no dependa del entorno de
+            // quien compila: nada se conecta a él —el proceso sólo escucha y se
+            // apaga—, pero sin esta variable la configuración exigiría el
+            // `XDG_RUNTIME_DIR` del usuario y el proceso no arrancaría en una
+            // máquina que no lo tenga.
+            .env("PODPOT_PODMAN_SOCKET", "/run/podpot-de-prueba/podman.sock")
             .env("RUST_LOG", "off")
             .stdin(Stdio::null())
             .stdout(Stdio::null())

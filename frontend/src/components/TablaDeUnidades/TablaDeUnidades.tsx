@@ -12,6 +12,8 @@ export interface TablaDeUnidadesProps {
   onAccion: (unidad: QuadletUnit, accion: AccionDeUnidad) => void
   /** Edición solicitada desde una fila. */
   onEditar: (unidad: QuadletUnit) => void
+  /** Apertura del visor de logs solicitada desde una fila. */
+  onVerRegistros: (unidad: QuadletUnit) => void
   /**
    * Borrado **confirmado** desde una fila: la confirmación vive aquí, así que
    * cancelarla no llega a emitir nada.
@@ -44,6 +46,7 @@ export function TablaDeUnidades({
   cargando,
   onAccion,
   onEditar,
+  onVerRegistros,
   onBorrar,
   enCurso = null,
 }: TablaDeUnidadesProps) {
@@ -106,6 +109,15 @@ export function TablaDeUnidades({
               onClick={() => onEditar(unidad)}
             >
               Editar
+            </Button>
+            {/* Los logs solo se leen: no se bloquean con una operación en curso
+                sobre la fila (no encadenan nada destructivo). */}
+            <Button
+              size="small"
+              aria-label={`Logs ${unidad.name}`}
+              onClick={() => onVerRegistros(unidad)}
+            >
+              Logs
             </Button>
             {/* El borrado es destructivo: la confirmación vive aquí y solo al
                 confirmarla se emite `onBorrar`; cancelar no sale de la fila.
