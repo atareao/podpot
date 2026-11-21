@@ -206,7 +206,7 @@ async fn registrar_operacion(
         .bind(file_name)
         .execute(pool)
         .await
-        .map_err(|causa| QuadletError::Registro {
+        .map_err(|causa| QuadletError::Persistencia {
             file_name: file_name.to_owned(),
             causa: Box::new(causa),
         })?;
@@ -673,8 +673,8 @@ mod tests {
         );
     }
 
-    /// Escenario «Registro tras un borrado»: un borrado con éxito queda apuntado
-    /// como borrado.
+    /// Escenario «Operación registrada tras un borrado»: un borrado con éxito
+    /// queda apuntado como borrado.
     #[tokio::test]
     async fn un_borrado_con_exito_se_registra() {
         let dir = tempfile::tempdir().expect("se tiene que poder crear un directorio temporal");

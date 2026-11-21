@@ -402,7 +402,7 @@ fn traducir_quadlet(causa: QuadletError) -> (StatusCode, &'static str, String) {
             tracing::error!(
                 fichero = %file_name,
                 error = %causa,
-                "no se pudo registrar la creación de la quadlet"
+                "no se pudo registrar la operación sobre la quadlet"
             );
 
             (
@@ -418,19 +418,6 @@ fn traducir_quadlet(causa: QuadletError) -> (StatusCode, &'static str, String) {
                 StatusCode::NOT_FOUND,
                 CODE_NOT_FOUND,
                 "no existe una quadlet con ese nombre en el directorio de quadlets".to_owned(),
-            )
-        }
-        QuadletError::Registro { file_name, causa } => {
-            tracing::error!(
-                fichero = %file_name,
-                error = %causa,
-                "no se pudo registrar la operación sobre la quadlet"
-            );
-
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                CODE_INTERNAL,
-                INTERNAL_MESSAGE.to_owned(),
             )
         }
         QuadletError::Systemd(causa) => traducir_systemd(causa),

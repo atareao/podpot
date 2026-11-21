@@ -7,7 +7,7 @@ Cierra el ciclo de vida de las quadlets en podpot: además de listar/controlar (
 ## Ficheros implicados
 
 ### Backend (`backend/`)
-- `src/quadlet/mod.rs` — dominio: `QuadletError::{NotFound, ReadFailed, Registro}`, `Quadlet::from_file_name` (identidad `<stem>.<kind>`), `QuadletDraft::parse` (inverso del render), `describe_a` (inmutabilidad del nombre).
+- `src/quadlet/mod.rs` — dominio: `QuadletError::{NotFound, ReadFailed, Persistencia}`, `Quadlet::from_file_name` (identidad `<stem>.<kind>`), `QuadletDraft::parse` (inverso del render), `describe_a` (inmutabilidad del nombre).
 - `src/quadlet/store.rs` — `leer`, `reescribir` (tmp + `rename` atómico, permisos `0600`/preservados), `borrar`, `nombre_temporal`.
 - `src/quadlet/service.rs` — orquestación `leer`/`editar`/`borrar` (validar → identidad → existencia → render → escritura → `daemon-reload` → registrar).
 - `src/api/quadlets.rs` — handlers `leer` (GET), `editar` (PATCH), `borrar` (DELETE).
@@ -47,10 +47,10 @@ No cambia el despliegue respecto a las features anteriores: contenedor rootless 
 - **Permisos `0600`** en ficheros creados/reescritos (la reescritura preserva el modo del destino si existía): una quadlet puede llevar `Environment=…PASSWORD=…`.
 - **`leer` no sigue symlinks** (`symlink_metadata`): coherente con el resto del módulo.
 - **Carrera benigna** entre `existe` y `reescribir`: aceptada y documentada.
-- **Errores**: `NotFound`→404, `InvalidName`/`InvalidKind`/`InvalidValue`→400, `WriteFailed`/`ReadFailed`/`Registro`→500, `ReloadFailed`/`UnitRejected`→502, `Transport`→503.
+- **Errores**: `NotFound`→404, `InvalidName`/`InvalidKind`/`InvalidValue`→400, `WriteFailed`/`ReadFailed`/`Persistencia`→500, `ReloadFailed`/`UnitRejected`→502, `Transport`→503.
 
 ## Follow-ups
 
 - **Issue #6**: exponer `file_name`/`kind` real en `GET /api/v1/units` para eliminar la deducción no inyectiva de identidad en el frontend (`web-volume.service` es ambiguo).
-- Alinear el código de error `Persistencia`/`Registro` (casi idénticos) si se quiere reducir superficie.
+- ~~Alinear el código de error `Persistencia`/`Registro` (casi idénticos) si se quiere reducir superficie.~~ **RESUELTO**: se unificaron ambas variantes en `QuadletError::Persistencia` (cubre creación, edición y borrado; el mapeo HTTP sigue siendo `internal`/500). Change OpenSpec `unificar-error-persistencia`, issue #20.
 - (Heredados) auth OIDC; SSE/`PropertiesChanged`; chunk de antd >500 kB.

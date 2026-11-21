@@ -162,6 +162,7 @@ mod tests {
     use axum::http::{Method, StatusCode};
     use serde_json::json;
 
+    use crate::error::INTERNAL_MESSAGE;
     use crate::systemd::SystemdError;
     use crate::systemd::fake::FakeSystemd;
     use crate::test_support::{
@@ -796,12 +797,14 @@ mod tests {
             [("delete".to_owned(), "web.container".to_owned())]
         );
     }
-    /// Escenario «Fallo del registro»: la edición se completa en disco, pero si el
-    /// registro no se puede escribir la respuesta es un `500` genérico —sin causa,
-    /// sin dato y sin deshacer el hecho—. Se fuerza de forma determinista cerrando
-    /// el pool: cualquier consulta falla y no depende de los permisos del disco.
+    /// Escenario «Fallo de persistencia en la edición/borrado»: la edición se
+    /// completa en disco, pero si el registro no se puede escribir la respuesta es
+    /// un `500` genérico —sin causa, sin dato y sin deshacer el hecho—. Se fuerza
+    /// de forma determinista cerrando el pool: cualquier consulta falla y no
+    /// depende de los permisos del disco. Fija el desenlace unificado de
+    /// `QuadletError::Persistencia` en el camino de edición.
     #[tokio::test]
-    async fn un_fallo_al_registrar_la_operacion_da_500() {
+    async fn un_fallo_de_persistencia_en_la_edicion_da_500() {
         let entorno = entorno().await;
         con_fichero(entorno.quadlet_dir());
         entorno.state().pool.close().await;
@@ -816,6 +819,36 @@ mod tests {
 
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(cuerpo["error"]["code"], "internal");
+        assert_eq!(cuerpo["error"]["message"], INTERNAL_MESSAGE);
+        assert!(cuerpo.get("data").is_none());
+        assert_eq!(
+            std::fs::read_to_string(entorno.quadlet_dir().join("web.container"))
+                .expect("el fichero tiene que estar"),
+            "[Container]\nImage=docker.io/library/nginx:latest\n",
+            "el hecho ocurrido no se deshace porque falle el registro"
+        );
+    }
+
+    /// La otra mitad del requisito unificado: la **creación** también falla con un
+    /// `500` genérico si el registro no se puede escribir —sin causa, sin dato y sin
+    /// deshacer el hecho—. Se fuerza cerrando el pool: cuando `registrar` falla, el
+    /// fichero ya está escrito, así que el hecho ocurrido no se revierte.
+    #[tokio::test]
+    async fn un_fallo_de_persistencia_en_la_creacion_da_500() {
+        let entorno = entorno().await;
+        entorno.state().pool.close().await;
+
+        let (status, cuerpo) = peticion_json(
+            &entorno.app(),
+            Method::POST,
+            "/api/v1/quadlets",
+            peticion_valida("web"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(cuerpo["error"]["code"], "internal");
+        assert_eq!(cuerpo["error"]["message"], INTERNAL_MESSAGE);
         assert!(cuerpo.get("data").is_none());
         assert_eq!(
             std::fs::read_to_string(entorno.quadlet_dir().join("web.container"))
