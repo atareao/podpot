@@ -1,0 +1,5 @@
+schema: spec-driven
+created: 2026-11-21
+goal: Cachear el JWKS del proveedor OIDC para dejar de pedirlo en cada callback,
+  acotando la frescura con un TTL y un refresco ante kid desconocido, sin cambio
+  del contrato HTTP

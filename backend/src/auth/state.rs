@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex, RwLock};
 
-use crate::auth::oidc::Discovery;
+use crate::auth::oidc::{Discovery, JwksCacheado};
 use crate::config::{AuthMode, Config, OidcSettings};
 use crate::secret::SecretString;
 
@@ -85,6 +85,14 @@ pub struct AuthState {
     /// varios logins pueden leer la caché a la vez sin estorbarse. Se escribe
     /// solo cuando llega el primer resultado.
     pub discovery: Arc<RwLock<Option<Discovery>>>,
+    /// JWKS cacheado del proveedor: `None` hasta que se lea la primera vez.
+    ///
+    /// Igual que el descubrimiento —y por la misma razón—: tras un [`RwLock`],
+    /// porque varios callbacks pueden mirarlo a la vez y solo se escribe cuando
+    /// llega un resultado. Se guarda con la marca de lectura y no el conjunto
+    /// suelto porque el JWKS **caduca**: la frescura la acota
+    /// [`crate::auth::oidc::JWKS_TTL`].
+    pub jwks: Arc<RwLock<Option<JwksCacheado>>>,
     /// Logins en curso: `state → (nonce, instante de emisión)`.
     ///
     /// Tras un [`Mutex`] porque insertar y purgar son mutaciones: el mapa no
@@ -106,6 +114,7 @@ impl AuthState {
             secret,
             settings: Arc::new(settings),
             discovery: Arc::new(RwLock::new(None)),
+            jwks: Arc::new(RwLock::new(None)),
             logins: Arc::new(Mutex::new(HashMap::new())),
             consumidos: Arc::new(Mutex::new(HashMap::new())),
         }

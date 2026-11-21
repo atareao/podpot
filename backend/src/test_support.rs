@@ -629,13 +629,16 @@ pub async fn peticion_cruda_con_cookie(
 /// atado a `127.0.0.1` con un puerto efímero, y todas las peticiones se quedan en
 /// la máquina.
 pub mod proveedor_falso {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
     use jsonwebtoken::jwk::{Jwk, JwkSet};
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
     use rsa::RsaPrivateKey;
     use rsa::pkcs1::{EncodeRsaPrivateKey, EncodeRsaPublicKey};
     use serde::{Deserialize, Serialize};
     use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
     use super::{EMAIL, SUB};
 
@@ -659,6 +662,13 @@ pub mod proveedor_falso {
     /// cuya cabecera apunta a una clave que el conjunto no tiene: el rechazo sale
     /// de la búsqueda por `kid`, que es anterior a la firma.
     pub const KID_AJENO: &str = "podpot-clave-que-no-se-publica";
+
+    /// `kid` de la clave que el proveedor publica **después** de rotar.
+    ///
+    /// Es el complemento de [`KID`] para el escenario de rotación: el conjunto
+    /// cacheado publica [`KID`] y el `jwks_uri` ya publica éste, así que un token
+    /// firmado con la clave nueva solo entra si el flujo **refresca** el conjunto.
+    pub const KID_ROTADO: &str = "podpot-clave-rotada";
 
     /// Claims del ID token que el proveedor falso firma.
     ///
@@ -704,6 +714,16 @@ pub mod proveedor_falso {
         }
     }
 
+    /// La clave con la que el proveedor firma **después** de rotar.
+    ///
+    /// Es opaca a propósito: la prueba la recibe de [`ProveedorFalso::rotar_clave`] y
+    /// la devuelve en [`ProveedorFalso::firmar_con_rotada`], sin poder mirarla ni
+    /// confundirla con la vigente.
+    pub struct ClaveRotada {
+        /// Clave privada nueva, con la que se firman los tokens posteriores.
+        clave: EncodingKey,
+    }
+
     /// Proveedor OIDC falso: un servidor `wiremock` que sirve el descubrimiento,
     /// el `token_endpoint` y el `jwks_uri`, con un par RSA real.
     pub struct ProveedorFalso {
@@ -724,6 +744,25 @@ pub mod proveedor_falso {
         /// ataque: lo único que lo para es que la verificación fije `RS256` en vez
         /// de leer el algoritmo de la cabecera.
         clave_confusa: EncodingKey,
+        /// Lo que el `jwks_uri` publica **en este momento**.
+        ///
+        /// Es un catálogo vivo y no un mock por rotación: el `jwks_uri` se monta una
+        /// sola vez y lo que cambia es lo que publica. Montar un mock nuevo en cada
+        /// rotación dejaría el enrutado en manos de la prioridad de `wiremock` y el
+        /// conteo de lecturas repartido entre varios mocks.
+        publicadas: Arc<Mutex<Vec<Jwk>>>,
+        /// Si el `jwks_uri` está caído: desde aquí, sus lecturas contestan `500`.
+        ///
+        /// Es el escenario del proveedor que no responde al refrescar el conjunto,
+        /// y se enciende a voluntad para que la prueba decida **cuándo** se cae.
+        caido: Arc<AtomicBool>,
+        /// Lecturas del `jwks_uri` que el proveedor ha atendido.
+        ///
+        /// Lo cuenta el propio doble —y no `received_requests`— porque lo que las
+        /// pruebas de la caché necesitan medir es **cuántas veces se ha ido a por el
+        /// conjunto**, incluidas las lecturas que el proveedor ha contestado con un
+        /// error.
+        peticiones_al_jwks: Arc<AtomicUsize>,
     }
 
     impl ProveedorFalso {
@@ -752,9 +791,19 @@ pub mod proveedor_falso {
                 .mount(&server)
                 .await;
 
+            // El catálogo arranca con la clave vigente y el contador a cero: el
+            // `jwks_uri` que lo sirve es el mismo de toda la vida del proveedor.
+            let publicadas = Arc::new(Mutex::new(vec![jwk_publicada(&clave, KID)]));
+            let caido = Arc::new(AtomicBool::new(false));
+            let peticiones_al_jwks = Arc::new(AtomicUsize::new(0));
+
             Mock::given(method("GET"))
                 .and(path(RUTA_JWKS))
-                .respond_with(ResponseTemplate::new(200).set_body_json(jwks(&clave)))
+                .respond_with(lector_del_jwks(
+                    Arc::clone(&publicadas),
+                    Arc::clone(&caido),
+                    Arc::clone(&peticiones_al_jwks),
+                ))
                 .mount(&server)
                 .await;
 
@@ -767,6 +816,9 @@ pub mod proveedor_falso {
                 // material que el `jwks_uri` publica. `EncodingKey::from_secret`
                 // no distingue familias, así que el token se firma de verdad.
                 clave_confusa: EncodingKey::from_secret(&publica),
+                publicadas,
+                caido,
+                peticiones_al_jwks,
             }
         }
 
@@ -837,6 +889,67 @@ pub mod proveedor_falso {
 
             encode(&cabecera, claims, &self.clave_confusa)
                 .expect("el ID token de prueba debe firmarse")
+        }
+
+        /// Rota la clave publicada: el `jwks_uri` deja de publicar la vigente y
+        /// pasa a publicar una nueva, con [`KID_ROTADO`].
+        ///
+        /// Devuelve la clave con la que hay que firmar los tokens posteriores, que
+        /// los firma [`Self::firmar_con_rotada`]. Es lo que permite reproducir el
+        /// caso que el refresco del conjunto existe para cubrir: el `kid` del token
+        /// **no** está en el conjunto que el flujo tenía cacheado.
+        pub fn rotar_clave(&self) -> ClaveRotada {
+            let (clave, _) = generar_clave();
+
+            *self
+                .publicadas
+                .lock()
+                .expect("el catálogo del JWKS de prueba no puede envenenarse") =
+                vec![jwk_publicada(&clave, KID_ROTADO)];
+
+            ClaveRotada { clave }
+        }
+
+        /// Firma un ID token `RS256` con una clave **rotada**, con su `kid`.
+        pub fn firmar_con_rotada(&self, rotada: &ClaveRotada, claims: &IdToken) -> String {
+            let mut cabecera = Header::new(Algorithm::RS256);
+            cabecera.kid = Some(KID_ROTADO.to_owned());
+
+            encode(&cabecera, claims, &rotada.clave).expect("el ID token de prueba debe firmarse")
+        }
+
+        /// Tumba el `jwks_uri`: desde aquí, sus lecturas contestan `500`.
+        ///
+        /// Es el escenario del proveedor caído **al refrescar**: el conjunto que el
+        /// flujo tenía cacheado sigue valiendo, y lo que no llega es el nuevo.
+        pub fn tumbar_el_jwks(&self) {
+            self.caido.store(true, Ordering::SeqCst);
+        }
+
+        /// El conjunto que el `jwks_uri` publica **ahora mismo**.
+        ///
+        /// Es lo que permite **sembrar** la caché de una prueba con el conjunto
+        /// vigente sin gastar una lectura, que es como se fabrica una caché
+        /// caducada: se espera diez minutos o se le pone a mano una marca de lectura
+        /// vieja, y la segunda es la que cabe en una prueba.
+        pub fn jwks_publicado(&self) -> JwkSet {
+            JwkSet {
+                keys: self
+                    .publicadas
+                    .lock()
+                    .expect("el catálogo del JWKS de prueba no puede envenenarse")
+                    .clone(),
+            }
+        }
+
+        /// Cuántas veces se ha leído el `jwks_uri`.
+        ///
+        /// Es lo que hace creíble la caché: contar las lecturas es la única forma de
+        /// probar que un segundo callback **no** vuelve a pedir el conjunto. El
+        /// contador es del doble y no de `wiremock` para que cuente también las
+        /// lecturas que el proveedor contesta con un error.
+        pub fn peticiones_al_jwks(&self) -> usize {
+            self.peticiones_al_jwks.load(Ordering::SeqCst)
         }
 
         /// Monta el `token_endpoint` para que devuelva el ID token dado.
@@ -910,18 +1023,47 @@ pub mod proveedor_falso {
         (EncodingKey::from_rsa_der(&der), publica)
     }
 
-    /// Publica la clave pública de `clave` como JWKS, con su `kid`.
+    /// Publica la clave pública de `clave` como JWK, con el `kid` dado.
     ///
     /// Se usa `Jwk::from_encoding_key`, que extrae el módulo y el exponente y los
     /// codifica en base64url sin relleno —como exige el RFC 7518—, de modo que la
     /// misma biblioteca que firma y verifica construye la clave que publica.
-    fn jwks(clave: &EncodingKey) -> serde_json::Value {
+    fn jwk_publicada(clave: &EncodingKey, kid: &str) -> Jwk {
         let mut jwk = Jwk::from_encoding_key(clave, Algorithm::RS256)
             .expect("la clave pública de prueba debe poder publicarse como JWK");
-        jwk.common.key_id = Some(KID.to_owned());
+        jwk.common.key_id = Some(kid.to_owned());
 
-        serde_json::to_value(JwkSet { keys: vec![jwk] })
-            .expect("el JWKS de prueba debe serializarse")
+        jwk
+    }
+
+    /// El lector del `jwks_uri`: cuenta la lectura y publica lo que toque.
+    ///
+    /// Es la única pieza que decide qué contesta el `jwks_uri`, y por eso es donde
+    /// vive el contador: una lectura cuenta siempre —también la que termina en
+    /// error—, porque lo que las pruebas de la caché miden es cuántas veces se ha
+    /// ido a por el conjunto.
+    fn lector_del_jwks(
+        publicadas: Arc<Mutex<Vec<Jwk>>>,
+        caido: Arc<AtomicBool>,
+        peticiones: Arc<AtomicUsize>,
+    ) -> impl Fn(&Request) -> ResponseTemplate + Send + Sync + 'static {
+        move |_peticion| {
+            peticiones.fetch_add(1, Ordering::SeqCst);
+
+            if caido.load(Ordering::SeqCst) {
+                return ResponseTemplate::new(500);
+            }
+
+            let conjunto = JwkSet {
+                keys: publicadas
+                    .lock()
+                    .expect("el catálogo del JWKS de prueba no puede envenenarse")
+                    .clone(),
+            };
+
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::to_value(conjunto).expect("el JWKS debe serializarse"))
+        }
     }
 
     /// Firma `claims` con `clave` y el `kid` del proveedor.
