@@ -165,14 +165,7 @@ pub async fn callback(
         Err(error) => return error.into_response(),
     };
 
-    let identidad = match oidc::verificar_id_token(
-        auth.settings.as_ref(),
-        &discovery,
-        &id_token,
-        &pendiente.nonce,
-    )
-    .await
-    {
+    let identidad = match oidc::verificar_id_token(auth, &id_token, &pendiente.nonce).await {
         Ok(identidad) => identidad,
         Err(error) => return error.into_response(),
     };

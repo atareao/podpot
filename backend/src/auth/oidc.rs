@@ -7,8 +7,18 @@
 //! convertir el retorno en una identidad verificada. El flujo se escribe a mano
 //! —patrón de kesto— y no con `openidconnect`: la caja no está en la caché de
 //! Cargo de esta máquina y el repositorio tiene que poder compilarse sin conexión.
+//!
+//! El módulo cachea las **dos** respuestas del proveedor que no cambian de un
+//! login a otro: el documento de descubrimiento ([`discovery_cached`]) y el
+//! conjunto de claves ([`jwks_cached`]). El segundo **caduca** —la entrada guarda
+//! su instante de lectura y se reutiliza a lo sumo [`JWKS_TTL`]— y además se
+//! refresca de forma condicional: si el ID token viene firmado con un `kid` que el
+//! conjunto cacheado no publica, [`verificar_id_token`] pide un refresco forzado
+//! antes de rendirse. Es un ahorro —un `jwks_uri` por TTL en vez de uno por
+//! callback— con un precio acotado y explícito: el rato del TTL es la ventana en
+//! la que una clave retirada seguiría sirviendo aquí.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode_header};
@@ -323,6 +333,56 @@ pub async fn canjear_codigo(
         })
 }
 
+/// Frescura máxima del JWKS cacheado: 10 minutos.
+///
+/// La caché del conjunto de claves se salta el requisito de pedir el `jwks_uri` en
+/// cada callback, y ese ahorro **tiene un precio**: durante este rato podpot sigue
+/// verificando ID tokens con una clave que el proveedor pudo haber retirado. El TTL
+/// es, por tanto, el techo de esa exposición, no un número de conveniencia.
+///
+/// Diez minutos: el mismo orden que el `state` de un login ([`STATE_TTL`] son cinco)
+/// y muy por debajo de la hora que suele vivir un ID token, de modo que la rotación
+/// normal —clave nueva, `kid` nuevo— la cubre el refresco condicional y este TTL solo
+/// acota el caso que el refresco **no** puede ver: una clave retirada cuyo `kid` el
+/// conjunto cacheado sigue publicando. Ni más corto —un TTL de segundos volvería a
+/// pagar una petición por callback, que es justo lo que se viene a quitar— ni mucho
+/// más largo, porque ese rato es exactamente la ventana en la que una clave retirada
+/// sigue sirviendo aquí.
+///
+/// [`STATE_TTL`]: crate::auth::state::STATE_TTL
+pub const JWKS_TTL: Duration = Duration::from_secs(10 * 60);
+
+/// Un JWKS cacheado: el conjunto y el instante en que se leyó del proveedor.
+///
+/// El instante va **dentro** de la entrada, y no en una marca aparte, por la misma
+/// razón que el `nonce` viaja junto al `state`: la caducidad y el conjunto que
+/// caduca no pueden separarse sin que una lectura los desempareje. La frescura se
+/// mide contra [`JWKS_TTL`] con [`JwksCacheado::esta_fresco`].
+#[derive(Debug, Clone)]
+pub struct JwksCacheado {
+    /// El conjunto de claves tal cual lo publicó el `jwks_uri`.
+    pub conjunto: JwkSet,
+    /// Instante de lectura, para aplicar el TTL.
+    pub leido_en: Instant,
+}
+
+impl JwksCacheado {
+    /// ¿Sigue fresco el conjunto a fecha de `ahora`?
+    ///
+    /// La fecha entra por parámetro —y no se lee del reloj aquí— por el mismo
+    /// motivo que el `ahora` de `PendingLogin::expirado_en`: deja la comparación
+    /// determinista en las pruebas. El reloj monotónico de `Instant` mide desde el
+    /// arranque de la máquina, así que un test que quisiera caducar una entrada
+    /// restándole el TTL al reloj tendría que dar por hecho que el sistema lleva
+    /// más de un TTL en marcha —falso en un runner recién arrancado—; con la fecha
+    /// inyectada, el test decide cuándo se evalúa la caché y no depende del uptime.
+    /// `saturating_duration_since` cierra el caso de una fecha anterior a la
+    /// lectura, que no puede darse en producción y que aquí cuenta como fresca.
+    fn esta_fresco(&self, ahora: Instant) -> bool {
+        ahora.saturating_duration_since(self.leido_en) < JWKS_TTL
+    }
+}
+
 /// Pide el JWKS contra el que se verifica el ID token.
 ///
 /// Un JWKS que no se puede leer es un fallo del proveedor, no de podpot: la
@@ -355,6 +415,120 @@ async fn fetch_jwks(url: &str) -> Result<JwkSet, AppError> {
         .map_err(|error| AppError::BadGateway(format!("el JWKS no es válido: {error}")))
 }
 
+/// Devuelve el JWKS contra el que verificar el ID token, cacheado con frescura
+/// acotada por [`JWKS_TTL`].
+///
+/// El mismo patrón que [`discovery_cached`], con una diferencia que manda: aquí el
+/// conjunto **caduca**. La entrada guarda el instante de lectura —[`JwksCacheado`]— y
+/// solo se reutiliza mientras [`JwksCacheado::esta_fresco`] lo diga a fecha de `ahora`;
+/// pasado el TTL, el siguiente callback vuelve a pedir el `jwks_uri` y sustituye la
+/// entrada por lo recién leído.
+///
+/// La frescura se consulta primero bajo un candado de **lectura**, que es el camino
+/// barato —el de todos los callbacks dentro del TTL, que se atienden a la vez sin
+/// estorbarse—; solo cuando no hay nada fresco se pasa al candado de escritura, que
+/// es donde vive [`refrescar_jwks`].
+///
+/// Aquí solo se refresca por **caducidad**. El otro motivo para ir al `jwks_uri` —que
+/// el ID token venga firmado con un `kid` que el conjunto cacheado no publica— no se
+/// decide aquí, porque depende del token y no del conjunto: lo detecta
+/// [`verificar_id_token`], que en ese caso pide un refresco forzado
+/// ([`refrescar_jwks`] con `forzar` a `true`) y reintenta la búsqueda.
+pub async fn jwks_cached(auth: &AuthState) -> Result<JwkSet, AppError> {
+    jwks_cached_en(auth, Instant::now()).await
+}
+
+/// [`jwks_cached`] con la fecha de evaluación explícita.
+///
+/// El reloj entra por parámetro para que la caducidad sea comprobable sin depender de
+/// cuánto lleve la máquina en marcha: el camino de producción es el de arriba, que
+/// pasa `Instant::now()`, mientras que las pruebas de la caducidad pasan una fecha
+/// posterior al TTL sobre una entrada sembrada **fresca**. La composición —leer
+/// primero, refrescar solo si no hay nada fresco— es la misma que la del camino
+/// público, que es justamente lo que se quiere cubrir.
+async fn jwks_cached_en(auth: &AuthState, ahora: Instant) -> Result<JwkSet, AppError> {
+    if let Some(cacheado) = leer_jwks_fresco(auth, ahora).await {
+        return Ok(cacheado);
+    }
+
+    refrescar_jwks(auth, false, ahora).await
+}
+
+/// Devuelve el conjunto cacheado si sigue fresco a fecha de `ahora`, y `None` si no
+/// hay entrada o ya ha caducado.
+///
+/// Es el camino barato: basta un candado de **lectura**, así que los callbacks
+/// dentro del TTL no se bloquean entre sí. La frescura la calcula
+/// [`JwksCacheado::esta_fresco`] contra el instante de lectura de la propia entrada,
+/// de modo que el conjunto y su caducidad no pueden desemparejarse.
+async fn leer_jwks_fresco(auth: &AuthState, ahora: Instant) -> Option<JwkSet> {
+    auth.jwks
+        .read()
+        .await
+        .as_ref()
+        .filter(|entrada| entrada.esta_fresco(ahora))
+        .map(|entrada| entrada.conjunto.clone())
+}
+
+/// Pide el `jwks_uri` y deja el conjunto recién leído en la caché.
+///
+/// El candado de escritura se toma **antes** de ir a por el conjunto y se mantiene
+/// durante la petición, en vez de soltarlo tras consultar la caché. Es lo que impide
+/// que dos callbacks que caducan a la vez pidan el conjunto por duplicado y que el
+/// segundo pise el resultado del primero: el que llega después espera al candado y ya
+/// encuentra la entrada fresca. El precio es que los demás callbacks aguardan mientras
+/// dura un refresco —y, en el peor caso, lo que tarde en vencer
+/// [`INTERCAMBIO_TIMEOUT`]—; se acepta porque el refresco solo ocurre al caducar el TTL
+/// o al rotar una clave, no en cada callback, y a cambio la caché nunca queda a medias
+/// ni se pide dos veces para lo mismo.
+///
+/// Esa **deduplicación vale solo para `forzar` a `false`** —la caducidad—, el único
+/// caso en que se vuelve a comprobar la frescura ya bajo el candado: si otra tarea
+/// refrescó mientras se esperaba por él, su conjunto vale y no hay que pedir nada. Con
+/// `forzar` a `true` —la rotación— esa comprobación se salta a propósito, porque el
+/// motivo del refresco no es que la entrada haya caducado sino que no publica la clave
+/// que el ID token pide: el conjunto puede estar fresco y seguir siendo el viejo. Por
+/// eso, con `forzar` a `true`, **N callbacks concurrentes con un `kid` desconocido
+/// pueden encadenar N peticiones** al `jwks_uri`, serializadas bajo el candado pero
+/// todas de verdad. Se asume: el caso es raro —solo lo provoca una rotación que varios
+/// callbacks pisan a la vez— y una guardia de «refresco en curso» no compensaría la
+/// complejidad, porque el candado ya evita la carrera y una petición de más no rompe
+/// nada.
+///
+/// Un fallo de la petición —o del descubrimiento— se propaga tal cual y **no se
+/// cachea**: se devuelve antes de escribir, así que la entrada anterior se queda como
+/// estaba. Un proveedor caído no envenena la caché con un conjunto vacío ni deja a
+/// podpot sin el conjunto que ya tenía.
+///
+/// El conjunto se fecha con el `ahora` que entra por parámetro —la misma fecha con la
+/// que se comprobó la frescura— y no con una lectura nueva del reloj: una sola fuente
+/// de tiempo para decidir y para fechar evita que el TTL empiece a contar en un
+/// instante distinto al que se usó para mirar la caché.
+async fn refrescar_jwks(
+    auth: &AuthState,
+    forzar: bool,
+    ahora: Instant,
+) -> Result<JwkSet, AppError> {
+    let mut cache = auth.jwks.write().await;
+
+    if !forzar
+        && let Some(entrada) = cache.as_ref()
+        && entrada.esta_fresco(ahora)
+    {
+        return Ok(entrada.conjunto.clone());
+    }
+
+    let discovery = discovery_cached(auth).await?;
+    let conjunto = fetch_jwks(&discovery.jwks_uri).await?;
+
+    *cache = Some(JwksCacheado {
+        conjunto: conjunto.clone(),
+        leido_en: ahora,
+    });
+
+    Ok(conjunto)
+}
+
 /// Rechaza un ID token dejando la causa en el registro y un motivo genérico al
 /// cliente.
 fn rechazar_id_token(causa: &str) -> AppError {
@@ -368,13 +542,22 @@ fn rechazar_id_token(causa: &str) -> AppError {
 /// `aud`, vigencia de `exp` e `iat`, y `nonce` igual al emitido en el login.
 /// Cualquier fallo rechaza con [`AppError::Unauthorized`]: no hay sesión que
 /// emitir.
+///
+/// El conjunto de claves se resuelve por [`jwks_cached`] a partir del estado —y no
+/// por el descubrimiento que el llamador tenga en la mano— porque el JWKS se cachea:
+/// quien llama no tiene por qué saber de dónde sale el conjunto ni cuándo caduca.
+///
+/// Si el `kid` del ID token no está en el conjunto cacheado, se refresca **una sola
+/// vez** y se reintenta: es lo que cubre una rotación de claves sin que el login
+/// dependa de que el TTL haya vencido. Un refresco que falla no se convierte en
+/// rechazo del token sino que se propaga tal cual —el `502` de [`AppError::BadGateway`]—,
+/// porque el problema es del proveedor, no del ID token.
 pub async fn verificar_id_token(
-    settings: &OidcSettings,
-    discovery: &Discovery,
+    auth: &AuthState,
     id_token: &str,
     nonce_esperado: &str,
 ) -> Result<IdentidadVerificada, AppError> {
-    let jwks = fetch_jwks(&discovery.jwks_uri).await?;
+    let jwks = jwks_cached(auth).await?;
 
     // El `kid` de la cabecera elige la clave del conjunto. Sin `kid`, o con uno
     // que el JWKS no publica, no hay clave con la que verificar.
@@ -389,12 +572,27 @@ pub async fn verificar_id_token(
     let Some(kid) = cabecera.kid else {
         return Err(rechazar_id_token("el ID token no declara kid"));
     };
-    let Some(jwk) = jwks.find(&kid) else {
-        return Err(rechazar_id_token(
-            "el ID token va firmado con una clave que el jwks_uri no publica",
-        ));
+
+    // El conjunto cacheado se da por bueno hasta que caduque, pero una rotación de
+    // claves no reinicia el TTL: el proveedor puede publicar una clave nueva con el
+    // conjunto cacheado todavía fresco. Por eso, si el `kid` del token no está en lo
+    // cacheado, se refresca **una sola vez** —saltándose la frescura, que es lo que
+    // distingue este caso del de la caducidad— y se reintenta la búsqueda; si tampoco
+    // así aparece, el rechazo es el de siempre. El refresco solo se intenta cuando el
+    // `kid` falta, no en cada verificación, de modo que el camino normal no paga
+    // ninguna petición de más.
+    let jwk = match jwks.find(&kid) {
+        Some(jwk) => jwk.clone(),
+        None => match refrescar_jwks(auth, true, Instant::now()).await?.find(&kid) {
+            Some(jwk) => jwk.clone(),
+            None => {
+                return Err(rechazar_id_token(
+                    "el ID token va firmado con una clave que el jwks_uri no publica",
+                ));
+            }
+        },
     };
-    let clave = match DecodingKey::from_jwk(jwk) {
+    let clave = match DecodingKey::from_jwk(&jwk) {
         Ok(clave) => clave,
         Err(error) => {
             return Err(rechazar_id_token(&format!(
@@ -411,8 +609,8 @@ pub async fn verificar_id_token(
     let mut validacion = Validation::new(Algorithm::RS256);
     validacion.leeway = 0;
     validacion.validate_aud = true;
-    validacion.set_audience(&[settings.client_id.as_str()]);
-    validacion.set_issuer(&[settings.issuer.as_str()]);
+    validacion.set_audience(&[auth.settings.client_id.as_str()]);
+    validacion.set_issuer(&[auth.settings.issuer.as_str()]);
     validacion.set_required_spec_claims(&["exp", "iss", "aud"]);
 
     let datos = match jsonwebtoken::decode::<IdTokenClaims>(id_token, &clave, &validacion) {
@@ -452,18 +650,25 @@ pub async fn verificar_id_token(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
 
     use super::{
-        AuthorizationRequest, Discovery, MARGEN_DE_RELOJ, SCOPE, TOKEN_LENGTH,
-        build_authorization_url, canjear_codigo, discovery_cached, discovery_url,
-        verificar_id_token,
+        AuthorizationRequest, Discovery, JWKS_TTL, JwksCacheado, MARGEN_DE_RELOJ, SCOPE,
+        TOKEN_LENGTH, build_authorization_url, canjear_codigo, discovery_cached, discovery_url,
+        jwks_cached_en, verificar_id_token,
     };
     use crate::auth::state::AuthState;
     use crate::config::OidcSettings;
-    use crate::error::AppError;
+    use crate::error::{AppError, BAD_GATEWAY_MESSAGE};
     use crate::secret::SecretString;
     use crate::test_support::proveedor_falso::{IdToken, ProveedorFalso, token_con_alg_none};
-    use crate::test_support::{EMAIL, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, SUB, capturar_log};
+    use crate::test_support::{
+        EMAIL, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, SECRETO, SUB, body_json, capturar_log,
+    };
+    use tokio::task::JoinSet;
 
     /// Configuración del proveedor apuntando a un emisor dado.
     fn settings(emisor: &str) -> OidcSettings {
@@ -482,6 +687,18 @@ mod tests {
             token_endpoint: format!("{emisor}/token"),
             jwks_uri: format!("{emisor}/jwks"),
         }
+    }
+
+    /// Estado de autenticación apuntando al proveedor falso dado.
+    ///
+    /// Es lo que necesita la verificación del ID token —y, con ella, toda la caché
+    /// del JWKS—: el conjunto de claves lo resuelve el **estado**, así que el emisor
+    /// tiene que ir dentro y no suelto en la llamada.
+    fn auth(proveedor: &ProveedorFalso) -> AuthState {
+        AuthState::new(
+            settings(&proveedor.issuer),
+            SecretString::new(SECRETO.to_owned()),
+        )
     }
 
     /// Descompone una cadena de consulta en un mapa clave→valor.
@@ -639,8 +856,7 @@ mod tests {
     #[tokio::test]
     async fn un_id_token_valido_devuelve_la_identidad() {
         let proveedor = ProveedorFalso::servir().await;
-        let config = settings(&proveedor.issuer);
-        let documento = discovery(&proveedor.issuer);
+        let estado = auth(&proveedor);
 
         let id_token = proveedor.firmar(&IdToken::valido(
             &proveedor.issuer,
@@ -648,7 +864,7 @@ mod tests {
             "nonce-esperado",
         ));
 
-        let identidad = verificar_id_token(&config, &documento, &id_token, "nonce-esperado")
+        let identidad = verificar_id_token(&estado, &id_token, "nonce-esperado")
             .await
             .expect("un ID token en regla debe verificar");
 
@@ -661,8 +877,7 @@ mod tests {
     #[tokio::test]
     async fn un_id_token_con_firma_invalida_se_rechaza() {
         let proveedor = ProveedorFalso::servir().await;
-        let config = settings(&proveedor.issuer);
-        let documento = discovery(&proveedor.issuer);
+        let estado = auth(&proveedor);
 
         let id_token = proveedor.firmar_con_clave_ajena(&IdToken::valido(
             &proveedor.issuer,
@@ -670,7 +885,7 @@ mod tests {
             "nonce-esperado",
         ));
 
-        let error = verificar_id_token(&config, &documento, &id_token, "nonce-esperado")
+        let error = verificar_id_token(&estado, &id_token, "nonce-esperado")
             .await
             .expect_err("una firma que no cuadra no puede verificar");
 
@@ -685,8 +900,7 @@ mod tests {
     #[tokio::test]
     async fn un_id_token_con_nonce_distinto_se_rechaza() {
         let proveedor = ProveedorFalso::servir().await;
-        let config = settings(&proveedor.issuer);
-        let documento = discovery(&proveedor.issuer);
+        let estado = auth(&proveedor);
 
         let id_token = proveedor.firmar(&IdToken::valido(
             &proveedor.issuer,
@@ -694,7 +908,7 @@ mod tests {
             "nonce-que-no-es",
         ));
 
-        let error = verificar_id_token(&config, &documento, &id_token, "nonce-esperado")
+        let error = verificar_id_token(&estado, &id_token, "nonce-esperado")
             .await
             .expect_err("un nonce distinto no puede verificar");
 
@@ -744,15 +958,13 @@ mod tests {
     /// La guardia de captura se mantiene viva hasta leer el buffer —al soltarla, el
     /// hilo deja de capturar— y se suelta al volver. El rechazo tiene que ser
     /// [`AppError::Unauthorized`]: un `401` tipado, nunca un `500` ni un pánico.
-    async fn rechazo_con_su_causa(
-        config: &OidcSettings,
-        documento: &Discovery,
-        token: &str,
-        nonce: &str,
-    ) -> String {
+    ///
+    /// El estado entra por parámetro, y no el emisor suelto, porque el conjunto de
+    /// claves se resuelve por él: es donde vive la caché del JWKS.
+    async fn rechazo_con_su_causa(estado: &AuthState, token: &str, nonce: &str) -> String {
         let (buffer, _guardia) = capturar_log();
 
-        let error = verificar_id_token(config, documento, token, nonce)
+        let error = verificar_id_token(estado, token, nonce)
             .await
             .expect_err("el ID token tiene que rechazarse");
 
@@ -776,12 +988,11 @@ mod tests {
     #[tokio::test]
     async fn un_id_token_con_alg_none_no_se_acepta() {
         let proveedor = ProveedorFalso::servir().await;
-        let config = settings(&proveedor.issuer);
-        let documento = discovery(&proveedor.issuer);
+        let estado = auth(&proveedor);
 
         let token = token_con_alg_none(&claims_completos(&proveedor, "nonce-esperado"));
 
-        let log = rechazo_con_su_causa(&config, &documento, &token, "nonce-esperado").await;
+        let log = rechazo_con_su_causa(&estado, &token, "nonce-esperado").await;
 
         assert!(
             log.contains("la cabecera del ID token no es válida"),
@@ -803,13 +1014,12 @@ mod tests {
     #[tokio::test]
     async fn un_id_token_firmado_en_hs256_no_se_acepta() {
         let proveedor = ProveedorFalso::servir().await;
-        let config = settings(&proveedor.issuer);
-        let documento = discovery(&proveedor.issuer);
+        let estado = auth(&proveedor);
 
         let token = proveedor
             .firmar_confundiendo_algoritmo(&claims_completos(&proveedor, "nonce-esperado"));
 
-        let log = rechazo_con_su_causa(&config, &documento, &token, "nonce-esperado").await;
+        let log = rechazo_con_su_causa(&estado, &token, "nonce-esperado").await;
 
         assert!(
             log.contains("la verificación del ID token falló: InvalidAlgorithm"),
@@ -822,19 +1032,12 @@ mod tests {
     #[tokio::test]
     async fn un_iss_distinto_no_se_acepta() {
         let proveedor = ProveedorFalso::servir().await;
-        let config = settings(&proveedor.issuer);
-        let documento = discovery(&proveedor.issuer);
+        let estado = auth(&proveedor);
 
         let mut claims = IdToken::valido(&proveedor.issuer, OIDC_CLIENT_ID, "nonce-esperado");
         claims.iss = "https://otro-emisor.test/realms/podpot".to_owned();
 
-        let log = rechazo_con_su_causa(
-            &config,
-            &documento,
-            &proveedor.firmar(&claims),
-            "nonce-esperado",
-        )
-        .await;
+        let log = rechazo_con_su_causa(&estado, &proveedor.firmar(&claims), "nonce-esperado").await;
 
         assert!(
             log.contains("InvalidIssuer"),
@@ -847,19 +1050,12 @@ mod tests {
     #[tokio::test]
     async fn un_aud_ajeno_no_se_acepta() {
         let proveedor = ProveedorFalso::servir().await;
-        let config = settings(&proveedor.issuer);
-        let documento = discovery(&proveedor.issuer);
+        let estado = auth(&proveedor);
 
         let mut claims = IdToken::valido(&proveedor.issuer, OIDC_CLIENT_ID, "nonce-esperado");
         claims.aud = "otro-cliente-distinto".to_owned();
 
-        let log = rechazo_con_su_causa(
-            &config,
-            &documento,
-            &proveedor.firmar(&claims),
-            "nonce-esperado",
-        )
-        .await;
+        let log = rechazo_con_su_causa(&estado, &proveedor.firmar(&claims), "nonce-esperado").await;
 
         assert!(
             log.contains("InvalidAudience"),
@@ -874,21 +1070,14 @@ mod tests {
     #[tokio::test]
     async fn un_id_token_caducado_no_se_acepta() {
         let proveedor = ProveedorFalso::servir().await;
-        let config = settings(&proveedor.issuer);
-        let documento = discovery(&proveedor.issuer);
+        let estado = auth(&proveedor);
 
         let ahora = jsonwebtoken::get_current_timestamp();
         let mut claims = IdToken::valido(&proveedor.issuer, OIDC_CLIENT_ID, "nonce-esperado");
         claims.iat = ahora - 60;
         claims.exp = ahora - 30;
 
-        let log = rechazo_con_su_causa(
-            &config,
-            &documento,
-            &proveedor.firmar(&claims),
-            "nonce-esperado",
-        )
-        .await;
+        let log = rechazo_con_su_causa(&estado, &proveedor.firmar(&claims), "nonce-esperado").await;
 
         assert!(
             log.contains("ExpiredSignature"),
@@ -906,8 +1095,7 @@ mod tests {
     #[tokio::test]
     async fn un_id_token_sin_exp_no_se_acepta() {
         let proveedor = ProveedorFalso::servir().await;
-        let config = settings(&proveedor.issuer);
-        let documento = discovery(&proveedor.issuer);
+        let estado = auth(&proveedor);
 
         let mut claims = claims_completos(&proveedor, "nonce-esperado");
         claims
@@ -916,7 +1104,7 @@ mod tests {
             .remove("exp");
         let token = proveedor.firmar_claims(&claims);
 
-        let log = rechazo_con_su_causa(&config, &documento, &token, "nonce-esperado").await;
+        let log = rechazo_con_su_causa(&estado, &token, "nonce-esperado").await;
 
         assert!(
             log.contains("Missing required claim: exp"),
@@ -934,8 +1122,7 @@ mod tests {
     #[tokio::test]
     async fn un_id_token_emitido_en_el_futuro_no_se_acepta() {
         let proveedor = ProveedorFalso::servir().await;
-        let config = settings(&proveedor.issuer);
-        let documento = discovery(&proveedor.issuer);
+        let estado = auth(&proveedor);
 
         let ahora = jsonwebtoken::get_current_timestamp();
         let mut claims = claims_completos(&proveedor, "nonce-esperado");
@@ -943,7 +1130,7 @@ mod tests {
         claims["exp"] = serde_json::json!(ahora + 1800);
         let token = proveedor.firmar_claims(&claims);
 
-        let log = rechazo_con_su_causa(&config, &documento, &token, "nonce-esperado").await;
+        let log = rechazo_con_su_causa(&estado, &token, "nonce-esperado").await;
 
         assert!(
             log.contains("el ID token se emitió en el futuro"),
@@ -971,20 +1158,14 @@ mod tests {
         const DESFASE_DE_RELOJ: u64 = 30;
 
         let proveedor = ProveedorFalso::servir().await;
-        let config = settings(&proveedor.issuer);
-        let documento = discovery(&proveedor.issuer);
+        let estado = auth(&proveedor);
 
         let mut claims = IdToken::valido(&proveedor.issuer, OIDC_CLIENT_ID, "nonce-esperado");
         claims.iat = jsonwebtoken::get_current_timestamp() + DESFASE_DE_RELOJ;
 
-        let identidad = verificar_id_token(
-            &config,
-            &documento,
-            &proveedor.firmar(&claims),
-            "nonce-esperado",
-        )
-        .await
-        .expect("un desfase de reloj dentro del margen no puede tumbar el login");
+        let identidad = verificar_id_token(&estado, &proveedor.firmar(&claims), "nonce-esperado")
+            .await
+            .expect("un desfase de reloj dentro del margen no puede tumbar el login");
 
         assert_eq!(identidad.sub, SUB);
     }
@@ -999,8 +1180,7 @@ mod tests {
     #[tokio::test]
     async fn un_id_token_sin_iat_no_se_acepta() {
         let proveedor = ProveedorFalso::servir().await;
-        let config = settings(&proveedor.issuer);
-        let documento = discovery(&proveedor.issuer);
+        let estado = auth(&proveedor);
 
         let mut claims = claims_completos(&proveedor, "nonce-esperado");
         claims
@@ -1009,7 +1189,7 @@ mod tests {
             .remove("iat");
         let token = proveedor.firmar_claims(&claims);
 
-        let log = rechazo_con_su_causa(&config, &documento, &token, "nonce-esperado").await;
+        let log = rechazo_con_su_causa(&estado, &token, "nonce-esperado").await;
 
         assert!(
             log.contains("la verificación del ID token falló"),
@@ -1038,12 +1218,11 @@ mod tests {
     #[tokio::test]
     async fn un_id_token_sin_kid_no_se_acepta() {
         let proveedor = ProveedorFalso::servir().await;
-        let config = settings(&proveedor.issuer);
-        let documento = discovery(&proveedor.issuer);
+        let estado = auth(&proveedor);
 
         let token = proveedor.firmar_sin_kid(&claims_completos(&proveedor, "nonce-esperado"));
 
-        let log = rechazo_con_su_causa(&config, &documento, &token, "nonce-esperado").await;
+        let log = rechazo_con_su_causa(&estado, &token, "nonce-esperado").await;
 
         assert!(
             log.contains("el ID token no declara kid"),
@@ -1058,16 +1237,270 @@ mod tests {
     #[tokio::test]
     async fn un_id_token_con_un_kid_que_el_jwks_no_publica_no_se_acepta() {
         let proveedor = ProveedorFalso::servir().await;
-        let config = settings(&proveedor.issuer);
-        let documento = discovery(&proveedor.issuer);
+        let estado = auth(&proveedor);
 
         let token = proveedor.firmar_con_kid_ajeno(&claims_completos(&proveedor, "nonce-esperado"));
 
-        let log = rechazo_con_su_causa(&config, &documento, &token, "nonce-esperado").await;
+        let log = rechazo_con_su_causa(&estado, &token, "nonce-esperado").await;
 
         assert!(
             log.contains("una clave que el jwks_uri no publica"),
             "el rechazo no viene de que el kid no esté en el JWKS: {log}"
+        );
+    }
+
+    // --- La caché del JWKS -----------------------------------------------------
+    //
+    // El conjunto de claves del proveedor se pide hoy en **cada** callback, y estas
+    // pruebas son las que exigen lo contrario: que se cachee con frescura acotada,
+    // que se refresque cuando aparece un `kid` que la caché no publica (rotación) y
+    // que un refresco que falla siga desenlazando en el `502` de la casa. Los conteos
+    // salen del contador del doble —[`ProveedorFalso::peticiones_al_jwks`]—, que
+    // cuenta **idas** al `jwks_uri` responda lo que responda el proveedor: contar
+    // lecturas es la única forma de probar que un callback no vuelve a pedir el
+    // conjunto.
+
+    /// Deja el conjunto del proveedor cacheado pagando **una sola** lectura.
+    ///
+    /// Es el punto de partida de los escenarios de rotación y de refresco fallido:
+    /// en los dos, el ID token trae un `kid` que el conjunto cacheado no publica, así
+    /// que lo que se mida después solo vale si antes había caché de verdad. La
+    /// aserción del conteo va aquí, y no en cada prueba, porque es lo que fija que ese
+    /// estado inicial sea el que el escenario supone —un conjunto **cacheado**— y no
+    /// una lectura de más.
+    async fn cachear_el_jwks(estado: &AuthState, proveedor: &ProveedorFalso) {
+        let id_token = proveedor.firmar(&IdToken::valido(
+            &proveedor.issuer,
+            OIDC_CLIENT_ID,
+            "nonce-esperado",
+        ));
+
+        verificar_id_token(estado, &id_token, "nonce-esperado")
+            .await
+            .expect("el primer callback debe verificar");
+        verificar_id_token(estado, &id_token, "nonce-esperado")
+            .await
+            .expect("el segundo callback debe verificar con el conjunto cacheado");
+
+        assert_eq!(
+            proveedor.peticiones_al_jwks(),
+            1,
+            "cachear el conjunto cuesta una sola lectura del jwks_uri"
+        );
+    }
+
+    /// Traduce un error del flujo a la respuesta HTTP que vería el cliente.
+    ///
+    /// Se hace aquí —y no en una prueba HTTP— porque el refresco del `jwks_uri` es
+    /// una decisión de este módulo: es aquí donde se puede forzar que el proveedor se
+    /// caiga, y el escenario del refresco fallido habla de la **respuesta**, no solo
+    /// del error.
+    async fn respuesta_de(error: AppError) -> (StatusCode, serde_json::Value) {
+        let respuesta = error.into_response();
+        let estado = respuesta.status();
+
+        (estado, body_json(respuesta).await)
+    }
+
+    /// Escenario «Reutilización dentro del TTL»: dos callbacks válidos dentro del
+    /// TTL se pagan con **una sola** lectura del `jwks_uri`, y el segundo verifica con
+    /// el conjunto cacheado.
+    #[tokio::test]
+    async fn dos_callbacks_dentro_del_ttl_piden_el_jwks_una_sola_vez() {
+        let proveedor = ProveedorFalso::servir().await;
+        let estado = auth(&proveedor);
+        let id_token = proveedor.firmar(&IdToken::valido(
+            &proveedor.issuer,
+            OIDC_CLIENT_ID,
+            "nonce-esperado",
+        ));
+
+        let primero = verificar_id_token(&estado, &id_token, "nonce-esperado")
+            .await
+            .expect("el primer callback debe verificar");
+        let segundo = verificar_id_token(&estado, &id_token, "nonce-esperado")
+            .await
+            .expect("el segundo callback debe verificar con el conjunto cacheado");
+
+        assert_eq!(primero.sub, SUB);
+        assert_eq!(segundo.email, EMAIL);
+        assert_eq!(
+            proveedor.peticiones_al_jwks(),
+            1,
+            "dentro del TTL el jwks_uri se lee una sola vez para los dos callbacks"
+        );
+    }
+
+    /// Escenario «Expiración del TTL»: caducada la caché, la siguiente lectura
+    /// vuelve a pedir el `jwks_uri` y la entrada se sustituye por la recién leída.
+    ///
+    /// La caducidad se fabrica **sin depender del reloj de la máquina**: se siembra la
+    /// caché **fresca** y se evalúa a una fecha posterior al TTL. Restar el TTL al
+    /// reloj monotónico —el recurso de la prueba del `state` caducado— daría por hecho
+    /// que el sistema lleva más de un TTL en marcha, que no es cierto en un runner
+    /// recién arrancado; con la fecha inyectada, la prueba decide cuándo se evalúa la
+    /// caché y el vencimiento es determinista. Se siembra con el conjunto **vigente**
+    /// para que el refresco solo pueda venir de la caducidad y no de un `kid` que el
+    /// conjunto no publica.
+    #[tokio::test]
+    async fn transcurrido_el_ttl_se_vuelve_a_pedir_el_jwks() {
+        let proveedor = ProveedorFalso::servir().await;
+        let estado = auth(&proveedor);
+
+        let leido_en = Instant::now();
+        *estado.jwks.write().await = Some(JwksCacheado {
+            conjunto: proveedor.jwks_publicado(),
+            leido_en,
+        });
+        let ahora = leido_en + JWKS_TTL + Duration::from_secs(1);
+
+        jwks_cached_en(&estado, ahora)
+            .await
+            .expect("un conjunto caducado debe poder volver a leerse");
+
+        assert_eq!(
+            proveedor.peticiones_al_jwks(),
+            1,
+            "caducado el TTL, el jwks_uri se lee de nuevo"
+        );
+
+        let cacheada = estado
+            .jwks
+            .read()
+            .await
+            .clone()
+            .expect("el conjunto recién leído tiene que quedar cacheado");
+        assert_eq!(
+            cacheada.leido_en, ahora,
+            "la caché tiene que sustituirse por el conjunto recién leído, fechado a la fecha evaluada"
+        );
+    }
+
+    /// Escenario «Dos callbacks concurrentes sobre una caché caducada»: con el
+    /// conjunto vencido, dos callbacks que coinciden en el tiempo se pagan con **una
+    /// sola** lectura del `jwks_uri`.
+    ///
+    /// Es el candado de que el refresco se hace con el candado de escritura en la mano
+    /// y no antes de tomarlo: si cada callback pidiera el conjunto nada más ver la
+    /// caché vencida, aquí habría dos lecturas. La aserción es determinista aunque el
+    /// entrelazado no lo sea —da igual que el segundo callback llegue antes o después
+    /// de que el primero escriba—: si mira la caché después, ya la encuentra fresca, y
+    /// si espera al candado, la vuelve a mirar bajo él. Por eso no hace falta forzar un
+    /// orden concreto, solo lanzarlos a la vez.
+    #[tokio::test]
+    async fn dos_callbacks_concurrentes_sobre_una_cache_caducada_piden_el_jwks_una_sola_vez() {
+        let proveedor = ProveedorFalso::servir().await;
+        let estado = auth(&proveedor);
+
+        let leido_en = Instant::now();
+        *estado.jwks.write().await = Some(JwksCacheado {
+            conjunto: proveedor.jwks_publicado(),
+            leido_en,
+        });
+        let ahora = leido_en + JWKS_TTL + Duration::from_secs(1);
+
+        let mut tareas = JoinSet::new();
+        for _ in 0..2 {
+            let estado = estado.clone();
+            tareas.spawn(async move { jwks_cached_en(&estado, ahora).await });
+        }
+
+        while let Some(resultado) = tareas.join_next().await {
+            resultado
+                .expect("la tarea no puede entrar en pánico")
+                .expect("un conjunto caducado debe poder volver a leerse");
+        }
+
+        assert_eq!(
+            proveedor.peticiones_al_jwks(),
+            1,
+            "dos callbacks a la vez sobre una caché caducada comparten una sola lectura"
+        );
+    }
+
+    /// Escenario «Rotación de claves con un `kid` que la caché no publica»: el
+    /// proveedor publica una clave nueva y el ID token va firmado con ella, pero el
+    /// conjunto cacheado es el de antes; se refresca una vez y el token entra.
+    ///
+    /// El escenario es sobre el conjunto **cacheado**, así que la prueba primero lo
+    /// cachea —y fija que ese tramo cuesta una sola lectura— y solo entonces rota:
+    /// sin la caché, el `jwks_uri` publica siempre la clave nueva y el token entraría
+    /// sin refrescar nada, que es justo lo que la prueba no puede dar por bueno.
+    #[tokio::test]
+    async fn un_kid_que_la_cache_no_publica_se_refresca_una_vez_y_se_acepta() {
+        let proveedor = ProveedorFalso::servir().await;
+        let estado = auth(&proveedor);
+
+        cachear_el_jwks(&estado, &proveedor).await;
+
+        // El proveedor rota: deja de publicar la clave vigente y publica otra, con
+        // otro `kid`. La caché se queda con la vieja.
+        let rotada = proveedor.rotar_clave();
+        let token_rotado = proveedor.firmar_con_rotada(
+            &rotada,
+            &IdToken::valido(&proveedor.issuer, OIDC_CLIENT_ID, "nonce-esperado"),
+        );
+
+        let identidad = verificar_id_token(&estado, &token_rotado, "nonce-esperado")
+            .await
+            .expect("el refresco del JWKS debe aceptar el ID token rotado");
+
+        assert_eq!(identidad.sub, SUB);
+        assert_eq!(
+            proveedor.peticiones_al_jwks(),
+            2,
+            "el refresco por un kid que la caché no publica se pide una sola vez más"
+        );
+    }
+
+    /// Escenario «Proveedor caído al refrescar el JWKS»: el `jwks_uri` deja de
+    /// responder justo cuando hay que refrescar. El desenlace es el `502` de la casa
+    /// —la envoltura de siempre, y **sin** la causa del proveedor— y no hay identidad
+    /// que emitir: no hay sesión.
+    ///
+    /// El refresco lo fuerza la rotación: el ID token trae un `kid` que el conjunto
+    /// cacheado no publica, así que el flujo **tiene** que ir al proveedor, y es ahí
+    /// donde se lo encuentra caído. Si se rindiera con un rechazo genérico en vez de
+    /// con el `502`, este candado se pondría rojo.
+    #[tokio::test]
+    async fn un_jwks_que_falla_al_refrescar_da_un_502_sin_sesion() {
+        let proveedor = ProveedorFalso::servir().await;
+        let estado = auth(&proveedor);
+
+        cachear_el_jwks(&estado, &proveedor).await;
+
+        let rotada = proveedor.rotar_clave();
+        let token_rotado = proveedor.firmar_con_rotada(
+            &rotada,
+            &IdToken::valido(&proveedor.issuer, OIDC_CLIENT_ID, "nonce-esperado"),
+        );
+        proveedor.tumbar_el_jwks();
+
+        let error = verificar_id_token(&estado, &token_rotado, "nonce-esperado")
+            .await
+            .expect_err("sin JWKS al que ir no hay identidad que emitir");
+
+        assert!(
+            matches!(error, AppError::BadGateway(_)),
+            "un proveedor que no responde al JWKS es un 502 tipado: {error}"
+        );
+
+        let (estado_http, cuerpo) = respuesta_de(error).await;
+
+        assert_eq!(
+            estado_http,
+            StatusCode::BAD_GATEWAY,
+            "el refresco que falla desenlaza en 502: {cuerpo}"
+        );
+        assert_eq!(cuerpo["error"]["code"], "bad_gateway");
+        assert_eq!(
+            cuerpo["error"]["message"], BAD_GATEWAY_MESSAGE,
+            "el cuerpo no puede publicar la causa del proveedor: {cuerpo}"
+        );
+        assert_eq!(
+            proveedor.peticiones_al_jwks(),
+            2,
+            "el jwks_uri se refresca una sola vez antes de rendirse"
         );
     }
 }
