@@ -36,14 +36,14 @@ beforeEach(() => {
 describe('pantalla de quadlets', () => {
   it('lista cada quadlet con su estado', async () => {
     vi.mocked(listarUnidades).mockResolvedValue([
-      unidad({ name: 'web.container', active_state: 'active', sub_state: 'running' }),
-      unidad({ name: 'db.container', active_state: 'failed', sub_state: 'failed' }),
+      unidad({ name: 'web.service', active_state: 'active', sub_state: 'running' }),
+      unidad({ name: 'db.service', active_state: 'failed', sub_state: 'failed' }),
     ])
 
     montar()
 
-    expect(await screen.findByText('web.container')).toBeInTheDocument()
-    expect(screen.getByText('db.container')).toBeInTheDocument()
+    expect(await screen.findByText('web.service')).toBeInTheDocument()
+    expect(screen.getByText('db.service')).toBeInTheDocument()
     expect(screen.getByText('En ejecución')).toBeInTheDocument()
     expect(screen.getByText('Fallida')).toBeInTheDocument()
   })
@@ -60,7 +60,7 @@ describe('pantalla de quadlets', () => {
     const usuario = userEvent.setup()
     vi.mocked(listarUnidades)
       .mockRejectedValueOnce(new ErrorDeApi(500, 'internal_error', 'no se pudo hablar con systemd'))
-      .mockResolvedValueOnce([unidad({ name: 'web.container' })])
+      .mockResolvedValueOnce([unidad({ name: 'web.service' })])
 
     montar()
 
@@ -69,28 +69,28 @@ describe('pantalla de quadlets', () => {
 
     await usuario.click(screen.getByRole('button', { name: 'Reintentar' }))
 
-    expect(await screen.findByText('web.container')).toBeInTheDocument()
+    expect(await screen.findByText('web.service')).toBeInTheDocument()
   })
 
   it('arranca una quadlet, avisa del resultado y refresca el estado', async () => {
     const usuario = userEvent.setup()
     vi.mocked(listarUnidades)
       .mockResolvedValueOnce([
-        unidad({ name: 'web.container', active_state: 'inactive', sub_state: 'dead' }),
+        unidad({ name: 'web.service', active_state: 'inactive', sub_state: 'dead' }),
       ])
       .mockResolvedValueOnce([
-        unidad({ name: 'web.container', active_state: 'active', sub_state: 'running' }),
+        unidad({ name: 'web.service', active_state: 'active', sub_state: 'running' }),
       ])
-    vi.mocked(accionDeUnidad).mockResolvedValue({ name: 'web.container', active_state: 'active' })
+    vi.mocked(accionDeUnidad).mockResolvedValue({ name: 'web.service', active_state: 'active' })
 
     montar()
 
     expect(await screen.findByText('Parada')).toBeInTheDocument()
 
-    await usuario.click(screen.getByRole('button', { name: 'Arrancar web.container' }))
+    await usuario.click(screen.getByRole('button', { name: 'Arrancar web.service' }))
 
-    expect(await screen.findByText(/«web.container» arrancada/i)).toBeInTheDocument()
-    expect(vi.mocked(accionDeUnidad)).toHaveBeenCalledWith('web.container', 'start')
+    expect(await screen.findByText(/«web.service» arrancada/i)).toBeInTheDocument()
+    expect(vi.mocked(accionDeUnidad)).toHaveBeenCalledWith('web.service', 'start')
     // El refresco vuelve a pedir la lista y termina mostrando el estado nuevo.
     expect(await screen.findByText('En ejecución')).toBeInTheDocument()
     await waitFor(() => expect(vi.mocked(listarUnidades)).toHaveBeenCalledTimes(2))
@@ -99,7 +99,7 @@ describe('pantalla de quadlets', () => {
   it('un error de acción avisa y mantiene el estado real de la unidad', async () => {
     const usuario = userEvent.setup()
     vi.mocked(listarUnidades).mockResolvedValue([
-      unidad({ name: 'web.container', active_state: 'inactive', sub_state: 'dead' }),
+      unidad({ name: 'web.service', active_state: 'inactive', sub_state: 'dead' }),
     ])
     vi.mocked(accionDeUnidad).mockRejectedValue(
       new ErrorDeApi(409, 'unit_conflict', 'la unidad está en transición'),
@@ -109,7 +109,7 @@ describe('pantalla de quadlets', () => {
 
     expect(await screen.findByText('Parada')).toBeInTheDocument()
 
-    await usuario.click(screen.getByRole('button', { name: 'Arrancar web.container' }))
+    await usuario.click(screen.getByRole('button', { name: 'Arrancar web.service' }))
 
     expect(await screen.findByText('la unidad está en transición')).toBeInTheDocument()
     // Sin refresco: la tabla sigue enseñando el estado real de la unidad.

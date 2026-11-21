@@ -23,7 +23,7 @@ describe('api de unidades', () => {
       respuesta({
         data: [
           {
-            name: 'web.container',
+            name: 'web.service',
             active_state: 'active',
             sub_state: 'running',
             unit_file_state: 'generated',
@@ -42,14 +42,14 @@ describe('api de unidades', () => {
   it('accionDeUnidad hace POST a la ruta de la acción', async () => {
     const fetch = vi
       .fn()
-      .mockResolvedValue(respuesta({ data: { name: 'web.container', active_state: 'active' } }))
+      .mockResolvedValue(respuesta({ data: { name: 'web.service', active_state: 'active' } }))
     vi.stubGlobal('fetch', fetch)
 
-    const resultado = await accionDeUnidad('web.container', 'start')
+    const resultado = await accionDeUnidad('web.service', 'start')
 
     expect(resultado.active_state).toBe('active')
     const [url, init] = fetch.mock.calls[0] as [string, RequestInit]
-    expect(url).toBe('/api/v1/units/web.container/start')
+    expect(url).toBe('/api/v1/units/web.service/start')
     expect(init.method).toBe('POST')
   })
 
