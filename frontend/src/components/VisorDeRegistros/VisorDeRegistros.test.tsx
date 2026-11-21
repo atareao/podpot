@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { EventSourceFalso } from '../../../tests/eventSourceFalso'
 import { VisorDeRegistros } from './VisorDeRegistros'
@@ -23,6 +23,38 @@ function doblarScrollIntoView(): { desplazar: ReturnType<typeof vi.fn>; restaura
   const desplazar = vi.fn()
   Element.prototype.scrollIntoView = desplazar as unknown as Element['scrollIntoView']
   return { desplazar, restaurar: () => (Element.prototype.scrollIntoView = original) }
+}
+
+/**
+ * Fija las medidas de scroll del registro y simula el desplazamiento del usuario.
+ *
+ * Deja el contenedor a `scrollHeight - scrollTop - clientHeight` px del fondo, que
+ * es la distancia con la que el visor decide si el usuario está «pegado al fondo».
+ * jsdom no calcula layout, así que estas medidas hay que fijarlas a mano.
+ */
+function simularScroll(
+  registro: HTMLElement,
+  medidas: { scrollHeight: number; clientHeight: number; scrollTop: number },
+): void {
+  Object.defineProperty(registro, 'scrollHeight', { value: medidas.scrollHeight, configurable: true })
+  Object.defineProperty(registro, 'clientHeight', { value: medidas.clientHeight, configurable: true })
+  Object.defineProperty(registro, 'scrollTop', {
+    value: medidas.scrollTop,
+    configurable: true,
+    writable: true,
+  })
+  fireEvent.scroll(registro)
+}
+
+/** Abre el visor de una unidad, emite una primera línea y devuelve lo necesario. */
+async function abrirConPrimeraLinea(unidad = 'web.service') {
+  const vista = render(<VisorDeRegistros unidad={unidad} onCerrar={vi.fn()} />)
+  const fuente = EventSourceFalso.instancias.at(-1)!
+  emitir(fuente, [{ line: 'primera', stream: 'stdout' }])
+  // El contenedor del log solo existe cuando hay líneas: esperarlo deja el volcado
+  // por lote ya aplicado y sus efectos, corridos.
+  const registro = await screen.findByRole('log')
+  return { ...vista, fuente, registro }
 }
 
 describe('VisorDeRegistros', () => {
@@ -58,17 +90,15 @@ describe('VisorDeRegistros', () => {
   it('arrastra el scroll al final al llegar líneas si el usuario está pegado al fondo', async () => {
     const { desplazar, restaurar } = doblarScrollIntoView()
     try {
-      render(<VisorDeRegistros unidad="web.service" onCerrar={vi.fn()} />)
-      const fuente = EventSourceFalso.instancias[0]!
-
-      emitir(fuente, [{ line: 'primera', stream: 'stdout' }])
-      await screen.findByText('primera')
+      const { fuente } = await abrirConPrimeraLinea()
 
       desplazar.mockClear()
       emitir(fuente, [{ line: 'segunda', stream: 'stdout' }])
       await screen.findByText('segunda')
 
-      expect(desplazar).toHaveBeenCalled()
+      // El autodesplazamiento lo dispara un efecto tras el volcado por lote: se
+      // espera a él en vez de afirmar a renglón seguido (sin depender del timing).
+      await waitFor(() => expect(desplazar).toHaveBeenCalled())
     } finally {
       restaurar()
     }
@@ -77,24 +107,64 @@ describe('VisorDeRegistros', () => {
   it('no arrastra el scroll al final si el usuario subió a leer', async () => {
     const { desplazar, restaurar } = doblarScrollIntoView()
     try {
-      render(<VisorDeRegistros unidad="web.service" onCerrar={vi.fn()} />)
-      const fuente = EventSourceFalso.instancias[0]!
-
-      emitir(fuente, [{ line: 'primera', stream: 'stdout' }])
-      await screen.findByText('primera')
+      const { fuente, registro } = await abrirConPrimeraLinea()
 
       // El usuario subió: queda mucho contenido por debajo del viewport.
-      const registro = screen.getByRole('log')
-      Object.defineProperty(registro, 'scrollHeight', { value: 1000, configurable: true })
-      Object.defineProperty(registro, 'clientHeight', { value: 100, configurable: true })
-      Object.defineProperty(registro, 'scrollTop', { value: 0, configurable: true, writable: true })
-      fireEvent.scroll(registro)
+      simularScroll(registro, { scrollHeight: 1000, clientHeight: 100, scrollTop: 0 })
 
       desplazar.mockClear()
       emitir(fuente, [{ line: 'segunda', stream: 'stdout' }])
       await screen.findByText('segunda')
 
       expect(desplazar).not.toHaveBeenCalled()
+    } finally {
+      restaurar()
+    }
+  })
+
+  it('trata el umbral de 24 px como frontera: 25 px no desplaza, 24 px sí', async () => {
+    const { desplazar, restaurar } = doblarScrollIntoView()
+    try {
+      const { fuente, registro } = await abrirConPrimeraLinea()
+
+      // 25 px hasta el fondo: por encima del umbral, no arrastra.
+      simularScroll(registro, { scrollHeight: 125, clientHeight: 100, scrollTop: 0 })
+      desplazar.mockClear()
+      emitir(fuente, [{ line: 'segunda', stream: 'stdout' }])
+      await screen.findByText('segunda')
+      expect(desplazar).not.toHaveBeenCalled()
+
+      // 24 px hasta el fondo: justo en el límite, sí arrastra.
+      simularScroll(registro, { scrollHeight: 124, clientHeight: 100, scrollTop: 0 })
+      desplazar.mockClear()
+      emitir(fuente, [{ line: 'tercera', stream: 'stdout' }])
+      await screen.findByText('tercera')
+      await waitFor(() => expect(desplazar).toHaveBeenCalled())
+    } finally {
+      restaurar()
+    }
+  })
+
+  it('al reabrir el visor vuelve a considerarse pegado al fondo', async () => {
+    const { desplazar, restaurar } = doblarScrollIntoView()
+    try {
+      const { rerender, fuente, registro } = await abrirConPrimeraLinea()
+
+      // El usuario sube a leer antes de cerrar.
+      simularScroll(registro, { scrollHeight: 1000, clientHeight: 100, scrollTop: 0 })
+
+      // Cierra y reabre la misma unidad: el cuerpo se remonta y parte de «pegado».
+      rerender(<VisorDeRegistros unidad={null} onCerrar={vi.fn()} />)
+      rerender(<VisorDeRegistros unidad="web.service" onCerrar={vi.fn()} />)
+
+      const fuenteReabierta = EventSourceFalso.instancias.at(-1)!
+      expect(fuenteReabierta).not.toBe(fuente)
+
+      desplazar.mockClear()
+      emitir(fuenteReabierta, [{ line: 'tras reabrir', stream: 'stdout' }])
+      await screen.findByText('tras reabrir')
+
+      await waitFor(() => expect(desplazar).toHaveBeenCalled())
     } finally {
       restaurar()
     }
