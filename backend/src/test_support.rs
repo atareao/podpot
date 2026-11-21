@@ -11,17 +11,24 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use axum::response::Response;
 use http_body_util::BodyExt;
+use tokio::sync::{broadcast, watch};
 use tower::ServiceExt;
 
 use crate::config::Config;
 use crate::db;
-use crate::state::AppState;
+use crate::state::{AppState, CAPACIDAD_DE_EVENTOS};
 use crate::systemd::fake::FakeSystemd;
-use crate::systemd::{SystemdClient, SystemdError};
+use crate::systemd::{SystemdClient, SystemdError, UnitWatcher};
 
 /// Lo que una prueba necesita para ejercer la aplicación.
 pub struct Entorno {
     state: AppState,
+    /// El disparador del cierre.
+    ///
+    /// Vive aquí —y no dentro del estado— porque el estado sólo necesita poder
+    /// **mirar** si el proceso se está apagando: quien lo dispara es quien arranca
+    /// el servidor, y en una prueba eso es la propia prueba.
+    cierre: watch::Sender<bool>,
     /// El directorio de la base temporal.
     ///
     /// Se guarda —y no se suelta al terminar de componer— porque el directorio se
@@ -51,6 +58,16 @@ impl Entorno {
     pub fn quadlet_dir(&self) -> &std::path::Path {
         &self.state.config.quadlet_dir
     }
+
+    /// Dispara el cierre, como haría la señal de terminación del proceso.
+    ///
+    /// Es lo que permite medir el apagado ordenado sin mandar una señal de verdad:
+    /// el fan-out termina y los flujos SSE acaban porque los dos miran este mismo
+    /// canal.
+    pub fn cerrar(&self) {
+        // Sin receptores el envío falla, y no es un error: nadie mira.
+        let _ = self.cierre.send(true);
+    }
 }
 
 /// Un entorno con la configuración mínima que arranca y el doble de muestra.
@@ -77,7 +94,19 @@ pub async fn entorno_con(systemd: Arc<dyn SystemdClient>) -> Entorno {
     montar(systemd, None).await
 }
 
-/// Compone el entorno: base temporal, configuración y estado.
+/// Un entorno con el doble de systemd, devolviendo además su trazo de vigilante.
+///
+/// Es la puerta del canal en vivo: el fan-out necesita las **dos** caras del mismo
+/// objeto —el listado que recalcula y los avisos que lo disparan—, y el doble las
+/// tiene. Se devuelven juntas porque tienen que ser el mismo doble: con dos
+/// distintos, un aviso no tendría nada que ver con lo que se lista.
+pub async fn entorno_con_vigilante(doble: Arc<FakeSystemd>) -> (Entorno, Arc<dyn UnitWatcher>) {
+    let vigilante: Arc<dyn UnitWatcher> = doble.clone();
+
+    (entorno_con(doble).await, vigilante)
+}
+
+/// Compone el entorno: base temporal, configuración, canales y estado.
 async fn montar(systemd: Arc<dyn SystemdClient>, panel: Option<&std::path::Path>) -> Entorno {
     let dir = tempfile::tempdir().expect("se tiene que poder crear un directorio temporal");
     let dsn = format!("sqlite://{}/podpot.db", dir.path().display());
@@ -93,12 +122,21 @@ async fn montar(systemd: Arc<dyn SystemdClient>, panel: Option<&std::path::Path>
     // él, así que no puede apuntar al del usuario que compila.
     let quadlets = tempfile::tempdir().expect("se tiene que poder crear un directorio temporal");
 
+    // Los dos canales del canal en vivo. El extremo «de escritura» de cada uno se
+    // queda aquí: el de los eventos no hace falta —el fan-out publica con el que
+    // guarda el estado—, pero el del cierre sí, y es lo que `cerrar()` dispara.
+    let (eventos, _) = broadcast::channel(CAPACIDAD_DE_EVENTOS);
+    let (cierre, apagado) = watch::channel(false);
+
     Entorno {
         state: AppState::new(
             config_de_prueba_con(&dsn, panel, quadlets.path()),
             pool,
             systemd,
+            eventos,
+            apagado,
         ),
+        cierre,
         _dir: dir,
         _quadlets: quadlets,
     }
@@ -190,6 +228,114 @@ impl SystemdClient for DobleQueFalla {
     async fn reload(&self) -> Result<(), SystemdError> {
         Err(self.error())
     }
+}
+
+/// Un doble que se queda **dentro** del listado hasta que la prueba lo deja seguir.
+///
+/// Es la puerta de las pruebas de orden: con el listado retenido, la prueba sabe
+/// cuándo el manejador está dentro de él —y, por tanto, cuándo ya pasó por todo lo
+/// que va antes— y puede publicar un cambio justo en ese hueco. Sin poder retener
+/// el listado, la carrera entre suscribirse y listar no se puede medir: sólo se
+/// podría mirar el resultado, que es idéntico pase lo que pase.
+pub struct DobleRetenido {
+    /// Lo que devuelve el listado cuando se le deja seguir.
+    unidades: Vec<crate::systemd::UnitStatus>,
+    /// Se completa al entrar en `quadlets()`.
+    dentro: Arc<tokio::sync::Notify>,
+    /// Se espera, ya dentro, para dejar terminar el listado.
+    seguir: Arc<tokio::sync::Notify>,
+}
+
+impl DobleRetenido {
+    /// Un doble que devuelve `unidades` en cuanto se le deja seguir.
+    pub fn con(unidades: Vec<crate::systemd::UnitStatus>) -> Self {
+        Self {
+            unidades,
+            dentro: Arc::new(tokio::sync::Notify::new()),
+            seguir: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    /// Se completa cuando el doble entra en el listado.
+    pub fn dentro(&self) -> Arc<tokio::sync::Notify> {
+        self.dentro.clone()
+    }
+
+    /// Deja que el listado termine.
+    pub fn seguir(&self) -> Arc<tokio::sync::Notify> {
+        self.seguir.clone()
+    }
+}
+
+impl std::fmt::Debug for DobleRetenido {
+    /// El trait exige `Debug`; se nombra el doble y no se publica el listado
+    /// retenido, que no aporta nada al diagnóstico.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DobleRetenido")
+    }
+}
+
+#[async_trait]
+impl SystemdClient for DobleRetenido {
+    /// El listado retenido: avisa de que está dentro y espera a que la prueba lo
+    /// deje seguir.
+    async fn quadlets(&self) -> Result<Vec<crate::systemd::UnitStatus>, SystemdError> {
+        self.dentro.notify_one();
+        self.seguir.notified().await;
+
+        Ok(self.unidades.clone())
+    }
+
+    async fn status(
+        &self,
+        _unit: &crate::systemd::UnitName,
+    ) -> Result<crate::systemd::UnitStatus, SystemdError> {
+        Err(no_se_usa())
+    }
+
+    async fn action(
+        &self,
+        _unit: &crate::systemd::UnitName,
+        _action: crate::systemd::UnitAction,
+    ) -> Result<crate::systemd::UnitStatus, SystemdError> {
+        Err(no_se_usa())
+    }
+
+    async fn reload(&self) -> Result<(), SystemdError> {
+        Err(no_se_usa())
+    }
+}
+
+/// El error de las llamadas que un doble de prueba no ejerce.
+///
+/// No es una ausencia fingida: si alguna prueba llegara aquí por error, lo que
+/// quiere saber es que llamó donde no debía, y eso lo dice el texto.
+fn no_se_usa() -> SystemdError {
+    SystemdError::Transport {
+        causa: Box::new(std::io::Error::other(
+            "el doble retenido sólo ejerce el listado",
+        )),
+    }
+}
+
+/// Lanza una petición contra el router y devuelve la respuesta **sin leer** el
+/// cuerpo.
+///
+/// Es lo que necesitan las pruebas del canal en vivo: un flujo `text/event-stream`
+/// no termina —es justo su razón de ser—, así que leerlo entero colgaría la
+/// prueba. Con la respuesta en la mano se mira la cabecera y se leen los trozos que
+/// van llegando.
+pub async fn peticion_cruda(app: &Router, method: Method, uri: &str) -> Response {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(Body::empty())
+                .expect("la petición de prueba se construye siempre"),
+        )
+        .await
+        .expect("el router no puede fallar al atender")
 }
 
 /// Lanza una petición contra el router y devuelve el código y el cuerpo JSON.

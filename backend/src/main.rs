@@ -8,12 +8,14 @@
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use tokio::sync::{broadcast, watch};
+
 use podpot::config::{Config, DEFAULT_LOG_FILTER, SystemdBackend};
-use podpot::state::AppState;
+use podpot::state::{AppState, CAPACIDAD_DE_EVENTOS};
 use podpot::systemd::dbus::DbusSystemdClient;
 use podpot::systemd::fake::FakeSystemd;
-use podpot::systemd::{SystemdClient, SystemdError};
-use podpot::{db, server};
+use podpot::systemd::{SystemdClient, SystemdError, UnitWatcher};
+use podpot::{db, fanout, server};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -54,9 +56,11 @@ async fn main() -> ExitCode {
 
     // 5. El cliente de systemd. La elección se toma aquí y en ningún otro sitio:
     //    el estado se queda con el objeto que se le dé, así que ninguna ruta tiene
-    //    que saber si por debajo hay bus o doble.
-    let systemd = match cliente_de_systemd(config.systemd_backend).await {
-        Ok(systemd) => systemd,
+    //    que saber si por debajo hay bus o doble. El mismo objeto se entrega como
+    //    **dos** trazos: el listado que contesta preguntas y el vigilante que avisa
+    //    de los cambios.
+    let (systemd, vigilante) = match cliente_de_systemd(config.systemd_backend).await {
+        Ok(par) => par,
         Err(error) => {
             eprintln!("podpot no puede arrancar: {error}");
             pool.close().await;
@@ -64,8 +68,14 @@ async fn main() -> ExitCode {
         }
     };
 
-    // 6. Escucha y apagado: el estado se compone con las tres piezas ya resueltas.
-    let estado = AppState::new(config, pool.clone(), systemd);
+    // 6. Los dos canales del canal en vivo. Sus extremos «de escritura» se quedan
+    //    aquí: el de los eventos lo comparte el estado —el fan-out publica por él—
+    //    y el del cierre lo dispara la señal de terminación.
+    let (eventos, _) = broadcast::channel(CAPACIDAD_DE_EVENTOS);
+    let (disparador, apagado) = watch::channel(false);
+
+    // 7. Escucha y apagado: el estado se compone con las piezas ya resueltas.
+    let estado = AppState::new(config, pool.clone(), systemd, eventos, apagado);
     let direccion = estado.bind_address();
 
     let listener = match tokio::net::TcpListener::bind(direccion).await {
@@ -79,7 +89,25 @@ async fn main() -> ExitCode {
 
     tracing::info!(%direccion, "escuchando");
 
-    let resultado = server::serve(estado, listener, server::shutdown_signal()).await;
+    // 8. El fan-out: consume los avisos del vigilante, recalcula la instantánea y
+    //    la publica en el canal que lee el stream. Se arranca antes de escuchar
+    //    para que ningún cambio entre el arranque y la primera petición se pierda.
+    let fanout = fanout::arrancar(estado.clone(), vigilante.as_ref());
+
+    // 9. El cierre: la señal de terminación apaga el canal y con él los flujos SSE
+    //    y el fan-out, **antes** de que el apagado ordenado espere a las conexiones
+    //    en curso —si no, un stream perpetuo lo colgaría—.
+    let cierre = async move {
+        server::shutdown_signal().await;
+        // Sin receptores el envío falla, y no es un error: nadie mira.
+        let _ = disparador.send(true);
+    };
+
+    let resultado = server::serve(estado, listener, cierre).await;
+
+    // El fan-out mira el mismo canal de cierre, así que termina solo; se espera
+    // para no dejar una tarea a la espalda.
+    let _ = fanout.await;
 
     // La escucha ha terminado sin nadie atendiendo: el pool se cierra antes de
     // salir, que es la mitad de «liberar los recursos» del apagado ordenado.
@@ -99,18 +127,35 @@ async fn main() -> ExitCode {
     }
 }
 
-/// El cliente de systemd que pide la configuración.
+/// El cliente de systemd que pide la configuración, con sus **dos** trazos.
 ///
 /// El doble de desarrollo no conecta con nada —sus unidades son de muestra— y el
 /// modo de verdad es el bus de **usuario**: si no hay bus, el proceso no arranca,
 /// porque un panel que enseñara el doble creyendo que enseña la máquina sería
 /// peor que un panel que no arranca.
+///
+/// Devuelve el mismo objeto dos veces con dos formas distintas —el listado que
+/// contesta preguntas y el vigilante que avisa de los cambios— porque tienen que
+/// ser el **mismo** objeto: con dos distintos, un aviso no tendría nada que ver con
+/// lo que se lista.
 async fn cliente_de_systemd(
     backend: SystemdBackend,
-) -> Result<Arc<dyn SystemdClient>, SystemdError> {
+) -> Result<(Arc<dyn SystemdClient>, Arc<dyn UnitWatcher>), SystemdError> {
     match backend {
-        SystemdBackend::Fake => Ok(Arc::new(FakeSystemd::demo())),
-        SystemdBackend::Dbus => Ok(Arc::new(DbusSystemdClient::connect_user().await?)),
+        SystemdBackend::Fake => {
+            let doble = Arc::new(FakeSystemd::demo());
+            let cliente: Arc<dyn SystemdClient> = doble.clone();
+            let vigilante: Arc<dyn UnitWatcher> = doble;
+
+            Ok((cliente, vigilante))
+        }
+        SystemdBackend::Dbus => {
+            let real = Arc::new(DbusSystemdClient::connect_user().await?);
+            let cliente: Arc<dyn SystemdClient> = real.clone();
+            let vigilante: Arc<dyn UnitWatcher> = real;
+
+            Ok((cliente, vigilante))
+        }
     }
 }
 

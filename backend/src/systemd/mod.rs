@@ -10,6 +10,7 @@ use std::fmt;
 use async_trait::async_trait;
 use serde::{Serialize, Serializer};
 use thiserror::Error;
+use tokio::sync::broadcast;
 
 pub mod dbus;
 pub mod fake;
@@ -638,13 +639,38 @@ pub trait SystemdClient: Send + Sync + fmt::Debug {
     async fn reload(&self) -> Result<(), SystemdError>;
 }
 
+/// El contrato del **vigilante** de cambios de unidades.
+///
+/// Es un puerto aparte de [`SystemdClient`] y no un método suyo porque son dos
+/// cosas distintas: el cliente contesta preguntas —«¿qué quadlets hay y cómo
+/// están?»— y el vigilante avisa de cuándo la respuesta habría cambiado. Separarlos
+/// deja que el fan-out dependa sólo de «algo cambió», sin saber de D-Bus, y que el
+/// doble de pruebas emita avisos sin bus.
+///
+/// El aviso **no lleva datos** a propósito: lo único que dice es «el conjunto o el
+/// estado de las unidades puede haber cambiado». Quien lo recibe vuelve a
+/// preguntar ([`SystemdClient::quadlets`]) y así hay una sola forma de construir la
+/// instantánea —la que ya está probada—, en vez de dos que puedan divergir.
+///
+/// No es `async` porque suscribirse no habla con nadie: el canal ya existe cuando
+/// el vigilante se construye.
+pub trait UnitWatcher: Send + Sync + fmt::Debug {
+    /// Se suscribe a los avisos de cambio.
+    ///
+    /// Cada suscriptor recibe los avisos **a partir de su suscripción**; si se
+    /// queda atrás y el canal se llena, pierde avisos —y no importa: el aviso sólo
+    /// dispara un recálculo, y el recálculo es siempre de la instantánea entera, no
+    /// de la parte que cambió—.
+    fn subscribe(&self) -> broadcast::Receiver<()>;
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use super::{
         ActiveState, SystemdClient, SystemdError, UnitAction, UnitFileState, UnitName, UnitOrigin,
-        UnitStatus, es_origen_de_quadlet, fake::FakeSystemd,
+        UnitStatus, UnitWatcher, es_origen_de_quadlet, fake::FakeSystemd,
     };
 
     /// Escenario «Nombre con caracteres especiales»: `.` y `-` van escapados a la
@@ -1192,5 +1218,36 @@ mod tests {
                 .expect("el doble no falla")
                 .is_empty()
         );
+    }
+
+    /// Escenario «El doble emite notificaciones sin bus»: el puerto del vigilante
+    /// se ejerce con el doble —sin D-Bus— y el suscriptor recibe el aviso.
+    #[tokio::test]
+    async fn el_vigilante_avisa_a_sus_suscriptores_sin_bus() {
+        let doble = FakeSystemd::new();
+        let mut suscriptor = doble.subscribe();
+
+        doble.notificar();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), suscriptor.recv())
+            .await
+            .expect("el aviso tiene que llegar sin esperar al plazo")
+            .expect("el canal sigue vivo mientras el doble exista");
+    }
+
+    /// Y el puerto también vale como objeto: el fan-out guarda un
+    /// `Arc<dyn UnitWatcher>`, así que el vigilante se inyecta por ahí.
+    #[tokio::test]
+    async fn el_vigilante_vale_detras_de_un_arco() {
+        let doble = Arc::new(FakeSystemd::new());
+        let vigilante: Arc<dyn UnitWatcher> = doble.clone();
+        let mut suscriptor = vigilante.subscribe();
+
+        doble.notificar();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), suscriptor.recv())
+            .await
+            .expect("el aviso tiene que llegar a través del trazo del puerto")
+            .expect("el canal sigue vivo mientras el doble exista");
     }
 }

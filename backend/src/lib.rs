@@ -11,6 +11,7 @@
 //! * [`config`] — la configuración leída del entorno y sus reglas de arranque.
 //! * [`error`] — el error tipado de la aplicación y su traducción a HTTP.
 //! * [`api`] — el servidor HTTP: envoltura JSON, rutas y manejadores.
+//! * [`fanout`] — el fan-out: convierte avisos de cambio en instantáneas publicadas.
 //! * [`quadlet`] — la creación de quadlets nuevas: dominio, escritura y registro.
 //! * [`state`] — el estado compartido que se inyecta en los manejadores.
 //! * [`server`] — la escucha y el apagado ordenado.
@@ -21,6 +22,7 @@ pub mod api;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod fanout;
 pub mod quadlet;
 pub mod server;
 pub mod state;

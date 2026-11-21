@@ -14,17 +14,21 @@
 //!   devuelven un *job* y sólo el aviso de que el job terminó dice si la unidad
 //!   llegó a su estado.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures_util::StreamExt;
+use futures_util::stream::{self, Stream, StreamExt};
+use tokio::sync::{broadcast, mpsc, watch};
+use zbus::message::Type;
 use zbus::proxy::SignalStream;
 use zbus::zvariant::OwnedObjectPath;
-use zbus::{Connection, Proxy};
+use zbus::{Connection, MatchRule, MessageStream, Proxy};
 
 use super::{
     ActiveState, SystemdClient, SystemdError, UnitAction, UnitFileState, UnitName, UnitOrigin,
-    UnitStatus,
+    UnitStatus, UnitWatcher,
 };
 
 /// El servicio del gestor de systemd.
@@ -38,6 +42,64 @@ const IFACE_MANAGER: &str = "org.freedesktop.systemd1.Manager";
 
 /// La interfaz de una unidad.
 const IFACE_UNIT: &str = "org.freedesktop.systemd1.Unit";
+
+/// La interfaz estándar por la que cualquier objeto de D-Bus publica sus cambios
+/// de propiedades.
+const IFACE_PROPIEDADES: &str = "org.freedesktop.DBus.Properties";
+
+/// La señal con la que esa interfaz anuncia que una propiedad cambió.
+const SENAL_PROPIEDADES: &str = "PropertiesChanged";
+
+/// El espacio de rutas bajo el que cuelgan **todas** las unidades.
+///
+/// Es lo que hace que una sola regla de D-Bus cubra cualquier unidad: podpot no
+/// puede observar una por una —no sabe cuáles hay hasta que las lista, y una
+/// quadlet nueva aparece sin avisar—, así que escucha el prefijo entero.
+///
+/// Va **sin barra final**: el bus compara un espacio de rutas contra la ruta del
+/// mensaje como «igual, o prefijo seguido de `/`», así que
+/// `/org/freedesktop/systemd1/unit` cubre `/org/freedesktop/systemd1/unit/x_2eservice`
+/// sin dejar fuera la ruta del propio espacio. Añadir la barra no cambiaría el
+/// filtro del bus, pero `zbus` valida el valor como ruta de objeto y una barra
+/// final no lo es.
+const ESPACIO_DE_UNIDADES: &str = "/org/freedesktop/systemd1/unit";
+
+/// Cuántos avisos de cambio caben en el canal del vigilante antes de perder el
+/// más viejo.
+///
+/// Perder un aviso no rompe nada —dispara un recálculo, y el recálculo es siempre
+/// de la instantánea entera—, pero la capacidad no puede ser cero: con cero no
+/// habría avisos y el panel se quedaría congelado sin que nada lo delatara.
+const CAPACIDAD_DE_AVISOS: usize = 32;
+
+/// Cuántas señales crudas caben antes de que el reenvío tenga que esperar.
+///
+/// Una ráfaga —un `daemon-reload` con muchas unidades— cabe de sobra; si no
+/// cupiera, el reenvío esperaría y el bus acumularía, que es lo correcto: no se
+/// pierde ninguna señal.
+const CAPACIDAD_DE_SENALES: usize = 256;
+
+/// Cuánto silencio convierte una ráfaga de señales en un solo aviso.
+///
+/// Un `daemon-reload` emite decenas de señales seguidas; sin este plazo, cada una
+/// sería un recálculo del listado entero. Con él, la ráfaga se convierte en un
+/// aviso y el coste es una latencia de un cuarto de segundo —imperceptible para
+/// un panel— a cambio de no recalcular en vano.
+const DEBOUNCE: Duration = Duration::from_millis(250);
+
+/// Cuánto se espera antes del primer reintento de la suscripción.
+///
+/// Corto a propósito: lo normal es que un cierre del stream sea un parpadeo del
+/// bus, y con esta espera el panel vuelve a refrescarse casi sin enterarse.
+const REINTENTO_INICIAL: Duration = Duration::from_secs(1);
+
+/// El tope de la espera entre reintentos.
+///
+/// Sin tope, un bus que no vuelve haría esperas cada vez más largas y el log se
+/// llenaría de avisos cada vez más espaciados; con tope, el coste de un bus muerto
+/// es un intento cada medio minuto —suficiente para volver solo cuando el bus
+/// regrese, y barato mientras no lo haga—.
+const REINTENTO_MAXIMO: Duration = Duration::from_secs(30);
 
 /// El error con el que systemd dice que la unidad no está cargada.
 const ERROR_NO_SUCH_UNIT: &str = "org.freedesktop.systemd1.NoSuchUnit";
@@ -104,6 +166,31 @@ type Entrada = (
 #[derive(Debug)]
 pub struct DbusSystemdClient {
     conexion: Connection,
+    /// El canal por el que el vigilante avisa de los cambios de unidades.
+    ///
+    /// Es `broadcast` y no `mpsc` porque los suscriptores son varios y ninguno
+    /// manda a los demás: el fan-out escucha para recalcular y publicar, y una
+    /// prueba de integración escucha para medir el camino entero.
+    avisos: broadcast::Sender<()>,
+    /// El cierre del vigilante: cuando vale `true`, la tarea de escucha termina.
+    ///
+    /// El disparador vive en el cliente —y no lo comparte con el cierre del
+    /// servidor— porque el vigilante nace en [`DbusSystemdClient::connect_user`],
+    /// antes de que existan los canales de la aplicación: el cliente no puede
+    /// depender de un canal que todavía no está construido. Se dispara al soltarse
+    /// el cliente, que es exactamente cuando ya no hay a quién avisar.
+    apagado: watch::Sender<bool>,
+}
+
+impl Drop for DbusSystemdClient {
+    /// Al soltarse el cliente, el vigilante termina.
+    ///
+    /// Es lo que evita dejar una tarea zombi reintentando la suscripción contra un
+    /// bus que ya nadie mira —y, con ella, el bucle de reintentos del apagado—.
+    /// Sin receptores el envío falla, y no es un error: el vigilante ya se fue.
+    fn drop(&mut self) {
+        let _ = self.apagado.send(true);
+    }
 }
 
 impl DbusSystemdClient {
@@ -115,10 +202,49 @@ impl DbusSystemdClient {
     /// requisito de ámbito; la otra mitad es que el destino sea el
     /// `org.freedesktop.systemd1` de *ese* bus, que es el gestor de
     /// `systemctl --user`.
+    ///
+    /// La conexión deja arrancada la tarea del vigilante —[`UnitWatcher`]—: se
+    /// lanza aquí y **no** se espera, porque el vigilante no termina nunca y
+    /// `connect_user` sí tiene que volver. Que no se espere no la hace opcional:
+    /// si el bus no admite la suscripción, el vigilante lo registra y la reintenta,
+    /// mientras el cliente sigue contestando listados y acciones.
     pub async fn connect_user() -> Result<Self, SystemdError> {
         let conexion = Connection::session().await.map_err(transporte)?;
+        let (avisos, _) = broadcast::channel(CAPACIDAD_DE_AVISOS);
+        let (apagado, _) = watch::channel(false);
 
-        Ok(Self { conexion })
+        let cliente = Self {
+            conexion,
+            avisos,
+            apagado,
+        };
+        cliente.vigilar();
+
+        Ok(cliente)
+    }
+
+    /// Arranca la tarea que escucha las señales de systemd y avisa de los cambios.
+    ///
+    /// Se lanza en segundo plano porque la escucha dura lo que dure el proceso: la
+    /// tarea termina cuando el bus cierra la conexión —y entonces reintenta— o
+    /// cuando se suelta el cliente, que dispara el cierre.
+    fn vigilar(&self) {
+        let conexion = self.conexion.clone();
+        let avisos = self.avisos.clone();
+        let apagado = self.apagado.subscribe();
+
+        tokio::spawn(async move {
+            vigilar_sin_descanso(
+                |apagado| {
+                    let conexion = conexion.clone();
+                    let avisos = avisos.clone();
+
+                    async move { escuchar(&conexion, &avisos, apagado).await }
+                },
+                apagado,
+            )
+            .await;
+        });
     }
 
     /// El proxy del gestor de systemd.
@@ -294,6 +420,237 @@ impl SystemdClient for DbusSystemdClient {
     }
 }
 
+impl UnitWatcher for DbusSystemdClient {
+    /// Se suscribe a los avisos que emite la tarea de escucha de señales.
+    ///
+    /// Lo que se recibe no lleva datos: sólo dice «algo cambió». Quien lo recibe
+    /// vuelve a preguntar por el listado, y así la instantánea se construye
+    /// siempre por el mismo camino —el que ya está probado—.
+    fn subscribe(&self) -> broadcast::Receiver<()> {
+        self.avisos.subscribe()
+    }
+}
+
+/// Escucha las señales de systemd y avisa de los cambios hasta que el bus se cae
+/// o el servidor pide el cierre.
+///
+/// Cuatro manantiales y un solo destino:
+///
+/// * `PropertiesChanged` sobre el espacio de rutas de las unidades: un
+///   `ActiveState`/`SubState` que cambia —una quadlet que arranca, para o falla—.
+/// * `UnitNew` / `UnitRemoved` del gestor: aparece o desaparece una unidad.
+/// * `UnitFilesChanged`: alguien recargó la configuración —un `daemon-reload`
+///   tras crear, editar o borrar una quadlet—.
+///
+/// **Antes de escuchar hay que llamar a `Subscribe()`**: sin esa llamada, systemd
+/// sólo emite las señales de las unidades que alguien está observando, y podpot no
+/// observa ninguna —pide el listado y se va—, así que los cambios hechos fuera del
+/// panel no llegarían nunca.
+///
+/// Volver no es rendirse: cuando el bus cierra el stream, quien la llama reintenta
+/// —con `Subscribe()` incluido, que es lo que hay que rehacer—.
+async fn escuchar(
+    conexion: &Connection,
+    avisos: &broadcast::Sender<()>,
+    mut apagado: watch::Receiver<bool>,
+) -> Result<(), SystemdError> {
+    let manager = Proxy::new(conexion, DESTINO, RUTA_MANAGER, IFACE_MANAGER)
+        .await
+        .map_err(transporte)?;
+
+    manager
+        .call::<_, _, ()>("Subscribe", &())
+        .await
+        .map_err(transporte)?;
+
+    let propiedades = MessageStream::for_match_rule(
+        regla_de_propiedades()?,
+        conexion,
+        Some(CAPACIDAD_DE_SENALES),
+    )
+    .await
+    .map_err(transporte)?;
+
+    let altas = manager
+        .receive_signal("UnitNew")
+        .await
+        .map_err(transporte)?;
+    let bajas = manager
+        .receive_signal("UnitRemoved")
+        .await
+        .map_err(transporte)?;
+    let ficheros = manager
+        .receive_signal("UnitFilesChanged")
+        .await
+        .map_err(transporte)?;
+
+    // Los cuatro manantiales se juntan en uno: al reenvío le da igual de dónde
+    // venga la señal, porque lo único que transporta es «algo cambió».
+    let manantiales: Vec<Pin<Box<dyn Stream<Item = ()> + Send + '_>>> = vec![
+        Box::pin(propiedades.map(|_| ())),
+        Box::pin(altas.map(|_| ())),
+        Box::pin(bajas.map(|_| ())),
+        Box::pin(ficheros.map(|_| ())),
+    ];
+
+    let (crudo, entrantes) = mpsc::channel(CAPACIDAD_DE_SENALES);
+    let coalescedor = tokio::spawn(coalescer(entrantes, avisos.clone()));
+
+    // La escucha dura hasta que el bus cierra el stream **o** hasta que el cierre
+    // del servidor lo pide: sin lo segundo, el apagado dejaría la tarea pegada a un
+    // bus que ya nadie mira. `wait_for` —y no `changed()`— porque mira el valor
+    // actual antes de esperar: con `changed()`, un cierre ya disparado se quedaría
+    // esperando un cambio que no va a llegar.
+    tokio::select! {
+        biased;
+
+        _ = apagado.wait_for(|apagado| *apagado) => {}
+        _ = reenviar(stream::select_all(manantiales), crudo) => {}
+    }
+
+    // Sin nadie reenviando, el canal crudo se cierra y el coalescedor termina
+    // solo: se espera para no dejar una tarea colgando a la espalda.
+    let _ = coalescedor.await;
+
+    Ok(())
+}
+
+/// Mantiene viva la escucha de señales, reintentándola cuando el bus la cierra.
+///
+/// `escuchar` termina en cuanto el bus cierra el stream —una caída, un corte del
+/// socket—, y rendirse ahí dejaría el panel sin refrescarse para siempre y sin un
+/// solo log. Así que cada desenlace se registra y se reintenta con una espera
+/// creciente; lo único que termina el bucle es el cierre del servidor.
+///
+/// La escucha entra por parámetro —y no se llama a `escuchar` directamente— para
+/// poder medir el bucle sin un bus de verdad: el reintento se mide con una escucha
+/// de mentira, que es lo que lo hace determinista.
+async fn vigilar_sin_descanso<F, Fut>(mut escuchar: F, mut apagado: watch::Receiver<bool>)
+where
+    F: FnMut(watch::Receiver<bool>) -> Fut,
+    Fut: Future<Output = Result<(), SystemdError>>,
+{
+    let mut retraso = REINTENTO_INICIAL;
+
+    loop {
+        let inicio = tokio::time::Instant::now();
+        let desenlace = escuchar(apagado.clone()).await;
+
+        // El cierre del servidor se mira **antes** de registrar nada: un cierre
+        // pedido no es una caída del bus, y anunciarlo como tal sería mentir en el
+        // log. Se pregunta por el valor y por el canal —el disparador puede haberse
+        // soltado, y eso también es un cierre—.
+        if se_pidio_el_cierre(&apagado) {
+            return;
+        }
+
+        match desenlace {
+            Ok(()) => {
+                tracing::warn!("el bus cerró el stream de señales; se reintenta la suscripción")
+            }
+            Err(error) => tracing::warn!(
+                %error,
+                "el bus cerró el stream de señales; se reintenta la suscripción"
+            ),
+        }
+
+        // Una sesión que duró lo suficiente no fue un parpadeo: el bus estuvo sano,
+        // así que la espera vuelve a empezar por el principio en vez de arrastrar el
+        // tope de una racha de caídas vieja. El backoff crece para no martillear un
+        // bus caído, no para castigar a uno que vuelve.
+        if inicio.elapsed() >= REINTENTO_MAXIMO {
+            retraso = REINTENTO_INICIAL;
+        }
+
+        // La espera se parte en dos: el cierre del servidor la interrumpe, para no
+        // tardar hasta medio minuto en apagarse.
+        tokio::select! {
+            biased;
+
+            _ = apagado.wait_for(|apagado| *apagado) => return,
+            _ = tokio::time::sleep(retraso) => {}
+        }
+
+        retraso = siguiente_retraso(retraso);
+    }
+}
+
+/// El retraso del reintento siguiente: el doble del anterior, sin pasar del tope.
+///
+/// Es una función pura —y por eso se puede medir sin reloj y sin bus—: la política
+/// de espera no tiene nada que ver con D-Bus.
+fn siguiente_retraso(actual: Duration) -> Duration {
+    (actual * 2).min(REINTENTO_MAXIMO)
+}
+
+/// ¿El cierre lo pidió el servidor?
+///
+/// Se pregunta por el valor y por el canal: el disparador puede haberse soltado
+/// —el cliente se fue y nadie más va a mandar— y eso también es un cierre.
+fn se_pidio_el_cierre(apagado: &watch::Receiver<bool>) -> bool {
+    *apagado.borrow() || apagado.has_changed().is_err()
+}
+
+/// La regla de D-Bus que selecciona los cambios de propiedades de las unidades.
+///
+/// Es una regla de **espacio de rutas** y no de ruta: no se puede observar unidad
+/// por unidad porque podpot no sabe cuáles hay hasta que las lista, y una quadlet
+/// nueva aparece sin avisar a nadie.
+fn regla_de_propiedades() -> Result<MatchRule<'static>, SystemdError> {
+    let constructor = MatchRule::builder()
+        .msg_type(Type::Signal)
+        .interface(IFACE_PROPIEDADES)
+        .map_err(transporte)?
+        .member(SENAL_PROPIEDADES)
+        .map_err(transporte)?
+        .path_namespace(ESPACIO_DE_UNIDADES)
+        .map_err(transporte)?;
+
+    Ok(constructor.build())
+}
+
+/// Reenvía cada señal recibida al canal crudo, sin mirar qué señal es.
+///
+/// Es genérico sobre el manantial —y no está atado a D-Bus— a propósito: lo único
+/// que hace es convertir «llegó una señal» en «un aviso crudo», y eso se puede
+/// medir con un flujo de prueba, sin bus.
+async fn reenviar<S>(mut senales: S, crudo: mpsc::Sender<()>)
+where
+    S: Stream + Unpin,
+{
+    while senales.next().await.is_some() {
+        // Si el coalescedor se fue no hay a quién avisar, y esperar aquí sería
+        // quedarse pegado a un canal sin receptor.
+        if crudo.send(()).await.is_err() {
+            return;
+        }
+    }
+}
+
+/// Convierte una ráfaga de señales en un solo aviso.
+///
+/// El *debounce* es de cola: la primera señal abre una espera, cada señal nueva la
+/// reinicia y sólo el silencio la cierra. Así un `daemon-reload` que dispara
+/// decenas de señales seguidas produce **un** aviso, y no uno por señal.
+async fn coalescer(mut entrantes: mpsc::Receiver<()>, avisos: broadcast::Sender<()>) {
+    while entrantes.recv().await.is_some() {
+        esperar_la_calma(&mut entrantes).await;
+
+        // Sin suscriptores el aviso se pierde, y no es un error: nadie mira.
+        let _ = avisos.send(());
+    }
+}
+
+/// Espera a que la ráfaga se calle.
+///
+/// Vuelve cuando pasa [`DEBOUNCE`] sin recibir nada nuevo, o cuando el reenvío se
+/// fue —el canal se cerró—.
+async fn esperar_la_calma(entrantes: &mut mpsc::Receiver<()>) {
+    while let Ok(Some(())) = tokio::time::timeout(DEBOUNCE, entrantes.recv()).await {
+        // Sigue la ráfaga: se espera el silencio entero otra vez.
+    }
+}
+
 /// Espera a que terminen el job indicado y devuelve su resultado.
 ///
 /// `JobRemoved` se emite para **todos** los jobs del gestor, así que se compara
@@ -425,10 +782,20 @@ fn es_ausencia(error: &zbus::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use futures_util::stream;
+    use tokio::sync::{broadcast, mpsc, watch};
+    use zbus::match_rule::PathSpec;
+    use zbus::message::Type;
 
     use super::{
-        Clase, ERROR_FILE_NOT_FOUND, ERROR_NO_SUCH_UNIT, ERROR_UNKNOWN_PROPERTY, clase,
-        clase_del_nombre, recarga,
+        CAPACIDAD_DE_SENALES, Clase, DEBOUNCE, ERROR_FILE_NOT_FOUND, ERROR_NO_SUCH_UNIT,
+        ERROR_UNKNOWN_PROPERTY, ESPACIO_DE_UNIDADES, IFACE_PROPIEDADES, REINTENTO_INICIAL,
+        REINTENTO_MAXIMO, SENAL_PROPIEDADES, clase, clase_del_nombre, coalescer, recarga, reenviar,
+        regla_de_propiedades, siguiente_retraso, vigilar_sin_descanso,
     };
     use crate::systemd::SystemdError;
 
@@ -509,5 +876,260 @@ mod tests {
             recarga(Clase::Transporte, error),
             SystemdError::Transport { .. }
         ));
+    }
+
+    /// La regla del vigilante selecciona los cambios de propiedades de **cualquier**
+    /// unidad: señal, interfaz estándar de propiedades, miembro
+    /// `PropertiesChanged` y el espacio de rutas de las unidades.
+    ///
+    /// Se comprueba aquí, sin bus, porque es la única parte del vigilante que no
+    /// depende de que haya señales: con la ruta equivocada, el panel no se
+    /// refrescaría nunca y nada lo delataría.
+    #[test]
+    fn la_regla_escucha_los_cambios_de_propiedades_de_toda_unidad() {
+        let regla = regla_de_propiedades().expect("los nombres de la regla son constantes válidas");
+
+        assert_eq!(regla.msg_type(), Some(Type::Signal));
+        assert_eq!(
+            regla.interface().map(|interfaz| interfaz.as_str()),
+            Some(IFACE_PROPIEDADES)
+        );
+        assert_eq!(
+            regla.member().map(|miembro| miembro.as_str()),
+            Some(SENAL_PROPIEDADES)
+        );
+
+        match regla.path_spec() {
+            Some(PathSpec::PathNamespace(ruta)) => assert_eq!(ruta.as_str(), ESPACIO_DE_UNIDADES),
+            otro => panic!("se esperaba el espacio de rutas de las unidades: {otro:?}"),
+        }
+    }
+
+    /// Escenario «Notificaciones coalescidas»: varias señales seguidas producen
+    /// **un** aviso, no uno por señal.
+    ///
+    /// El reloj va parado (`start_paused`), así que el *debounce* se mide de
+    /// verdad —avanza sólo cuando no queda nada que hacer— y la prueba no depende
+    /// de lo que tarde la máquina.
+    #[tokio::test(start_paused = true)]
+    async fn una_rafaga_de_senales_produce_un_solo_aviso() {
+        let (crudo, entrantes) = mpsc::channel(CAPACIDAD_DE_SENALES);
+        let (avisos, _) = broadcast::channel(8);
+        let mut suscriptor = avisos.subscribe();
+
+        let coalescedor = tokio::spawn(coalescer(entrantes, avisos.clone()));
+
+        // Tres señales seguidas: es una ráfaga, no tres cambios.
+        reenviar(stream::iter([(), (), ()]), crudo).await;
+
+        tokio::time::timeout(Duration::from_secs(60), suscriptor.recv())
+            .await
+            .expect("la ráfaga tiene que producir un aviso")
+            .expect("el canal sigue vivo mientras el coalescedor exista");
+
+        // Y no hay un segundo: el silencio siguiente no emite nada.
+        assert!(
+            tokio::time::timeout(DEBOUNCE * 4, suscriptor.recv())
+                .await
+                .is_err(),
+            "la ráfaga se tenía que coalescer en un solo aviso"
+        );
+
+        coalescedor.abort();
+    }
+
+    /// Y dos ráfagas **separadas** por el silencio del *debounce* sí producen dos
+    /// avisos: lo que se coalesce es la ráfaga, no el flujo entero.
+    #[tokio::test(start_paused = true)]
+    async fn dos_rafagas_separadas_producen_dos_avisos() {
+        let (crudo, entrantes) = mpsc::channel(CAPACIDAD_DE_SENALES);
+        let (avisos, _) = broadcast::channel(8);
+        let mut suscriptor = avisos.subscribe();
+
+        let coalescedor = tokio::spawn(coalescer(entrantes, avisos.clone()));
+
+        // Primera ráfaga: un aviso.
+        reenviar(stream::iter([()]), crudo.clone()).await;
+        tokio::time::timeout(Duration::from_secs(60), suscriptor.recv())
+            .await
+            .expect("la primera ráfaga tiene que avisar")
+            .expect("el canal sigue vivo");
+
+        // Silencio de sobra —más que el *debounce*— y segunda ráfaga: otro aviso.
+        tokio::time::sleep(DEBOUNCE * 2).await;
+        reenviar(stream::iter([()]), crudo).await;
+
+        tokio::time::timeout(Duration::from_secs(60), suscriptor.recv())
+            .await
+            .expect("la segunda ráfaga tiene que avisar")
+            .expect("el canal sigue vivo");
+
+        coalescedor.abort();
+    }
+
+    /// El retraso del reintento crece al doble y **no** pasa del tope.
+    ///
+    /// Es la parte del vigilante que no depende de ningún bus —ni de ningún reloj—
+    /// así que se mide suelta: sin tope, un bus que no vuelve haría esperas cada vez
+    /// más largas; con él, el coste de un bus muerto es un intento cada medio minuto.
+    #[test]
+    fn el_retraso_del_reintento_crece_hasta_el_tope() {
+        assert_eq!(REINTENTO_INICIAL, Duration::from_secs(1));
+
+        let mut retraso = REINTENTO_INICIAL;
+        assert_eq!(siguiente_retraso(retraso), Duration::from_secs(2));
+
+        retraso = siguiente_retraso(retraso);
+        assert_eq!(siguiente_retraso(retraso), Duration::from_secs(4));
+
+        // Por muchos intentos que pasen, nunca se pasa del tope…
+        let mut retraso = REINTENTO_INICIAL;
+        for _ in 0..64 {
+            retraso = siguiente_retraso(retraso);
+
+            assert!(
+                retraso <= REINTENTO_MAXIMO,
+                "el retraso se pasó del tope: {retraso:?}"
+            );
+        }
+
+        // …y cuando lo alcanza, ahí se queda.
+        assert_eq!(retraso, REINTENTO_MAXIMO);
+        assert_eq!(siguiente_retraso(REINTENTO_MAXIMO), REINTENTO_MAXIMO);
+    }
+
+    /// Escenario «El bus cierra el stream de señales»: cuando el bus cierra la
+    /// escucha —con un error o cerrando el stream—, el vigilante **no** se rinde:
+    /// reintenta con una espera creciente. Y sólo el cierre del servidor termina el
+    /// bucle, para no dejar una tarea zombi tras el apagado.
+    ///
+    /// La escucha entra por parámetro —y no se llama a `escuchar` de verdad— porque
+    /// lo que se mide aquí es el bucle, no el bus: con un bus de verdad esta prueba
+    /// dejaría de ser determinista. El reloj va parado, así que las esperas crecientes
+    /// se consumen sin que la prueba espere de verdad.
+    #[tokio::test(start_paused = true)]
+    async fn el_vigilante_reintenta_cuando_el_bus_cierra_el_stream() {
+        let intentos = Arc::new(AtomicUsize::new(0));
+        let (disparador, apagado) = watch::channel(false);
+
+        let contador = intentos.clone();
+        let escucha = move |_apagado: watch::Receiver<bool>| {
+            let contador = contador.clone();
+
+            async move {
+                // El primer desenlace es un error —el bus que se cayó— y el resto un
+                // stream que se cierra: los dos tienen que reintentarse.
+                if contador.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(SystemdError::Transport {
+                        causa: Box::new(std::io::Error::other("el bus se cayó")),
+                    })
+                } else {
+                    Ok(())
+                }
+            }
+        };
+
+        let vigilante = tokio::spawn(vigilar_sin_descanso(escucha, apagado));
+
+        // Con el reloj parado, los diez segundos se consumen de golpe y caben los
+        // reintentos de 1 s, 2 s, 4 s y 8 s.
+        tokio::time::sleep(Duration::from_secs(10)).await;
+
+        let hechos = intentos.load(Ordering::SeqCst);
+        assert!(
+            hechos >= 3,
+            "el vigilante tenía que reintentar tras cerrarse el bus: sólo {hechos} intento(s)"
+        );
+
+        // El cierre del servidor sí termina el bucle: nada de tareas zombi.
+        disparador
+            .send(true)
+            .expect("el vigilante sigue suscrito al cierre");
+
+        tokio::time::timeout(Duration::from_secs(5), vigilante)
+            .await
+            .expect("el cierre del servidor tiene que terminar el vigilante")
+            .expect("el vigilante no puede entrar en pánico");
+    }
+
+    /// Una sesión de escucha lo bastante larga para contar como «el bus estaba
+    /// sano», y no como un parpadeo.
+    const SESION_LARGA: Duration = Duration::from_secs(40);
+
+    /// El retraso del reintento **vuelve a empezar** tras una sesión que duró lo
+    /// suficiente.
+    ///
+    /// Sin esto, una racha de parpadeos deja el retraso en el tope y una caída
+    /// posterior —aunque el bus haya estado sano horas— tarda hasta medio minuto en
+    /// recuperarse: el backoff crece para no martillear un bus caído, no para
+    /// castigar a un bus que vuelve.
+    ///
+    /// Se mide con el reloj parado, así que la duración de la sesión y la espera
+    /// siguiente son exactas y la prueba no depende de lo que tarde la máquina.
+    #[tokio::test(start_paused = true)]
+    async fn el_reintento_vuelve_a_empezar_tras_una_sesion_sana() {
+        assert!(
+            SESION_LARGA >= REINTENTO_MAXIMO,
+            "la sesión de prueba tiene que contar como sana: {SESION_LARGA:?}"
+        );
+
+        // El instante —virtual— en el que empezó cada intento.
+        let marcas = Arc::new(Mutex::new(Vec::new()));
+        let (disparador, apagado) = watch::channel(false);
+
+        let anotador = marcas.clone();
+        let escucha = move |_apagado: watch::Receiver<bool>| {
+            let anotador = anotador.clone();
+
+            async move {
+                let intento = {
+                    let mut marcas = anotador.lock().expect("el candado de las marcas");
+
+                    marcas.push(tokio::time::Instant::now());
+                    marcas.len() - 1
+                };
+
+                // La segunda sesión es la sana: dura de sobra y luego se cae.
+                if intento == 1 {
+                    tokio::time::sleep(SESION_LARGA).await;
+                }
+
+                Ok(())
+            }
+        };
+
+        let vigilante = tokio::spawn(vigilar_sin_descanso(escucha, apagado));
+
+        // De sobra para las tres sesiones y las esperas de en medio.
+        tokio::time::sleep(Duration::from_secs(60)).await;
+
+        // La espera se calcula con el candado dentro de un bloque —y no se suelta a
+        // mano— para que no pueda quedar vivo a través del `await` de más abajo.
+        let espera = {
+            let marcas = marcas.lock().expect("el candado de las marcas");
+            let sana = *marcas
+                .get(1)
+                .expect("la sesión sana tiene que haber empezado");
+            let siguiente = *marcas
+                .get(2)
+                .expect("tras la sesión sana tiene que haber otro intento");
+
+            siguiente - sana - SESION_LARGA
+        };
+
+        assert_eq!(
+            espera, REINTENTO_INICIAL,
+            "tras una sesión sana, el reintento tiene que volver a empezar por el \
+             principio: se esperó {espera:?}"
+        );
+
+        disparador
+            .send(true)
+            .expect("el vigilante sigue suscrito al cierre");
+
+        tokio::time::timeout(Duration::from_secs(5), vigilante)
+            .await
+            .expect("el cierre del servidor tiene que terminar el vigilante")
+            .expect("el vigilante no puede entrar en pánico");
     }
 }

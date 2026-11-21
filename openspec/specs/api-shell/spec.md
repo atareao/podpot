@@ -7,7 +7,7 @@ El servidor HTTP de podpot: arranque, envoltura JSON única de las respuestas, r
 
 ### Requirement: Envoltura JSON única
 
-Todas las rutas de negocio bajo `/api/v1/` SHALL responder con una envoltura JSON uniforme (un campo con los datos y, cuando proceda, un campo de error), también en los errores.
+Todas las rutas de negocio bajo `/api/v1/` SHALL responder con una envoltura JSON uniforme (un campo con los datos y, cuando proceda, un campo de error), también en los errores. La **única excepción** SHALL ser la ruta de stream (`GET /api/v1/units/stream`), que es una respuesta continua y no un documento único; aun así, el **contenido** de cada evento del stream SHALL reutilizar la envoltura `{data}`.
 
 #### Scenario: Respuesta de negocio correcta
 
@@ -34,6 +34,11 @@ Todas las rutas de negocio bajo `/api/v1/` SHALL responder con una envoltura JSO
 - **WHEN** se usa un método distinto de `GET`/`PATCH`/`DELETE` sobre `/api/v1/quadlets/{name}`
 - **THEN** la respuesta SHALL ser `405` con la misma envoltura
 
+#### Scenario: El stream no usa la envoltura de documento único
+
+- **WHEN** se pide `GET /api/v1/units/stream`
+- **THEN** la respuesta SHALL ser un flujo `text/event-stream` (no un documento JSON único), y el contenido de cada evento SHALL usar la envoltura `{data}`
+
 ### Requirement: Ruta de salud
 
 El servidor SHALL exponer `GET /api/v1/health` sin autenticación, con el estado del proceso.
@@ -45,12 +50,17 @@ El servidor SHALL exponer `GET /api/v1/health` sin autenticación, con el estado
 
 ### Requirement: Apagado ordenado
 
-El servidor SHALL dejar de aceptar conexiones nuevas y cerrar los recursos ante una señal de terminación.
+El servidor SHALL dejar de aceptar conexiones nuevas y cerrar los recursos ante una señal de terminación, incluidos los flujos SSE abiertos.
 
 #### Scenario: Terminación limpia
 
 - **WHEN** el proceso recibe `SIGTERM`
 - **THEN** SHALL terminar el servidor y liberar el pool y el cliente D-Bus antes de salir
+
+#### Scenario: Terminación con un stream abierto
+
+- **WHEN** el proceso recibe `SIGTERM` con un cliente suscrito a `GET /api/v1/units/stream`
+- **THEN** SHALL cerrar el flujo SSE y completar el apagado sin bloquearse esperando a esa conexión
 
 ### Requirement: Ruta de creación de quadlets
 
@@ -126,3 +136,17 @@ El servidor SHALL exponer `GET /api/v1/units` devolviendo las quadlets del usuar
 
 - **WHEN** el usuario no tiene quadlets instaladas
 - **THEN** SHALL responder `200` con `{data}` como array vacío
+
+### Requirement: Ruta de stream de unidades
+
+El servidor SHALL exponer `GET /api/v1/units/stream` como ruta de negocio bajo `/api/v1/`, devolviendo un flujo `text/event-stream` con la instantánea de las quadlets (ver la capability `unidades-en-vivo`). El método `GET` SHALL ser el único admitido.
+
+#### Scenario: Stream disponible
+
+- **WHEN** se pide `GET /api/v1/units/stream`
+- **THEN** SHALL responder `200` con `Content-Type: text/event-stream`
+
+#### Scenario: Método no permitido en el stream
+
+- **WHEN** se usa un método distinto de `GET` sobre `/api/v1/units/stream`
+- **THEN** la respuesta SHALL ser `405` con la envoltura `{error}` habitual

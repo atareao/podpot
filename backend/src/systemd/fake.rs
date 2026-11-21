@@ -18,11 +18,19 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use async_trait::async_trait;
+use tokio::sync::broadcast;
 
 use super::{
     ActiveState, SystemdClient, SystemdError, UnitAction, UnitFileState, UnitName, UnitOrigin,
-    UnitStatus,
+    UnitStatus, UnitWatcher,
 };
+
+/// Cuántos avisos de cambio caben antes de perder el más viejo.
+///
+/// Perder un aviso no rompe nada —lo único que provoca es un recálculo—, pero el
+/// canal no puede ser de capacidad cero: con cero no habría avisos y el panel se
+/// quedaría congelado sin que nada lo delatara.
+const CAPACIDAD_DE_AVISOS: usize = 16;
 
 /// Un cliente de systemd que no habla con systemd.
 #[derive(Debug)]
@@ -39,6 +47,12 @@ pub struct FakeSystemd {
     /// **ocurre** —una por creación—, y con un booleano una recarga de más
     /// pasaría desapercibida.
     recargas: AtomicU32,
+    /// El canal de avisos de cambio ([`UnitWatcher`]).
+    ///
+    /// El doble no mira systemd, así que no hay ninguna señal que reenviar: los
+    /// avisos los emite la prueba con [`FakeSystemd::notificar`]. Es exactamente
+    /// lo que hace falta para medir el fan-out y el stream sin un bus de sesión.
+    avisos: broadcast::Sender<()>,
 }
 
 impl Default for FakeSystemd {
@@ -50,9 +64,12 @@ impl Default for FakeSystemd {
 impl FakeSystemd {
     /// Un doble que no conoce ninguna unidad.
     pub fn new() -> Self {
+        let (avisos, _) = broadcast::channel(CAPACIDAD_DE_AVISOS);
+
         Self {
             unidades: Mutex::new(BTreeMap::new()),
             recargas: AtomicU32::new(0),
+            avisos,
         }
     }
 
@@ -101,6 +118,17 @@ impl FakeSystemd {
     /// Cuántas recargas se le han pedido.
     pub fn recargas(&self) -> u32 {
         self.recargas.load(Ordering::SeqCst)
+    }
+
+    /// Emite un aviso de cambio, como si systemd hubiera señalado algo.
+    ///
+    /// Es la mitad que el doble añade al puerto [`UnitWatcher`]: sin bus no hay
+    /// señales que reenviar, así que quien emite el aviso a mano es la prueba que
+    /// está midiendo el fan-out o el stream. No hay error posible: si nadie está
+    /// suscrito el aviso se pierde, que es justo lo que hace un canal sin
+    /// receptores.
+    pub fn notificar(&self) {
+        let _ = self.avisos.send(());
     }
 
     /// Toma el candado de las unidades sin poder entrar en pánico.
@@ -177,5 +205,16 @@ impl SystemdClient for FakeSystemd {
         self.recargas.fetch_add(1, Ordering::SeqCst);
 
         Ok(())
+    }
+}
+
+impl UnitWatcher for FakeSystemd {
+    /// Se suscribe a los avisos que emita [`FakeSystemd::notificar`].
+    ///
+    /// Es el mismo contrato que cumple el cliente real por señales de D-Bus, pero
+    /// sin bus: lo que se mide con él —el fan-out, el stream— es lo mismo, porque
+    /// los dos sólo hablan de «algo cambió».
+    fn subscribe(&self) -> broadcast::Receiver<()> {
+        self.avisos.subscribe()
     }
 }

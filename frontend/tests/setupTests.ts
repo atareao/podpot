@@ -2,6 +2,15 @@
 // Vitest: la entrada `/vitest` es la que declara la augmentación de tipos (la
 // raíz del paquete augmenta el `expect` de Jest y no compila aquí).
 import '@testing-library/jest-dom/vitest'
+import { EventSourceFalso } from './eventSourceFalso'
+
+// jsdom no implementa `EventSource` y el panel abre una suscripción SSE al
+// montar: sin este doble, cualquier prueba que pinte la pantalla fallaría al
+// construir la suscripción. Las pruebas del canal lo inspeccionan a través de
+// `EventSourceFalso.instancias`.
+if (typeof globalThis.EventSource === 'undefined') {
+  globalThis.EventSource = EventSourceFalso as unknown as typeof EventSource
+}
 
 // jsdom no implementa `window.matchMedia`, y Ant Design lo consulta para sus
 // puntos de ruptura responsive. Este doble evalúa las consultas `min-width`/

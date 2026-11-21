@@ -8,7 +8,7 @@
 //! cargo test --test systemd_real -- --ignored --nocapture
 //! ```
 //!
-//! Y existen porque hay tres cosas que **no** se pueden medir sin bus:
+//! Y existen porque hay cuatro cosas que **no** se pueden medir sin bus:
 //!
 //! * que `ListUnits` conteste y devuelva el listado con los nombres de unidad que
 //!   podpot espera;
@@ -16,12 +16,21 @@
 //!   ruta inventada no falla: por una unidad que no existe, systemd contesta
 //!   `inactive` igual que por una parada—;
 //! * que el `JobRemoved` del job llegue y la acción vuelva cuando el job termina,
-//!   en vez de esperar al plazo.
+//!   en vez de esperar al plazo;
+//! * que **arrancar o parar** una quadlet emita `PropertiesChanged` sobre su unidad
+//!   y el vigilante lo convierta en una notificación —el camino que el panel usa
+//!   para refrescarse solo—.
 
 use podpot::systemd::dbus::DbusSystemdClient;
 use podpot::systemd::{
-    ActiveState, SystemdClient, UnitAction, UnitFileState, UnitName, UnitStatus,
+    ActiveState, SystemdClient, UnitAction, UnitFileState, UnitName, UnitStatus, UnitWatcher,
 };
+
+/// El plazo con el que se esperan las notificaciones del vigilante.
+///
+/// Generoso a propósito: el *debounce* del vigilante tiene que cerrar la ráfaga
+/// antes de avisar, así que la señal no llega al instante ni mucho menos.
+const ESPERA_DE_AVISO: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Se conecta al bus de usuario; si no hay, la prueba no tiene sentido y se dice.
 async fn cliente() -> DbusSystemdClient {
@@ -222,4 +231,165 @@ async fn una_unidad_que_no_existe_no_se_puede_accionar() {
         matches!(&error, podpot::systemd::SystemdError::UnitNotFound { unit } if unit == fantasma.as_str()),
         "se esperaba «no existe» nombrando la unidad: {error}"
     );
+}
+
+/// Escenarios «Señal de cambio reenviada como notificación» y «Alta o baja de
+/// unidad», medidos sobre el bus de verdad.
+///
+/// Un `daemon-reload` —que es `Reload`— emite `UnitFilesChanged` en el gestor, así
+/// que es la señal más barata de provocar sin tocar ninguna unidad: no cambia el
+/// estado de nada. Y mide las dos mitades del vigilante que ninguna prueba con el
+/// doble puede tocar: que el `Subscribe()` previo hace que systemd emita, y que la
+/// regla de la señal de propiedades y los `receive_signal` del gestor están bien
+/// escritos.
+///
+/// La notificación se espera con un plazo generoso porque el *debounce* del
+/// vigilante tiene que cerrar la ráfaga antes de avisar.
+#[tokio::test]
+#[ignore = "necesita el bus de systemd del usuario"]
+async fn un_daemon_reload_llega_como_notificacion() {
+    let cliente = cliente().await;
+    let mut avisos = cliente.subscribe();
+
+    // La suscripción tiene que estar hecha antes de provocar la señal: el canal no
+    // guarda historia para quien llega tarde.
+    cliente
+        .reload()
+        .await
+        .expect("el gestor tiene que poder recargar su configuración");
+
+    esperar_aviso(&mut avisos).await;
+}
+
+/// El camino que de verdad usa el panel: **arrancar y parar** una quadlet emite
+/// `PropertiesChanged` sobre su unidad, y el vigilante lo reenvía.
+///
+/// Es lo que ninguna prueba con el doble puede tocar —«arranca / para / falla»— y
+/// lo que mide que la regla del **espacio de rutas** de las unidades alcanza a una
+/// unidad **generada**, que es como aparecen las quadlets.
+///
+/// La quadlet es un `.volume` de prueba —lo más inocuo que genera una quadlet: no
+/// arranca ningún contenedor ni toca la red— y se borra al terminar, salga como
+/// salga la prueba. No se usa ninguna quadlet del usuario a propósito: pararla
+/// cambiaría la máquina.
+#[tokio::test]
+#[ignore = "necesita el bus de systemd del usuario"]
+async fn arrancar_y_parar_una_quadlet_de_prueba_llega_como_notificacion() {
+    let cliente = cliente().await;
+    let prueba =
+        QuadletDePrueba::nueva().expect("se tiene que poder escribir la quadlet de prueba");
+
+    // La suscripción va **antes** de provocar cualquier cambio: el canal no guarda
+    // historia, así que quien llega tarde no se entera de nada.
+    let mut avisos = cliente.subscribe();
+
+    // La unidad no existe para el gestor hasta que recarga su configuración.
+    cliente
+        .reload()
+        .await
+        .expect("el gestor tiene que poder recargar su configuración");
+
+    // Y la recarga avisa por su cuenta: se drena su aviso **antes** de accionar
+    // nada. Sin drenarlo, el `esperar_aviso` de más abajo se conformaría con él y la
+    // prueba pasaría aunque arrancar la quadlet no emitiera ni una señal.
+    esperar_aviso(&mut avisos).await;
+
+    cliente
+        .action(&prueba.unidad, UnitAction::Start)
+        .await
+        .expect("una quadlet de volumen tiene que poder arrancarse");
+
+    esperar_aviso(&mut avisos).await;
+
+    cliente
+        .action(&prueba.unidad, UnitAction::Stop)
+        .await
+        .expect("la quadlet de volumen tiene que poder pararse");
+
+    esperar_aviso(&mut avisos).await;
+
+    // Se borra la quadlet y se recarga para no dejar la unidad cargada en el
+    // gestor del usuario.
+    prueba
+        .borrar()
+        .expect("se tiene que poder borrar la quadlet");
+    cliente
+        .reload()
+        .await
+        .expect("el gestor tiene que poder recargar su configuración");
+}
+
+/// Espera a que llegue una notificación de cambio, con el plazo de la casa.
+async fn esperar_aviso(avisos: &mut tokio::sync::broadcast::Receiver<()>) {
+    tokio::time::timeout(ESPERA_DE_AVISO, avisos.recv())
+        .await
+        .expect("el cambio tiene que llegar como notificación antes del plazo")
+        .expect("el canal sigue vivo mientras el cliente exista");
+}
+
+/// Una quadlet de prueba —un `.volume` vacío— en el directorio de unidades del
+/// usuario.
+///
+/// Se borra al soltarse, para no dejar basura en el directorio del usuario ni
+/// unidades fantasma en el gestor.
+struct QuadletDePrueba {
+    /// El fichero de la quadlet.
+    fichero: std::path::PathBuf,
+    /// La unidad que el gestor genera a partir de ese fichero.
+    unidad: UnitName,
+}
+
+impl QuadletDePrueba {
+    /// Escribe la quadlet y devuelve su nombre de unidad.
+    fn nueva() -> std::io::Result<Self> {
+        let directorio = directorio_de_quadlets()?;
+        std::fs::create_dir_all(&directorio)?;
+
+        // El nombre lleva el pid para que dos ejecuciones —seguidas o a la vez— no
+        // se pisen el fichero ni la unidad.
+        let proceso = std::process::id();
+        let fichero = directorio.join(format!("podpot-prueba-{proceso}.volume"));
+        std::fs::write(&fichero, "[Volume]\n")?;
+
+        // `<stem>.volume` genera la unidad `<stem>-volume.service`: el nombre de la
+        // unidad sale del basename del fichero, no del contenido.
+        let unidad = UnitName::parse(&format!("podpot-prueba-{proceso}-volume.service"))
+            .expect("el nombre de la unidad de prueba es válido");
+
+        Ok(Self { fichero, unidad })
+    }
+
+    /// Borra el fichero de la quadlet; borrarlo dos veces no es un error.
+    fn borrar(&self) -> std::io::Result<()> {
+        match std::fs::remove_file(&self.fichero) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+impl Drop for QuadletDePrueba {
+    /// La quadlet se borra al terminar la prueba, salga como salga.
+    fn drop(&mut self) {
+        let _ = self.borrar();
+    }
+}
+
+/// El directorio en el que el usuario pone sus quadlets:
+/// `$XDG_CONFIG_HOME/containers/systemd` o, sin la variable,
+/// `$HOME/.config/containers/systemd`.
+fn directorio_de_quadlets() -> std::io::Result<std::path::PathBuf> {
+    let config = match std::env::var_os("XDG_CONFIG_HOME") {
+        Some(config) if !config.is_empty() => std::path::PathBuf::from(config),
+        _ => {
+            let home = std::env::var_os("HOME").ok_or_else(|| {
+                std::io::Error::other("sin HOME no se puede saber dónde van las quadlets")
+            })?;
+
+            std::path::PathBuf::from(home).join(".config")
+        }
+    };
+
+    Ok(config.join("containers/systemd"))
 }
