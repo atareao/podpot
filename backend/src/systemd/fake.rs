@@ -21,8 +21,8 @@ use async_trait::async_trait;
 use tokio::sync::broadcast;
 
 use super::{
-    ActiveState, SystemdClient, SystemdError, UnitAction, UnitFileState, UnitName, UnitOrigin,
-    UnitStatus, UnitWatcher,
+    ActiveState, ProgresoDeJob, ProgresoDeTrabajos, SystemdClient, SystemdError, UnitAction,
+    UnitFileState, UnitName, UnitOrigin, UnitStatus, UnitWatcher,
 };
 
 /// Cuántos avisos de cambio caben antes de perder el más viejo.
@@ -31,6 +31,13 @@ use super::{
 /// canal no puede ser de capacidad cero: con cero no habría avisos y el panel se
 /// quedaría congelado sin que nada lo delatara.
 const CAPACIDAD_DE_AVISOS: usize = 16;
+
+/// Cuántos eventos del ciclo de vida de un job caben antes de perder el más viejo.
+///
+/// Perder uno no rompe el panel —los jobs en curso caben de sobra en esta
+/// capacidad, y el estado final llega igual por el canal de unidades—, pero con
+/// cero no habría ningún evento y el canal sería un decorado.
+const CAPACIDAD_DE_TRABAJOS: usize = 16;
 
 /// Un cliente de systemd que no habla con systemd.
 #[derive(Debug)]
@@ -53,6 +60,12 @@ pub struct FakeSystemd {
     /// avisos los emite la prueba con [`FakeSystemd::notificar`]. Es exactamente
     /// lo que hace falta para medir el fan-out y el stream sin un bus de sesión.
     avisos: broadcast::Sender<()>,
+    /// El canal del ciclo de vida de los jobs ([`ProgresoDeTrabajos`]).
+    ///
+    /// Igual que el de avisos: sin bus no hay señales que reenviar, así que los
+    /// eventos los emite la prueba con [`FakeSystemd::emitir`]. Es lo que permite
+    /// medir el canal de trabajos —y su endpoint— sin un systemd de verdad.
+    trabajos: broadcast::Sender<ProgresoDeJob>,
 }
 
 impl Default for FakeSystemd {
@@ -65,11 +78,13 @@ impl FakeSystemd {
     /// Un doble que no conoce ninguna unidad.
     pub fn new() -> Self {
         let (avisos, _) = broadcast::channel(CAPACIDAD_DE_AVISOS);
+        let (trabajos, _) = broadcast::channel(CAPACIDAD_DE_TRABAJOS);
 
         Self {
             unidades: Mutex::new(BTreeMap::new()),
             recargas: AtomicU32::new(0),
             avisos,
+            trabajos,
         }
     }
 
@@ -129,6 +144,18 @@ impl FakeSystemd {
     /// receptores.
     pub fn notificar(&self) {
         let _ = self.avisos.send(());
+    }
+
+    /// Emite un evento del ciclo de vida de un job, como si systemd lo hubiera
+    /// señalado.
+    ///
+    /// Es la mitad que el doble añade al puerto [`ProgresoDeTrabajos`]: sin bus no
+    /// hay señales de `JobNew`/`JobRemoved` que reenviar, así que quien emite el
+    /// evento a mano es la prueba que está midiendo el canal o su endpoint. No hay
+    /// error posible: si nadie está suscrito el evento se pierde, que es justo lo
+    /// que hace un canal sin receptores.
+    pub fn emitir(&self, progreso: ProgresoDeJob) {
+        let _ = self.trabajos.send(progreso);
     }
 
     /// Toma el candado de las unidades sin poder entrar en pánico.
@@ -216,5 +243,16 @@ impl UnitWatcher for FakeSystemd {
     /// los dos sólo hablan de «algo cambió».
     fn subscribe(&self) -> broadcast::Receiver<()> {
         self.avisos.subscribe()
+    }
+}
+
+impl ProgresoDeTrabajos for FakeSystemd {
+    /// Se suscribe a los eventos que emita [`FakeSystemd::emitir`].
+    ///
+    /// Es el mismo contrato que cumple el cliente real por señales de D-Bus, pero
+    /// sin bus: lo que se mide con él —el canal de trabajos y su endpoint— es lo
+    /// mismo, porque los dos sólo hablan de transiciones de job.
+    fn observar(&self) -> broadcast::Receiver<ProgresoDeJob> {
+        self.trabajos.subscribe()
     }
 }

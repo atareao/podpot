@@ -639,6 +639,194 @@ pub trait SystemdClient: Send + Sync + fmt::Debug {
     async fn reload(&self) -> Result<(), SystemdError>;
 }
 
+/// La fase del ciclo de vida de un job de systemd.
+///
+/// Son dos y sólo dos: el gestor avisa cuando **crea** el job y cuando lo
+/// **quita**, y no hay un tercer aviso. Lo que cambia por el camino es el estado
+/// de la unidad, que viaja por el canal de unidades
+/// ([`UnitStatus::active_state`]): un job que se está ejecutando ya se ve ahí.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaseDeJob {
+    /// El job acaba de crearse.
+    New,
+    /// El job ha terminado.
+    Done,
+}
+
+impl FaseDeJob {
+    /// La fase como texto, que es lo que viaja en el evento.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::New => "new",
+            Self::Done => "done",
+        }
+    }
+}
+
+impl fmt::Display for FaseDeJob {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Serialize for FaseDeJob {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+/// El resultado con el que terminó un job de systemd.
+///
+/// Es un enumerado y no un `String` por la misma razón que [`ActiveState`]: el
+/// panel decide con él —«¿terminó bien o mal?»— y comparar cadenas libres hace que
+/// una errata de systemd se traduzca en un desenlace que nadie mira. La lista es la
+/// que documenta systemd (`JobResult`), y lo que no esté en ella **no se pierde**:
+/// cae en [`ResultadoDeJob::Unknown`] y se publica tal cual, que es lo honesto —un
+/// panel mejor informado de lo que de verdad pasó que inventándose un desenlace—.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResultadoDeJob {
+    /// El job terminó como se pidió.
+    Done,
+    /// El job falló.
+    Failed,
+    /// Alguien lo canceló.
+    Canceled,
+    /// No terminó a tiempo.
+    Timeout,
+    /// No se pudo ejecutar por una dependencia.
+    Dependency,
+    /// Se saltó: no hacía falta.
+    Skipped,
+    /// El gestor lo abandonó.
+    Abandoned,
+    /// Cualquier desenlace que esta versión no conozca, sin perderlo por el camino.
+    Unknown(String),
+}
+
+impl ResultadoDeJob {
+    /// Lee el resultado de un job tal y como lo publica systemd.
+    pub fn from_dbus(resultado: &str) -> Self {
+        match resultado {
+            "done" => Self::Done,
+            "failed" => Self::Failed,
+            "canceled" => Self::Canceled,
+            "timeout" => Self::Timeout,
+            "dependency" => Self::Dependency,
+            "skipped" => Self::Skipped,
+            "abandoned" => Self::Abandoned,
+            otro => Self::Unknown(otro.to_owned()),
+        }
+    }
+
+    /// El resultado tal y como lo publica systemd.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Done => "done",
+            Self::Failed => "failed",
+            Self::Canceled => "canceled",
+            Self::Timeout => "timeout",
+            Self::Dependency => "dependency",
+            Self::Skipped => "skipped",
+            Self::Abandoned => "abandoned",
+            Self::Unknown(otro) => otro,
+        }
+    }
+}
+
+impl fmt::Display for ResultadoDeJob {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Serialize for ResultadoDeJob {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+/// El progreso de un job de systemd: una transición de su ciclo de vida.
+///
+/// A diferencia de [`UnitStatus`], que es una **instantánea** idempotente, esto es
+/// una **transición**: dice que un job acaba de nacer o de morir. Por eso no lleva
+/// el estado de la unidad —eso lo trae el canal de unidades— ni un instante: el
+/// único orden que el panel necesita es el que le da el flujo.
+///
+/// `job` es el identificador del gestor —único mientras el gestor viva—, `unit` la
+/// unidad sobre la que actúa, `kind` el tipo de job de systemd (`start`, `stop`,
+/// `restart`, …) y `result` el desenlace, presente **sólo** al terminar: un job que
+/// acaba de crearse no tiene resultado, y publicar `null` obligaría al panel a
+/// distinguir «sin resultado» de «resultado nulo», que no es lo mismo.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProgresoDeJob {
+    /// El identificador del job en el gestor.
+    pub job: u32,
+    /// La unidad sobre la que actúa.
+    pub unit: UnitName,
+    /// El tipo de job de systemd (`start`, `stop`, `restart`, …).
+    pub kind: String,
+    /// Si el job acaba de crearse o acaba de terminar.
+    pub phase: FaseDeJob,
+    /// El desenlace, presente sólo en la fase `done`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<ResultadoDeJob>,
+}
+
+impl ProgresoDeJob {
+    /// El progreso de un job que systemd acaba de crear.
+    pub fn nuevo(job: u32, unit: UnitName, kind: impl Into<String>) -> Self {
+        Self {
+            job,
+            unit,
+            kind: kind.into(),
+            phase: FaseDeJob::New,
+            result: None,
+        }
+    }
+
+    /// El progreso de un job que systemd acaba de quitar, con su desenlace.
+    pub fn terminado(
+        job: u32,
+        unit: UnitName,
+        kind: impl Into<String>,
+        result: ResultadoDeJob,
+    ) -> Self {
+        Self {
+            job,
+            unit,
+            kind: kind.into(),
+            phase: FaseDeJob::Done,
+            result: Some(result),
+        }
+    }
+}
+
+/// El contrato del **progreso de los trabajos** de systemd.
+///
+/// Es un puerto aparte de [`UnitWatcher`] y no un método suyo porque llevan datos
+/// distintos: el vigilante avisa de «algo cambió» y quien lo recibe vuelve a
+/// preguntar, mientras que aquí el evento **ya es el dato** —qué job, sobre qué
+/// unidad, en qué fase y con qué desenlace— y no hay nada que volver a preguntar.
+///
+/// Cubre **todos** los jobs del gestor, no sólo los que pide el panel: systemd
+/// arranca jobs por su cuenta —reinicios automáticos, dependencias, otro
+/// cliente—, y ésos también se publican. De ahí que la implementación real se
+/// alimente de las señales del gestor y **no** de la ruta de acción: una sola ruta
+/// —señal a evento— sirve para todo.
+///
+/// No es `async` porque suscribirse no habla con nadie: el canal ya existe cuando
+/// el cliente se construye.
+pub trait ProgresoDeTrabajos: Send + Sync + fmt::Debug {
+    /// Se suscribe a los eventos del ciclo de vida de los jobs.
+    ///
+    /// Cada suscriptor recibe los eventos **a partir de su suscripción**: el canal
+    /// no guarda historia, así que no hay instantánea inicial —un job «en curso» es
+    /// efímero y el estado que deja lo entrega el canal de unidades—. Si un
+    /// suscriptor se queda atrás y el canal se llena, pierde eventos viejos: es el
+    /// precio de que un panel lento no frene a los demás.
+    fn observar(&self) -> broadcast::Receiver<ProgresoDeJob>;
+}
+
 /// El contrato del **vigilante** de cambios de unidades.
 ///
 /// Es un puerto aparte de [`SystemdClient`] y no un método suyo porque son dos
@@ -669,8 +857,9 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        ActiveState, SystemdClient, SystemdError, UnitAction, UnitFileState, UnitName, UnitOrigin,
-        UnitStatus, UnitWatcher, es_origen_de_quadlet, fake::FakeSystemd,
+        ActiveState, FaseDeJob, ProgresoDeJob, ProgresoDeTrabajos, ResultadoDeJob, SystemdClient,
+        SystemdError, UnitAction, UnitFileState, UnitName, UnitOrigin, UnitStatus, UnitWatcher,
+        es_origen_de_quadlet, fake::FakeSystemd,
     };
 
     /// Escenario «Nombre con caracteres especiales»: `.` y `-` van escapados a la
@@ -1217,6 +1406,151 @@ mod tests {
                 .await
                 .expect("el doble no falla")
                 .is_empty()
+        );
+    }
+
+    /// El progreso de un job recién creado: la fase es `new` y **no** hay
+    /// resultado —un job que empieza no ha terminado—.
+    #[test]
+    fn un_job_recien_creado_es_de_fase_new_y_sin_resultado() {
+        let unidad = UnitName::parse("centinela-db.service").expect("nombre válido");
+
+        let progreso = ProgresoDeJob::nuevo(7, unidad.clone(), "start");
+
+        assert_eq!(progreso.job, 7);
+        assert_eq!(progreso.unit, unidad);
+        assert_eq!(progreso.kind, "start");
+        assert_eq!(progreso.phase, FaseDeJob::New);
+        assert_eq!(progreso.result, None);
+    }
+
+    /// Y su serialización es la del evento: `phase` en `new` y **sin** `result`,
+    /// para que el panel no tenga que distinguir un resultado ausente de uno nulo.
+    #[test]
+    fn la_serializacion_de_un_job_creado_lleva_la_fase_y_no_el_resultado() {
+        let unidad = UnitName::parse("centinela-db.service").expect("nombre válido");
+        let progreso = ProgresoDeJob::nuevo(7, unidad, "start");
+
+        let json = serde_json::to_value(&progreso).expect("el progreso se serializa");
+
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "job": 7,
+                "unit": "centinela-db.service",
+                "kind": "start",
+                "phase": "new",
+            }),
+            "el evento de un job creado no puede llevar `result`"
+        );
+    }
+
+    /// El de un job terminado sí lo lleva, y la fase es `done`.
+    #[test]
+    fn la_serializacion_de_un_job_terminado_lleva_la_fase_y_el_resultado() {
+        let unidad = UnitName::parse("centinela-db.service").expect("nombre válido");
+        let progreso =
+            ProgresoDeJob::terminado(7, unidad, "start", ResultadoDeJob::from_dbus("done"));
+
+        assert_eq!(progreso.phase, FaseDeJob::Done);
+
+        let json = serde_json::to_value(&progreso).expect("el progreso se serializa");
+
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "job": 7,
+                "unit": "centinela-db.service",
+                "kind": "start",
+                "phase": "done",
+                "result": "done",
+            })
+        );
+    }
+
+    /// El conjunto acotado de resultados conocidos: cada valor que systemd informa
+    /// tiene su variante, y el texto que se publica es el de systemd.
+    #[test]
+    fn los_resultados_conocidos_de_un_job_se_reconocen() {
+        for crudo in [
+            "done",
+            "failed",
+            "canceled",
+            "timeout",
+            "dependency",
+            "skipped",
+            "abandoned",
+        ] {
+            let resultado = ResultadoDeJob::from_dbus(crudo);
+
+            assert!(
+                resultado != ResultadoDeJob::Unknown(crudo.to_owned()),
+                "`{crudo}` es un resultado conocido y no puede caer en el cajón de sastre"
+            );
+            assert_eq!(resultado.as_str(), crudo, "el texto no puede cambiar");
+        }
+    }
+
+    /// Y un resultado que esta versión no conozca **no se pierde**: se conserva
+    /// tal cual, que es lo que permite publicar lo que diga systemd sin inventar.
+    #[test]
+    fn un_resultado_desconocido_no_se_pierde() {
+        let raro = ResultadoDeJob::from_dbus("reencarnado");
+
+        assert_eq!(
+            raro,
+            ResultadoDeJob::Unknown("reencarnado".to_owned()),
+            "un resultado desconocido tiene que conservarse"
+        );
+        assert_eq!(raro.as_str(), "reencarnado");
+    }
+
+    /// Escenario «El doble emite eventos sin bus»: el puerto del progreso de
+    /// trabajos se ejerce con el doble —sin D-Bus— y el suscriptor lo recibe.
+    #[tokio::test]
+    async fn el_progreso_de_trabajos_llega_al_suscriptor_sin_bus() {
+        let doble = FakeSystemd::new();
+        let mut suscriptor = doble.observar();
+
+        let unidad = UnitName::parse("centinela-db.service").expect("nombre válido");
+        doble.emitir(ProgresoDeJob::nuevo(7, unidad, "start"));
+
+        let recibido = tokio::time::timeout(std::time::Duration::from_secs(1), suscriptor.recv())
+            .await
+            .expect("el evento tiene que llegar sin esperar al plazo")
+            .expect("el canal sigue vivo mientras el doble exista");
+
+        assert_eq!(recibido.job, 7);
+        assert_eq!(recibido.phase, FaseDeJob::New);
+        assert_eq!(recibido.kind, "start");
+    }
+
+    /// Y el puerto también vale como objeto: el estado guarda un
+    /// `Arc<dyn ProgresoDeTrabajos>`, así que la implementación se inyecta por ahí.
+    #[tokio::test]
+    async fn el_progreso_de_trabajos_vale_detras_de_un_arco() {
+        let doble = Arc::new(FakeSystemd::new());
+        let trabajos: Arc<dyn ProgresoDeTrabajos> = doble.clone();
+        let mut suscriptor = trabajos.observar();
+
+        let unidad = UnitName::parse("centinela-db.service").expect("nombre válido");
+        doble.emitir(ProgresoDeJob::terminado(
+            9,
+            unidad,
+            "stop",
+            ResultadoDeJob::from_dbus("failed"),
+        ));
+
+        let recibido = tokio::time::timeout(std::time::Duration::from_secs(1), suscriptor.recv())
+            .await
+            .expect("el evento tiene que llegar a través del trazo del puerto")
+            .expect("el canal sigue vivo mientras el doble exista");
+
+        assert_eq!(recibido.phase, FaseDeJob::Done);
+        assert_eq!(
+            recibido.result,
+            Some(ResultadoDeJob::from_dbus("failed")),
+            "el resultado tiene que llegar entero"
         );
     }
 

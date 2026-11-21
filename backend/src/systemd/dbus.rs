@@ -14,6 +14,7 @@
 //!   devuelven un *job* y sólo el aviso de que el job terminó dice si la unidad
 //!   llegó a su estado.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
@@ -27,8 +28,8 @@ use zbus::zvariant::OwnedObjectPath;
 use zbus::{Connection, MatchRule, MessageStream, Proxy};
 
 use super::{
-    ActiveState, SystemdClient, SystemdError, UnitAction, UnitFileState, UnitName, UnitOrigin,
-    UnitStatus, UnitWatcher,
+    ActiveState, ProgresoDeJob, ProgresoDeTrabajos, ResultadoDeJob, SystemdClient, SystemdError,
+    UnitAction, UnitFileState, UnitName, UnitOrigin, UnitStatus, UnitWatcher,
 };
 
 /// El servicio del gestor de systemd.
@@ -42,6 +43,19 @@ const IFACE_MANAGER: &str = "org.freedesktop.systemd1.Manager";
 
 /// La interfaz de una unidad.
 const IFACE_UNIT: &str = "org.freedesktop.systemd1.Unit";
+
+/// La interfaz del objeto de un **job**.
+///
+/// Es donde vive la propiedad [`PROPIEDAD_JOB_TYPE`], que es el único sitio del que
+/// se puede sacar el tipo de job: la señal de alta **no** lo trae (ver
+/// [`tipo_de_job`]).
+const IFACE_JOB: &str = "org.freedesktop.systemd1.Job";
+
+/// La propiedad del objeto de un job que dice de qué tipo es (`start`, `stop`, …).
+///
+/// Es `const`, así que se puede leer una vez y vale para toda la vida del job; y es
+/// la única fuente: ni `JobNew` ni `JobRemoved` la llevan en su cuerpo.
+const PROPIEDAD_JOB_TYPE: &str = "JobType";
 
 /// La interfaz estándar por la que cualquier objeto de D-Bus publica sus cambios
 /// de propiedades.
@@ -78,6 +92,34 @@ const CAPACIDAD_DE_AVISOS: usize = 32;
 /// cupiera, el reenvío esperaría y el bus acumularía, que es lo correcto: no se
 /// pierde ninguna señal.
 const CAPACIDAD_DE_SENALES: usize = 256;
+
+/// Cuántos eventos de progreso de job caben antes de perder el más viejo.
+///
+/// Perder uno no rompe el panel —los jobs en curso de un usuario caben de sobra—,
+/// y el estado final llega igual por el canal de unidades; pero con cero no habría
+/// ningún evento y el canal sería un decorado.
+const CAPACIDAD_DE_TRABAJOS: usize = 64;
+
+/// La señal con la que el gestor anuncia que ha creado un job.
+const SENAL_JOB_NEW: &str = "JobNew";
+
+/// La señal con la que el gestor anuncia que ha quitado un job.
+const SENAL_JOB_REMOVED: &str = "JobRemoved";
+
+/// El tipo que se publica cuando el tipo del job no se puede saber.
+///
+/// Son dos casos, y los dos pasan de verdad:
+///
+/// * **no se le vio nacer** —el vigilante se resuscribe cuando el bus cierra el
+///   stream (una caída, un corte del socket), y un job que ya estuviera en curso
+///   entonces no tiene `JobNew` en la conexión nueva—;
+/// * **nació y murió antes de poder preguntar** —el tipo vive en el objeto del job,
+///   no en la señal, así que se pide aparte; si el job fue tan corto que el objeto
+///   ya no estaba cuando se preguntó, no hay tipo que publicar—.
+///
+/// Publicar `unknown` es más honesto que inventarse el tipo —que era `start` o
+/// `stop`, pero no se sabe— y mejor que no publicar nada: el fin del job sí se sabe.
+const KIND_DESCONOCIDO: &str = "unknown";
 
 /// Cuánto silencio convierte una ráfaga de señales en un solo aviso.
 ///
@@ -117,6 +159,14 @@ const ERROR_FILE_NOT_FOUND: &str = "org.freedesktop.DBus.Error.FileNotFound";
 /// no la generó ningún fichero.
 const ERROR_UNKNOWN_PROPERTY: &str = "org.freedesktop.DBus.Error.UnknownProperty";
 
+/// El error con el que el gestor contesta que la conexión **ya** está suscrita.
+///
+/// `Subscribe()` se pide **por conexión**, no por regla, y podpot tiene dos tareas
+/// escuchando por la misma conexión —el vigilante de unidades y el de trabajos—: la
+/// segunda en llamar recibe esto, que no es un fallo sino la confirmación de que ya
+/// se reciben señales, que es justo lo que se iba a pedir.
+const ERROR_YA_SUSCRITO: &str = "org.freedesktop.systemd1.AlreadySubscribed";
+
 /// El prefijo de los errores propios del gestor de systemd.
 ///
 /// Todo lo que el gestor contesta por su cuenta —unidad enmascarada, que no se
@@ -141,6 +191,15 @@ const MODO: &str = "replace";
 /// así que el plazo es generoso. Pero un plazo existe: sin él, una unidad que se
 /// quedara en `activating` para siempre dejaría la petición colgada.
 const ESPERA_DEL_JOB: Duration = Duration::from_secs(60);
+
+/// Cuánto se espera a que el gestor conteste por el `JobType` de un job.
+///
+/// Es una consulta **de adorno**: su resultado sólo mejora el evento —si no llega,
+/// el job sale con `unknown`— y quien la hace no puede quedarse esperándola. Un
+/// plazo corto y explícito evita depender del que traiga puesto el bus por defecto
+/// (que puede ser «ninguno») y que un gestor atascado deje la escucha de jobs
+/// parada detrás de una consulta que no vuelve.
+const ESPERA_DEL_TIPO: Duration = Duration::from_secs(2);
 
 /// Una entrada del listado de unidades de systemd.
 ///
@@ -172,6 +231,14 @@ pub struct DbusSystemdClient {
     /// manda a los demás: el fan-out escucha para recalcular y publicar, y una
     /// prueba de integración escucha para medir el camino entero.
     avisos: broadcast::Sender<()>,
+    /// El canal por el que el vigilante publica el ciclo de vida de los jobs.
+    ///
+    /// Es un canal **aparte** del de avisos y no el mismo: un aviso de cambio de
+    /// unidad no lleva datos y dispara un recálculo, mientras que un evento de job
+    /// ya es el dato y no hay nada que recalcular. También es `broadcast` porque
+    /// los suscriptores son varios —cada cliente del canal de trabajos— y ninguno
+    /// manda a los demás.
+    trabajos: broadcast::Sender<ProgresoDeJob>,
     /// El cierre del vigilante: cuando vale `true`, la tarea de escucha termina.
     ///
     /// El disparador vive en el cliente —y no lo comparte con el cierre del
@@ -208,17 +275,23 @@ impl DbusSystemdClient {
     /// `connect_user` sí tiene que volver. Que no se espere no la hace opcional:
     /// si el bus no admite la suscripción, el vigilante lo registra y la reintenta,
     /// mientras el cliente sigue contestando listados y acciones.
+    ///
+    /// Y con ella la del progreso de trabajos —[`ProgresoDeTrabajos`]—, por la misma
+    /// razón: escucha lo que dure el proceso y publica lo que el gestor le cuente.
     pub async fn connect_user() -> Result<Self, SystemdError> {
         let conexion = Connection::session().await.map_err(transporte)?;
         let (avisos, _) = broadcast::channel(CAPACIDAD_DE_AVISOS);
+        let (trabajos, _) = broadcast::channel(CAPACIDAD_DE_TRABAJOS);
         let (apagado, _) = watch::channel(false);
 
         let cliente = Self {
             conexion,
             avisos,
+            trabajos,
             apagado,
         };
         cliente.vigilar();
+        cliente.vigilar_trabajos();
 
         Ok(cliente)
     }
@@ -240,6 +313,32 @@ impl DbusSystemdClient {
                     let avisos = avisos.clone();
 
                     async move { escuchar(&conexion, &avisos, apagado).await }
+                },
+                apagado,
+            )
+            .await;
+        });
+    }
+
+    /// Arranca la tarea que escucha el ciclo de vida de los jobs y los publica.
+    ///
+    /// Es la gemela de [`DbusSystemdClient::vigilar`]: se lanza en segundo plano
+    /// —dura lo que el proceso— y termina cuando el bus cierra el stream, que
+    /// entonces se reintenta, o cuando se suelta el cliente. Comparte con ella el
+    /// canal de cierre, que es lo que impide que una de las dos sobreviva al
+    /// apagado.
+    fn vigilar_trabajos(&self) {
+        let conexion = self.conexion.clone();
+        let trabajos = self.trabajos.clone();
+        let apagado = self.apagado.subscribe();
+
+        tokio::spawn(async move {
+            vigilar_sin_descanso(
+                |apagado| {
+                    let conexion = conexion.clone();
+                    let trabajos = trabajos.clone();
+
+                    async move { escuchar_trabajos(&conexion, &trabajos, apagado).await }
                 },
                 apagado,
             )
@@ -431,6 +530,45 @@ impl UnitWatcher for DbusSystemdClient {
     }
 }
 
+/// Pide al gestor que mande sus señales por esta conexión.
+///
+/// `Subscribe()` es **idempotente en la intención** aunque el gestor no lo sea en la
+/// respuesta: lo que se quiere es que la conexión reciba señales, y
+/// [`ERROR_YA_SUSCRITO`] significa exactamente eso —lo pidió antes la otra tarea
+/// escuchando por la misma conexión—, así que se toma por buena y no se rompe la
+/// escucha por pedir algo que ya estaba hecho.
+///
+/// **La verificación de esa rama, contra el gestor de verdad, depende del test de
+/// bus real** (`tests/systemd_real.rs`): es el único sitio donde dos tareas piden la
+/// suscripción por la misma conexión y systemd contesta lo que contesta. Sin bus,
+/// lo que sí se mide es la decisión —[`es_ya_suscrito`] sobre un error homónimo
+/// construido a mano—, pero el viaje de ida y vuelta no.
+async fn suscribir(conexion: &Connection) -> Result<(), SystemdError> {
+    let manager = Proxy::new(conexion, DESTINO, RUTA_MANAGER, IFACE_MANAGER)
+        .await
+        .map_err(transporte)?;
+
+    match manager.call::<_, _, ()>("Subscribe", &()).await {
+        Ok(()) => Ok(()),
+        Err(error) if es_ya_suscrito(&error) => Ok(()),
+        Err(error) => Err(transporte(error)),
+    }
+}
+
+/// ¿Es este error del bus la confirmación de que la conexión **ya** estaba suscrita?
+///
+/// Se separa del `match` de [`suscribir`] —donde nació, como guarda— porque así la
+/// decisión se puede medir sin bus: un error de método con el nombre
+/// [`ERROR_YA_SUSCRITO`] y otro con un nombre distinto la agotan entera, y el
+/// resto de la función queda reducido a lo que sólo un bus real puede ejercer.
+fn es_ya_suscrito(error: &zbus::Error) -> bool {
+    match error {
+        zbus::Error::MethodError(nombre, _, _) => nombre.as_str() == ERROR_YA_SUSCRITO,
+        // Lo que no es un error de método no lo dijo el gestor: no es esta señal.
+        _ => false,
+    }
+}
+
 /// Escucha las señales de systemd y avisa de los cambios hasta que el bus se cae
 /// o el servidor pide el cierre.
 ///
@@ -454,12 +592,9 @@ async fn escuchar(
     avisos: &broadcast::Sender<()>,
     mut apagado: watch::Receiver<bool>,
 ) -> Result<(), SystemdError> {
-    let manager = Proxy::new(conexion, DESTINO, RUTA_MANAGER, IFACE_MANAGER)
-        .await
-        .map_err(transporte)?;
+    suscribir(conexion).await?;
 
-    manager
-        .call::<_, _, ()>("Subscribe", &())
+    let manager = Proxy::new(conexion, DESTINO, RUTA_MANAGER, IFACE_MANAGER)
         .await
         .map_err(transporte)?;
 
@@ -589,6 +724,283 @@ fn siguiente_retraso(actual: Duration) -> Duration {
 /// —el cliente se fue y nadie más va a mandar— y eso también es un cierre.
 fn se_pidio_el_cierre(apagado: &watch::Receiver<bool>) -> bool {
     *apagado.borrow() || apagado.has_changed().is_err()
+}
+
+impl ProgresoDeTrabajos for DbusSystemdClient {
+    /// Se suscribe a los eventos que publica la tarea de escucha de jobs.
+    ///
+    /// Cada suscriptor recibe las transiciones **a partir de su suscripción**: el
+    /// canal no guarda historia, así que no hay instantánea inicial —un job en
+    /// curso es efímero y su estado final lo entrega el canal de unidades—.
+    fn observar(&self) -> broadcast::Receiver<ProgresoDeJob> {
+        self.trabajos.subscribe()
+    }
+}
+
+/// Escucha el ciclo de vida de los jobs del gestor y lo publica como eventos.
+///
+/// Dos manantiales y ningún *debounce*: `JobNew` al crear un job y `JobRemoved` al
+/// quitarlo. Aquí no se coalesce nada a propósito —a diferencia del vigilante de
+/// unidades—: cada transición es un dato por derecho propio, y juntar dos jobs en
+/// un evento perdería el aviso de uno de ellos.
+///
+/// **Antes de escuchar hay que ser suscrito**: lo pide [`suscribir`], la misma
+/// llamada que hace el vigilante de unidades —que suele ganarle la mano, en cuyo
+/// caso la respuesta es «ya estabas» y se toma por buena—; sin la suscripción,
+/// systemd no emite las señales.
+///
+/// Volver no es rendirse: cuando el bus cierra el stream, quien la llama reintenta
+/// —con la suscripción incluida, que es lo que hay que rehacer—.
+async fn escuchar_trabajos(
+    conexion: &Connection,
+    trabajos: &broadcast::Sender<ProgresoDeJob>,
+    mut apagado: watch::Receiver<bool>,
+) -> Result<(), SystemdError> {
+    suscribir(conexion).await?;
+
+    let manager = Proxy::new(conexion, DESTINO, RUTA_MANAGER, IFACE_MANAGER)
+        .await
+        .map_err(transporte)?;
+
+    let altas = manager
+        .receive_signal(SENAL_JOB_NEW)
+        .await
+        .map_err(transporte)?;
+    let bajas = manager
+        .receive_signal(SENAL_JOB_REMOVED)
+        .await
+        .map_err(transporte)?;
+
+    // Los dos manantiales se juntan en uno: la traducción mira el nombre de la
+    // señal, y el orden de llegada es el que el bus manda.
+    let manantiales: Vec<Pin<Box<dyn Stream<Item = zbus::Message> + Send + '_>>> =
+        vec![Box::pin(altas), Box::pin(bajas)];
+
+    tokio::select! {
+        biased;
+
+        _ = apagado.wait_for(|apagado| *apagado) => {}
+        _ = publicar_jobs(
+            stream::select_all(manantiales),
+            // El lector del tipo de job entra por parámetro: la traducción no habla
+            // con el bus por su cuenta, así que se puede medir sin uno.
+            |ruta: OwnedObjectPath| async move { tipo_de_job(conexion, &ruta).await },
+            trabajos,
+        ) => {}
+    }
+
+    Ok(())
+}
+
+/// Publica un evento de progreso por cada señal de job que llegue.
+///
+/// Genérico sobre el manantial **y sobre el lector del tipo de job** —y no atado a
+/// una conexión de verdad— para poder medir la traducción sin bus: lo que entra son
+/// mensajes del gestor, lo que sale son eventos, y las dos mitades se pueden ejercer
+/// con mensajes construidos a mano y un lector de mentira.
+///
+/// El mapa de jobs en curso es la memoria que hace falta para completar el evento
+/// final: la señal de baja **no** trae el tipo de job —y para entonces el objeto del
+/// job ya no existe, así que tampoco se puede preguntar—, de modo que el tipo se
+/// guarda al nacer y se recupera al morir. Se vacía solo —cada baja borra su
+/// entrada—, así que no crece con el tiempo.
+///
+/// «No crece» es literal, y conviene decirlo porque un `HashMap` en un bucle
+/// ilimitado pide explicación: cada entrada se escribe con el alta de un job y se
+/// borra con su baja, y todo job que systemd crea lo quita —el gestor no acumula
+/// jobs—, así que el mapa no puede quedar más alto que los jobs que estén vivos a
+/// la vez. Lo único que lo reinicia de golpe es la reconexión del vigilante, que
+/// empieza con un mapa vacío; y los jobs que estuvieran en curso entonces no se
+/// pierden: su baja sale con [`KIND_DESCONOCIDO`].
+async fn publicar_jobs<S, L, F>(
+    mut senales: S,
+    leer_tipo: L,
+    trabajos: &broadcast::Sender<ProgresoDeJob>,
+) where
+    S: Stream<Item = zbus::Message> + Unpin,
+    L: Fn(OwnedObjectPath) -> F,
+    F: Future<Output = Option<String>>,
+{
+    let mut en_curso: HashMap<u32, String> = HashMap::new();
+
+    while let Some(mensaje) = senales.next().await {
+        let progreso = match senal_de_job(&mensaje) {
+            None => continue,
+            Some(SenalDeJob::Nueva { job, ruta, unit }) => {
+                // El tipo se pregunta **aquí**, con el job recién creado: es el único
+                // momento en que el objeto existe con seguridad.
+                let kind = leer_tipo(ruta)
+                    .await
+                    .unwrap_or_else(|| KIND_DESCONOCIDO.to_owned());
+
+                en_curso.insert(job, kind.clone());
+
+                ProgresoDeJob::nuevo(job, unit, kind)
+            }
+            Some(SenalDeJob::Quitada {
+                job,
+                unit,
+                resultado,
+            }) => {
+                let kind = en_curso
+                    .remove(&job)
+                    .unwrap_or_else(|| KIND_DESCONOCIDO.to_owned());
+
+                ProgresoDeJob::terminado(job, unit, kind, ResultadoDeJob::from_dbus(&resultado))
+            }
+        };
+
+        // Sin suscriptores el evento se pierde, y no es un error: nadie mira. El
+        // panel que se conecte después no se pierde nada suyo —el estado final está
+        // en el canal de unidades—.
+        let _ = trabajos.send(progreso);
+    }
+}
+
+/// Lo que una señal del gestor dice de un job, todavía **sin** el tipo.
+///
+/// Se separa de [`ProgresoDeJob`] porque el tipo no viaja en la señal: hay que ir a
+/// buscarlo al objeto del job, y eso es una llamada aparte que sólo se puede hacer
+/// con el alta —cuando el objeto existe—. Un tipo intermedio hace explícito que al
+/// traducir la señal todavía falta un dato.
+enum SenalDeJob {
+    /// El gestor acaba de crear el job. La ruta es la del objeto del job, de donde
+    /// se lee el tipo.
+    Nueva {
+        /// El identificador del job.
+        job: u32,
+        /// La ruta del objeto del job, que es donde vive `JobType`.
+        ruta: OwnedObjectPath,
+        /// La unidad sobre la que actúa.
+        unit: UnitName,
+    },
+    /// El gestor acaba de quitar el job, con su desenlace.
+    Quitada {
+        /// El identificador del job.
+        job: u32,
+        /// La unidad sobre la que actuaba.
+        unit: UnitName,
+        /// El desenlace que informa el gestor.
+        resultado: String,
+    },
+}
+
+/// Traduce una señal del gestor, o `None` si no es una señal de job.
+///
+/// Se mira el **nombre** de la señal y no la interfaz: es lo que distingue un alta
+/// de una baja, y lo que evita que cualquier otra cosa que diga el bus (los `UnitNew`
+/// y `UnitRemoved`, que también cuelgan del manager) se cuele en el canal.
+///
+/// Las dos firmas son distintas y **no** se pueden confundir: `JobNew` es `(uos)` y
+/// `JobRemoved` es `(uoss)`. La documentación de systemd de más de un sitio dice que
+/// el alta lleva el tipo de job como cuarto argumento; el systemd de esta máquina
+/// (262) no lo hace, y el test contra el bus real es el que lo deja por escrito.
+fn senal_de_job(mensaje: &zbus::Message) -> Option<SenalDeJob> {
+    let miembro = mensaje.header().member()?.as_str().to_owned();
+
+    match miembro.as_str() {
+        SENAL_JOB_NEW => {
+            let (job, ruta, unidad): (u32, OwnedObjectPath, String) =
+                match mensaje.body().deserialize() {
+                    Ok(cuerpo) => cuerpo,
+                    Err(error) => {
+                        aviso_de_cuerpo_inesperado(&miembro, &error);
+
+                        return None;
+                    }
+                };
+
+            Some(SenalDeJob::Nueva {
+                job,
+                ruta,
+                unit: unidad_de_senal(&unidad),
+            })
+        }
+        SENAL_JOB_REMOVED => {
+            let (job, _ruta, unidad, resultado): (u32, OwnedObjectPath, String, String) =
+                match mensaje.body().deserialize() {
+                    Ok(cuerpo) => cuerpo,
+                    Err(error) => {
+                        aviso_de_cuerpo_inesperado(&miembro, &error);
+
+                        return None;
+                    }
+                };
+
+            Some(SenalDeJob::Quitada {
+                job,
+                unit: unidad_de_senal(&unidad),
+                resultado,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Deja constancia de una señal de job cuyo cuerpo no encaja, y no publica nada.
+///
+/// Un cuerpo que no encaja se descarta, pero **no en silencio**: perder la
+/// transición sin dejar rastro dejaría el panel mudo y sin causa visible. Y no es
+/// un caso hipotético: si systemd cambia la firma —una versión que añada el tipo de
+/// job al alta, como da por hecho su documentación— todo lo que llegue deja de
+/// encajar, y este aviso es lo único que lo delata.
+///
+/// El mensaje vive aquí, y no repetido en las dos señales, para que la alta y la
+/// baja lo digan con las mismas palabras: dos copias acaban divergiendo y quien
+/// busque en el registro ya no sabrá qué patrón mirar.
+fn aviso_de_cuerpo_inesperado(miembro: &str, error: &zbus::Error) {
+    tracing::warn!(%error, senal = %miembro, "señal de job con cuerpo inesperado");
+}
+
+/// El tipo de un job, leído de la propiedad `JobType` del objeto del job.
+///
+/// Es una llamada **de más** por cada job y no hay forma de evitarla: ni `JobNew` ni
+/// `JobRemoved` llevan el tipo en el cuerpo, y el único sitio donde systemd lo
+/// publica es la propiedad `JobType` del objeto del job. El precio —un viaje de
+/// bus por job, y los jobs de un usuario se cuentan con los dedos— es despreciable
+/// frente a publicar un tipo inventado.
+///
+/// Devuelve `None` cuando el objeto ya no está —un job que nació y murió entre el
+/// aviso y la pregunta— o cuando el gestor no contesta **a tiempo**: quien la llama
+/// publica entonces [`KIND_DESCONOCIDO`], que es lo honesto. El plazo es explícito
+/// ([`ESPERA_DEL_TIPO`]) porque de esta consulta depende el ritmo de la escucha
+/// entera: sin plazo, un gestor que no contesta pararía detrás de ella todos los
+/// avisos que vinieran después.
+async fn tipo_de_job(conexion: &Connection, ruta: &OwnedObjectPath) -> Option<String> {
+    let consulta = async {
+        let job = Proxy::new(conexion, DESTINO, ruta.as_str(), IFACE_JOB)
+            .await
+            .ok()?;
+
+        job.get_property::<String>(PROPIEDAD_JOB_TYPE).await.ok()
+    };
+
+    tokio::time::timeout(ESPERA_DEL_TIPO, consulta)
+        .await
+        // Vencido el plazo no hay tipo, y tampoco un fallo que contar: la escucha
+        // sigue con el siguiente aviso.
+        .ok()
+        .flatten()
+}
+
+/// La unidad de una señal de job, como nombre de unidad de podpot.
+///
+/// El gestor informa siempre un nombre de unidad de verdad, así que el camino
+/// normal es [`UnitName::parse`]. Si alguna vez no lo fuera, el evento **no se
+/// pierde**: se conserva el nombre tal cual y se deja un aviso en el registro —un
+/// job que termina es un dato del panel aunque su nombre no pase el filtro—.
+fn unidad_de_senal(nombre: &str) -> UnitName {
+    match UnitName::parse(nombre) {
+        Ok(unit) => unit,
+        Err(_) => {
+            tracing::warn!(
+                unidad = %nombre,
+                "una señal de job nombró una unidad que podpot no reconoce"
+            );
+
+            UnitName::sin_validar(nombre)
+        }
+    }
 }
 
 /// La regla de D-Bus que selecciona los cambios de propiedades de las unidades.
@@ -793,11 +1205,339 @@ mod tests {
 
     use super::{
         CAPACIDAD_DE_SENALES, Clase, DEBOUNCE, ERROR_FILE_NOT_FOUND, ERROR_NO_SUCH_UNIT,
-        ERROR_UNKNOWN_PROPERTY, ESPACIO_DE_UNIDADES, IFACE_PROPIEDADES, REINTENTO_INICIAL,
-        REINTENTO_MAXIMO, SENAL_PROPIEDADES, clase, clase_del_nombre, coalescer, recarga, reenviar,
-        regla_de_propiedades, siguiente_retraso, vigilar_sin_descanso,
+        ERROR_UNKNOWN_PROPERTY, ERROR_YA_SUSCRITO, ESPACIO_DE_UNIDADES, IFACE_PROPIEDADES,
+        KIND_DESCONOCIDO, REINTENTO_INICIAL, REINTENTO_MAXIMO, SENAL_PROPIEDADES, clase,
+        clase_del_nombre, coalescer, es_ya_suscrito, publicar_jobs, recarga, reenviar,
+        regla_de_propiedades, senal_de_job, siguiente_retraso, vigilar_sin_descanso,
     };
-    use crate::systemd::SystemdError;
+    use crate::systemd::{FaseDeJob, ProgresoDeJob, ResultadoDeJob, SystemdError};
+    use crate::test_support::capturar_log;
+
+    /// Una señal de **alta** de job del gestor, con la firma que systemd emite de
+    /// verdad: `JobNew` es `(uos)` —identificador, ruta del job y unidad— y **no**
+    /// trae el tipo de job.
+    ///
+    /// Se construye un `Message` de D-Bus **de verdad**, sin bus: es lo que mide que
+    /// la firma que podpot espera es la que systemd emite. El test contra el bus real
+    /// (`tests/systemd_real.rs`) es el que fija el número de argumentos; aquí se
+    /// repite para que un cambio de firma se rompa también sin bus.
+    fn senal_de_alta(job: u32, unidad: &str) -> zbus::Message {
+        zbus::Message::signal(
+            "/org/freedesktop/systemd1",
+            "org.freedesktop.systemd1.Manager",
+            "JobNew",
+        )
+        .expect("la cabecera de la señal es válida")
+        .build(&(job, ruta_del_job(job), unidad))
+        .expect("el cuerpo de la señal se serializa")
+    }
+
+    /// Una señal de **baja** de job del gestor, con la firma real: `JobRemoved` es
+    /// `(uoss)` —identificador, ruta del job, unidad y resultado—.
+    fn senal_de_baja(job: u32, unidad: &str, resultado: &str) -> zbus::Message {
+        zbus::Message::signal(
+            "/org/freedesktop/systemd1",
+            "org.freedesktop.systemd1.Manager",
+            "JobRemoved",
+        )
+        .expect("la cabecera de la señal es válida")
+        .build(&(job, ruta_del_job(job), unidad, resultado))
+        .expect("el cuerpo de la señal se serializa")
+    }
+
+    /// La ruta del objeto de un job, que es de donde se lee su tipo.
+    fn ruta_del_job(job: u32) -> zbus::zvariant::OwnedObjectPath {
+        zbus::zvariant::OwnedObjectPath::try_from(format!("/org/freedesktop/systemd1/job/{job}"))
+            .expect("la ruta del job es una ruta de objeto válida")
+    }
+
+    /// Un error de método de D-Bus con el nombre pedido, construido a mano.
+    ///
+    /// Es lo que hace medible la traducción de errores sin bus: podpot sólo mira el
+    /// **nombre** del error, así que el mensaje que lo acompaña —la respuesta del
+    /// gestor— se sustituye por una señal cualquiera.
+    fn error_de_metodo(nombre: &str) -> zbus::Error {
+        let respuesta = zbus::Message::signal(
+            "/org/freedesktop/systemd1",
+            "org.freedesktop.systemd1.Manager",
+            "JobNew",
+        )
+        .expect("la cabecera del mensaje es válida")
+        .build(&())
+        .expect("el cuerpo vacío se serializa");
+
+        zbus::Error::MethodError(
+            zbus::names::OwnedErrorName::try_from(nombre.to_owned())
+                .expect("el nombre del error es válido"),
+            None,
+            respuesta,
+        )
+    }
+
+    /// Publica unas señales con un lector de tipo **fijo**: el tipo que se le pida,
+    /// o `None` para medir el caso de que no se pueda saber.
+    async fn publicar_con_tipo(
+        senales: Vec<zbus::Message>,
+        tipo: Option<&str>,
+        trabajos: &broadcast::Sender<ProgresoDeJob>,
+    ) {
+        let tipo = tipo.map(str::to_owned);
+
+        publicar_jobs(
+            stream::iter(senales),
+            move |_ruta| {
+                let tipo = tipo.clone();
+
+                async move { tipo }
+            },
+            trabajos,
+        )
+        .await;
+    }
+
+    /// Espera el siguiente evento del canal de trabajos, con el plazo de la casa.
+    async fn siguiente_evento(
+        suscriptor: &mut broadcast::Receiver<ProgresoDeJob>,
+    ) -> ProgresoDeJob {
+        tokio::time::timeout(Duration::from_secs(5), suscriptor.recv())
+            .await
+            .expect("el evento tiene que llegar antes del plazo")
+            .expect("el canal sigue vivo mientras el emisor exista")
+    }
+
+    /// Escenarios «Alta de job reenviada», «Baja de job reenviada con su resultado»
+    /// y «Job de origen ajeno al panel»: las señales `JobNew`/`JobRemoved` del
+    /// gestor se publican como eventos, con independencia de quién pidiera el job
+    /// —la unidad de la prueba no la conoce nadie del panel—.
+    #[tokio::test]
+    async fn las_senales_de_job_del_gestor_se_publican_como_progreso() {
+        let (trabajos, _) = broadcast::channel(8);
+        let mut suscriptor = trabajos.subscribe();
+
+        publicar_con_tipo(
+            vec![
+                senal_de_alta(7, "centinela-db.service"),
+                senal_de_baja(7, "centinela-db.service", "done"),
+            ],
+            Some("start"),
+            &trabajos,
+        )
+        .await;
+
+        let alta = siguiente_evento(&mut suscriptor).await;
+        assert_eq!(alta.job, 7);
+        assert_eq!(alta.unit.as_str(), "centinela-db.service");
+        assert_eq!(
+            alta.kind, "start",
+            "el tipo de job sale del objeto del job, que es donde vive"
+        );
+        assert_eq!(alta.phase, FaseDeJob::New);
+        assert_eq!(
+            alta.result, None,
+            "un job que acaba de nacer no tiene resultado"
+        );
+
+        let baja = siguiente_evento(&mut suscriptor).await;
+        assert_eq!(baja.job, 7);
+        assert_eq!(baja.unit.as_str(), "centinela-db.service");
+        assert_eq!(
+            baja.kind, "start",
+            "la señal de baja no trae el tipo de job: se recuerda del alta"
+        );
+        assert_eq!(baja.phase, FaseDeJob::Done);
+        assert_eq!(
+            baja.result,
+            Some(ResultadoDeJob::from_dbus("done")),
+            "el resultado que informa systemd tiene que llegar entero"
+        );
+    }
+
+    /// Al lector del tipo le llega **la ruta del job de la señal**, que es lo que
+    /// hace falta para preguntar por su `JobType`: con otra ruta, o con ninguna, el
+    /// tipo saldría del job equivocado —o de ninguno—.
+    #[tokio::test]
+    async fn el_tipo_se_lee_de_la_ruta_del_job_de_la_senal() {
+        let (trabajos, _) = broadcast::channel(8);
+        let mut suscriptor = trabajos.subscribe();
+
+        // Un lector que devuelve el último segmento de la ruta: si llegara vacía o
+        // fuera otra, el aserto de abajo lo diría.
+        publicar_jobs(
+            stream::iter([senal_de_alta(42, "centinela-db.service")]),
+            |ruta| async move { ruta.as_str().rsplit('/').next().map(str::to_owned) },
+            &trabajos,
+        )
+        .await;
+
+        let alta = siguiente_evento(&mut suscriptor).await;
+
+        assert_eq!(
+            alta.kind, "42",
+            "el lector tiene que recibir la ruta del job de la señal"
+        );
+    }
+
+    /// Escenario «Tipo de job desconocido»: si el tipo no se puede leer —el objeto
+    /// del job ya no estaba, o el gestor no contestó—, el alta **se publica
+    /// igualmente** con `unknown`. Es lo honesto: el job existe y su unidad se sabe,
+    /// aunque su tipo no.
+    #[tokio::test]
+    async fn sin_tipo_conocido_el_evento_sale_igual_con_unknown() {
+        let (trabajos, _) = broadcast::channel(8);
+        let mut suscriptor = trabajos.subscribe();
+
+        publicar_con_tipo(
+            vec![senal_de_alta(7, "centinela-db.service")],
+            None,
+            &trabajos,
+        )
+        .await;
+
+        let alta = siguiente_evento(&mut suscriptor).await;
+
+        assert_eq!(alta.phase, FaseDeJob::New);
+        assert_eq!(alta.job, 7);
+        assert_eq!(alta.unit.as_str(), "centinela-db.service");
+        assert_eq!(
+            alta.kind, KIND_DESCONOCIDO,
+            "sin tipo legible, el evento sale con `unknown` y no se pierde"
+        );
+    }
+
+    /// Una señal que **no** es de un job no publica nada: el canal de trabajos sólo
+    /// lleva transiciones de job, no cualquier cosa que diga el bus.
+    #[tokio::test]
+    async fn una_senal_que_no_es_de_un_job_no_publica_nada() {
+        let (trabajos, _) = broadcast::channel(8);
+        let mut suscriptor = trabajos.subscribe();
+
+        let ajena = zbus::Message::signal(
+            "/org/freedesktop/systemd1",
+            "org.freedesktop.systemd1.Manager",
+            "UnitFilesChanged",
+        )
+        .expect("la cabecera es válida")
+        .build(&())
+        .expect("el cuerpo vacío se serializa");
+
+        publicar_con_tipo(vec![ajena], Some("start"), &trabajos).await;
+
+        assert!(
+            suscriptor.try_recv().is_err(),
+            "una señal ajena no puede colarse en el canal de trabajos"
+        );
+    }
+
+    /// Y un job que **no** se vio nacer —el caso de una reconexión del vigilante—
+    /// termina igual: no se pierde el fin del job porque falte su alta.
+    #[tokio::test]
+    async fn un_job_que_no_se_vio_nacer_termina_sin_tipo() {
+        let (trabajos, _) = broadcast::channel(8);
+        let mut suscriptor = trabajos.subscribe();
+
+        publicar_con_tipo(
+            vec![senal_de_baja(9, "otra.service", "failed")],
+            Some("start"),
+            &trabajos,
+        )
+        .await;
+
+        let baja = siguiente_evento(&mut suscriptor).await;
+        assert_eq!(baja.phase, FaseDeJob::Done);
+        assert_eq!(baja.unit.as_str(), "otra.service");
+        assert_eq!(baja.kind, KIND_DESCONOCIDO);
+        assert_eq!(baja.result, Some(ResultadoDeJob::from_dbus("failed")));
+    }
+
+    /// Una señal de job cuyo cuerpo **no** encaja con la firma que podpot espera no
+    /// publica nada —pero tampoco se traga en silencio: el descarte **deja rastro**
+    /// en el registro.
+    ///
+    /// Es el caso de una versión de systemd que añadiera un argumento al alta: el
+    /// panel se quedaría sin eventos, y lo único que diría por qué es el aviso. Se
+    /// mide con el arnés de captura del registro, así que la prueba falla tanto si
+    /// se publica un evento inventado como si el descarte se hace en silencio.
+    #[test]
+    fn una_senal_de_job_con_cuerpo_inesperado_se_descarta_con_aviso() {
+        let (buffer, _guardia) = capturar_log();
+
+        // Un `JobNew` con el cuarto argumento que la documentación de systemd
+        // promete y que este systemd no manda: el cuerpo deja de encajar.
+        let inesperada = zbus::Message::signal(
+            "/org/freedesktop/systemd1",
+            "org.freedesktop.systemd1.Manager",
+            "JobNew",
+        )
+        .expect("la cabecera de la señal es válida")
+        .build(&(7, ruta_del_job(7), "centinela-db.service", "start"))
+        .expect("el cuerpo de la señal se serializa");
+
+        assert!(
+            senal_de_job(&inesperada).is_none(),
+            "un cuerpo que no encaja no puede inventarse un evento"
+        );
+        assert!(
+            buffer.texto().contains("cuerpo inesperado"),
+            "el descarte tiene que dejar rastro en el registro: {:?}",
+            buffer.texto()
+        );
+    }
+
+    /// Y ese descarte, aguas abajo, tampoco publica: una señal con cuerpo inesperado
+    /// no se convierte en evento en el canal.
+    #[tokio::test]
+    async fn una_senal_de_job_con_cuerpo_inesperado_no_publica_nada() {
+        let (trabajos, _) = broadcast::channel(8);
+        let mut suscriptor = trabajos.subscribe();
+
+        let inesperada = zbus::Message::signal(
+            "/org/freedesktop/systemd1",
+            "org.freedesktop.systemd1.Manager",
+            "JobNew",
+        )
+        .expect("la cabecera de la señal es válida")
+        .build(&(7, ruta_del_job(7), "centinela-db.service", "start"))
+        .expect("el cuerpo de la señal se serializa");
+
+        publicar_con_tipo(vec![inesperada], Some("start"), &trabajos).await;
+
+        assert!(
+            suscriptor.try_recv().is_err(),
+            "un cuerpo que no encaja no puede inventarse un evento"
+        );
+    }
+
+    /// La decisión de [`super::suscribir`] sobre el error del gestor, medida sin bus:
+    /// `AlreadySubscribed` se toma por bueno —la conexión ya recibe señales, que es
+    /// lo que se iba a pedir— y cualquier otro error no.
+    ///
+    /// El viaje de ida y vuelta —que systemd conteste eso de verdad cuando la otra
+    /// tarea de la misma conexión pidió antes la suscripción— sólo lo ejerce el test
+    /// de bus real (`tests/systemd_real.rs`); lo que se fija aquí es la traducción.
+    #[test]
+    fn solo_el_error_de_ya_suscrito_se_toma_por_bueno() {
+        assert!(
+            es_ya_suscrito(&error_de_metodo(ERROR_YA_SUSCRITO)),
+            "`AlreadySubscribed` significa que la conexión ya recibe señales"
+        );
+        assert!(
+            !es_ya_suscrito(&error_de_metodo(ERROR_NO_SUCH_UNIT)),
+            "cualquier otro error del gestor no es una suscripción ya hecha"
+        );
+        assert!(
+            !es_ya_suscrito(&zbus::Error::Unsupported),
+            "lo que no es un error de método no lo dijo el gestor"
+        );
+    }
+
+    /// El puerto del progreso de trabajos se ejerce a través del cliente real: la
+    /// suscripción existe antes de que llegue ninguna señal del bus.
+    #[test]
+    fn el_cliente_real_expone_la_suscripcion_al_progreso() {
+        fn acepta<T: super::ProgresoDeTrabajos>() {}
+
+        acepta::<super::DbusSystemdClient>();
+    }
 
     /// Unidad que no está: los tres códigos que systemd usa para decirlo caen en
     /// la misma clase, que es lo que permite dar un solo `404`.

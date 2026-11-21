@@ -15,7 +15,7 @@ use podpot::registros::podman::PodmanRegistros;
 use podpot::state::{AppState, CAPACIDAD_DE_EVENTOS};
 use podpot::systemd::dbus::DbusSystemdClient;
 use podpot::systemd::fake::FakeSystemd;
-use podpot::systemd::{SystemdClient, SystemdError, UnitWatcher};
+use podpot::systemd::{ProgresoDeTrabajos, SystemdClient, SystemdError, UnitWatcher};
 use podpot::{db, fanout, server};
 
 #[tokio::main]
@@ -58,9 +58,9 @@ async fn main() -> ExitCode {
     // 5. El cliente de systemd. La elección se toma aquí y en ningún otro sitio:
     //    el estado se queda con el objeto que se le dé, así que ninguna ruta tiene
     //    que saber si por debajo hay bus o doble. El mismo objeto se entrega como
-    //    **dos** trazos: el listado que contesta preguntas y el vigilante que avisa
-    //    de los cambios.
-    let (systemd, vigilante) = match cliente_de_systemd(config.systemd_backend).await {
+    //    **tres** trazos: el listado que contesta preguntas, el vigilante que avisa
+    //    de los cambios de unidad y el progreso de los jobs que systemd ejecuta.
+    let (systemd, vigilante, trabajos) = match cliente_de_systemd(config.systemd_backend).await {
         Ok(par) => par,
         Err(error) => {
             eprintln!("podpot no puede arrancar: {error}");
@@ -82,7 +82,15 @@ async fn main() -> ExitCode {
     let (disparador, apagado) = watch::channel(false);
 
     // 8. Escucha y apagado: el estado se compone con las piezas ya resueltas.
-    let estado = AppState::new(config, pool.clone(), systemd, registros, eventos, apagado);
+    let estado = AppState::new(
+        config,
+        pool.clone(),
+        systemd,
+        trabajos,
+        registros,
+        eventos,
+        apagado,
+    );
     let direccion = estado.bind_address();
 
     let listener = match tokio::net::TcpListener::bind(direccion).await {
@@ -134,34 +142,44 @@ async fn main() -> ExitCode {
     }
 }
 
-/// El cliente de systemd que pide la configuración, con sus **dos** trazos.
+/// El cliente de systemd que pide la configuración, con sus **tres** trazos.
 ///
 /// El doble de desarrollo no conecta con nada —sus unidades son de muestra— y el
 /// modo de verdad es el bus de **usuario**: si no hay bus, el proceso no arranca,
 /// porque un panel que enseñara el doble creyendo que enseña la máquina sería
 /// peor que un panel que no arranca.
 ///
-/// Devuelve el mismo objeto dos veces con dos formas distintas —el listado que
-/// contesta preguntas y el vigilante que avisa de los cambios— porque tienen que
-/// ser el **mismo** objeto: con dos distintos, un aviso no tendría nada que ver con
-/// lo que se lista.
+/// Devuelve el mismo objeto tres veces con tres formas distintas —el listado que
+/// contesta preguntas, el vigilante que avisa de los cambios de unidad y el
+/// progreso de los jobs— porque tienen que ser el **mismo** objeto: con dos
+/// distintos, un aviso no tendría nada que ver con lo que se lista, y un job no
+/// tendría nada que ver con las unidades que el panel enseña.
 async fn cliente_de_systemd(
     backend: SystemdBackend,
-) -> Result<(Arc<dyn SystemdClient>, Arc<dyn UnitWatcher>), SystemdError> {
+) -> Result<
+    (
+        Arc<dyn SystemdClient>,
+        Arc<dyn UnitWatcher>,
+        Arc<dyn ProgresoDeTrabajos>,
+    ),
+    SystemdError,
+> {
     match backend {
         SystemdBackend::Fake => {
             let doble = Arc::new(FakeSystemd::demo());
             let cliente: Arc<dyn SystemdClient> = doble.clone();
-            let vigilante: Arc<dyn UnitWatcher> = doble;
+            let vigilante: Arc<dyn UnitWatcher> = doble.clone();
+            let trabajos: Arc<dyn ProgresoDeTrabajos> = doble;
 
-            Ok((cliente, vigilante))
+            Ok((cliente, vigilante, trabajos))
         }
         SystemdBackend::Dbus => {
             let real = Arc::new(DbusSystemdClient::connect_user().await?);
             let cliente: Arc<dyn SystemdClient> = real.clone();
-            let vigilante: Arc<dyn UnitWatcher> = real;
+            let vigilante: Arc<dyn UnitWatcher> = real.clone();
+            let trabajos: Arc<dyn ProgresoDeTrabajos> = real;
 
-            Ok((cliente, vigilante))
+            Ok((cliente, vigilante, trabajos))
         }
     }
 }
