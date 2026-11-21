@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { Alert, App, Button, Card, Space, Spin, Typography } from 'antd'
 import { TablaDeUnidades } from '../components/TablaDeUnidades/TablaDeUnidades'
+import { VisorDeRegistros } from '../components/VisorDeRegistros/VisorDeRegistros'
 import { FormularioDeCreacion } from '../components/FormularioDeCreacion/FormularioDeCreacion'
 import type { ValoresDeFormulario } from '../components/FormularioDeCreacion/FormularioDeCreacion'
 import {
@@ -93,6 +94,9 @@ export default function Unidades() {
   const verificacion = useVerificarQuadlet()
   const borrado = useBorrarQuadlet()
   const [enEdicion, setEnEdicion] = useState<QuadletUnit | null>(null)
+  // Unidad cuyos logs se están viendo en el visor, si hay alguno abierto. El
+  // nombre de unidad es lo que alimenta el canal SSE (no el de fichero).
+  const [enRegistros, setEnRegistros] = useState<QuadletUnit | null>(null)
   // Unidad con un borrado en vuelo (verificación o `DELETE`): la operación va por
   // nombre de fichero, pero la fila a deshabilitar se identifica por unidad.
   const [enBorrado, setEnBorrado] = useState<QuadletUnit | null>(null)
@@ -142,6 +146,11 @@ export default function Unidades() {
   /** Entra en edición: el fichero a leer es la identidad publicada por la API. */
   const alEditar = (unidad: QuadletUnit) => {
     setEnEdicion(unidad)
+  }
+
+  /** Abre el visor de logs de una unidad (nombre de unidad, no de fichero). */
+  const alVerRegistros = (unidad: QuadletUnit) => {
+    setEnRegistros(unidad)
   }
 
   const alGuardarEdicion = async (peticion: PeticionDeCreacion): Promise<boolean> => {
@@ -262,7 +271,13 @@ export default function Unidades() {
         enCurso={enCurso}
         onAccion={(unidad, tipo) => void alAccionar(unidad, tipo)}
         onEditar={alEditar}
+        onVerRegistros={alVerRegistros}
         onBorrar={(unidad) => void alBorrar(unidad)}
+      />
+
+      <VisorDeRegistros
+        unidad={enRegistros?.name ?? null}
+        onCerrar={() => setEnRegistros(null)}
       />
     </section>
   )

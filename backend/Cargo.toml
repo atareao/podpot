@@ -54,6 +54,30 @@ zbus = { version = "5.14.0", default-features = false, features = ["tokio"] }
 # nombre.
 futures-util = "0.3.34"
 
+# ── Registros de contenedor (change `registros-de-quadlets`) ─────────────────
+#
+# Los logs del contenedor de una quadlet se leen de la **API de Podman por su
+# socket unix**, no con shell-out (`podman logs`) ni con el journal: es la vía
+# alineada con la política del proyecto —sin depender de binarios— y la que da
+# control total del stream. El cliente se escribe a mano sobre `hyper` en vez de
+# arrastrar `bollard` (árbol de dependencias tres veces mayor: 146 paquetes
+# frente a 51, medido offline).
+#
+# `hyper` sólo con las features que se usan: `client` e `http1`. La `http2` y el
+# servidor no hacen falta —el servidor lo pone axum—.
+hyper = { version = "1.12.0", features = ["client", "http1"] }
+# `hyperlocal` es el conector por socket unix de hyper: aporta `UnixConnector` y
+# el `Uri` que traduce `(socket, ruta)` a un URI que hyper entiende.
+# `default-features = false` deja fuera la mitad de servidor, que no se usa.
+hyperlocal = { version = "0.9.1", default-features = false, features = ["client"] }
+# El `Client` de hyper-util: `client-legacy` trae el cliente HTTP/1.1 con pool de
+# conexiones, `http1` el protocolo y `tokio` el ejecutor con el que se construye.
+hyper-util = { version = "0.1.21", features = ["client-legacy", "http1", "tokio"] }
+# `BodyExt::frame()` es lo que permite leer el cuerpo del stream de logs **según
+# llega** —no de golpe—, que es la mitad que hace posible el `follow`. Estaba en
+# `dev-dependencies` para las pruebas; ahora también lo usa el código.
+http-body-util = "0.1.5"
+
 # ── Autenticación OIDC (change `autenticacion-oidc`) ─────────────────────────
 #
 # El flujo OIDC se escribe a mano —patrón de kesto— y no con `openidconnect` ni
@@ -86,8 +110,6 @@ urlencoding = "2.1.3"
 [dev-dependencies]
 # `ServiceExt::oneshot` es lo que permite llamar al router sin abrir un puerto.
 tower = { version = "0.5.3", features = ["util"] }
-# Leer el cuerpo de una respuesta en una prueba.
-http-body-util = "0.1"
 # Base de datos temporal por prueba: el arranque no crea directorios, así que las
 # pruebas le dan uno que ya existe y que se limpia al soltarlo.
 tempfile = "3"

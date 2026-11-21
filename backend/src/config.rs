@@ -56,6 +56,27 @@ pub const QUADLET_DIR_VAR: &str = "PODPOT_QUADLET_DIR";
 /// sistema, y sólo se lee para resolver el defecto de [`QUADLET_DIR_VAR`].
 pub const HOME_VAR: &str = "HOME";
 
+/// El socket de la API de Podman del usuario, del que se leen los logs.
+///
+/// Es la vía alineada con la política del proyecto —hablar, no invocar binarios—
+/// y la única que puede **seguir** el stream de un contenedor: `podman logs`
+/// sería un shell-out y el journal no tiene los logs del contenedor.
+pub const PODMAN_SOCKET_VAR: &str = "PODPOT_PODMAN_SOCKET";
+
+/// El directorio de ejecución del usuario, del que cuelga el socket por defecto.
+///
+/// **No** es una variable de podpot: es la del sistema (`pam_systemd` la pone en
+/// cada sesión), y sólo se lee para resolver el defecto de
+/// [`PODMAN_SOCKET_VAR`].
+pub const XDG_RUNTIME_DIR_VAR: &str = "XDG_RUNTIME_DIR";
+
+/// La ruta del socket rootless de Podman **dentro** del directorio de ejecución.
+///
+/// El socket de la API de Podman de un usuario vive siempre aquí: en
+/// `/run/user/<uid>/podman/podman.sock`. Se compone con el directorio de
+/// ejecución, que es lo único que cambia de una máquina a otra.
+const SOCKET_DE_PODMAN_RELATIVO: &str = "podman/podman.sock";
+
 /// La variable con el emisor (`issuer`) del proveedor OIDC.
 ///
 /// Junto a [`OIDC_CLIENT_ID_VAR`] y [`OIDC_CLIENT_SECRET_VAR`] decide el modo de
@@ -284,6 +305,13 @@ pub struct Config {
     /// A diferencia del panel, **sí** se valida contra el disco al leerlo: es el
     /// destino de la creación, y un destino que no existe no se puede crear.
     pub quadlet_dir: PathBuf,
+    /// El socket de la API de Podman del usuario.
+    ///
+    /// Es de donde se leen los logs del contenedor de una quadlet. **No** se
+    /// comprueba contra el disco al leerlo: un socket ausente es un Podman
+    /// parado, no una configuración imposible, y el fallo se explica al pedir
+    /// los registros —con un `503`— en vez de impedir el arranque.
+    pub podman_socket: PathBuf,
     /// El modo de autenticación efectivo.
     ///
     /// Es `Disabled` salvo que estén las tres variables del proveedor: es lo que
@@ -324,6 +352,7 @@ impl Config {
             systemd_backend: backend(&leer)?,
             static_dir: static_dir(&leer),
             quadlet_dir: quadlet_dir(&leer)?,
+            podman_socket: podman_socket(&leer)?,
             auth,
             secret,
         })
@@ -364,7 +393,8 @@ impl Config {
     /// ni siquiera se nombran. Del proveedor se publica el modo, nunca las claves.
     pub fn describe(&self) -> String {
         format!(
-            "bind_address={} systemd={} log_filter={} panel={} quadlets={} auth_mode={}",
+            "bind_address={} systemd={} log_filter={} panel={} quadlets={} podman_socket={} \
+             auth_mode={}",
             self.bind_address,
             self.systemd_backend,
             self.log_filter,
@@ -373,6 +403,7 @@ impl Config {
                 None => "ausente".to_owned(),
             },
             self.quadlet_dir.display(),
+            self.podman_socket.display(),
             self.auth.as_str()
         )
     }
@@ -548,6 +579,64 @@ fn quadlet_dir(leer: &impl Fn(&str) -> Option<String>) -> Result<PathBuf, Config
     Ok(PathBuf::from(home).join(".config/containers/systemd"))
 }
 
+/// El socket de la API de Podman, en tres pasos.
+///
+/// 1. **La variable manda**: `PODPOT_PODMAN_SOCKET` es lo que un despliegue con
+///    Podman en otro sitio necesita, y se respeta tal cual —sin comprobar el
+///    disco: un socket ausente es un Podman parado, y eso se explica al pedir los
+///    registros, no impidiendo el arranque—.
+/// 2. **`$XDG_RUNTIME_DIR`**: el defecto del usuario es
+///    `$XDG_RUNTIME_DIR/podman/podman.sock`, que es donde rootless Podman lo
+///    pone.
+/// 3. **`/run/user/<uid>`**: sin `XDG_RUNTIME_DIR` —un servicio que no pasó por
+///    `pam_systemd`, por ejemplo— se deriva el mismo directorio que el sistema
+///    habría puesto, tomando el `uid` del dueño del `$HOME`. Se evita `libc`
+///    porque el crate prohíbe el código inseguro (`#![forbid(unsafe_code)]`).
+///
+/// Sin ninguno de los tres no hay defecto que componer y se falla nombrando
+/// `XDG_RUNTIME_DIR`: inventarse un socket llevaría a un `503` que no dice qué
+/// arreglar.
+fn podman_socket(leer: &impl Fn(&str) -> Option<String>) -> Result<PathBuf, ConfigError> {
+    if let Some(ruta) = opcional(leer, PODMAN_SOCKET_VAR) {
+        return Ok(PathBuf::from(ruta));
+    }
+
+    if let Some(runtime) = opcional(leer, XDG_RUNTIME_DIR_VAR) {
+        return Ok(PathBuf::from(runtime).join(SOCKET_DE_PODMAN_RELATIVO));
+    }
+
+    if let Some(home) = opcional(leer, HOME_VAR)
+        && let Some(uid) = uid_del_dueno(&home)
+    {
+        return Ok(PathBuf::from(format!("/run/user/{uid}")).join(SOCKET_DE_PODMAN_RELATIVO));
+    }
+
+    Err(ConfigError::Missing {
+        var: XDG_RUNTIME_DIR_VAR,
+    })
+}
+
+/// El `uid` del dueño de una ruta, si se puede leer.
+///
+/// Es la derivación de `/run/user/<uid>` sin `libc`: el `$HOME` de un usuario es
+/// suyo, así que su dueño **es** el `uid` de la sesión. Cualquier fallo —la ruta
+/// no existe, no se puede leer— devuelve `None` y quien llama decide.
+#[cfg(unix)]
+fn uid_del_dueno(ruta: &str) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+
+    std::fs::metadata(ruta)
+        .ok()
+        .map(|metadatos| metadatos.uid())
+}
+
+/// Fuera de Unix no hay `uid` que derivar: podpot es una aplicación de Podman y
+/// systemd, y sin el concepto de usuario no hay defecto que componer.
+#[cfg(not(unix))]
+fn uid_del_dueno(_ruta: &str) -> Option<u32> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -563,11 +652,21 @@ mod tests {
     /// quadlets se resuelva sin que cada prueba tenga que acordarse: como la
     /// búsqueda se queda con la **primera** coincidencia, una prueba que declare
     /// su propio `HOME` sigue mandando.
+    ///
+    /// `XDG_RUNTIME_DIR` entra por la misma razón: es lo que resuelve el defecto
+    /// del socket de Podman sin tocar el disco. Una prueba que quiera medir la
+    /// derivación desde `$HOME` lo deja fuera con su propia fuente.
     fn fuente(pares: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
         let pares: Vec<(String, String)> = pares
             .iter()
             .map(|(clave, valor)| ((*clave).to_owned(), (*valor).to_owned()))
-            .chain([(super::HOME_VAR.to_owned(), "/home/tester".to_owned())])
+            .chain([
+                (super::HOME_VAR.to_owned(), "/home/tester".to_owned()),
+                (
+                    super::XDG_RUNTIME_DIR_VAR.to_owned(),
+                    "/run/user/1000".to_owned(),
+                ),
+            ])
             .collect();
 
         move |clave: &str| {
@@ -904,6 +1003,90 @@ mod tests {
         .expect("un directorio existente es configuración válida");
 
         assert_eq!(config.quadlet_dir, dir.path());
+    }
+
+    /// Escenario «Valor por defecto»: sin `PODPOT_PODMAN_SOCKET`, el socket es el
+    /// del usuario —`$XDG_RUNTIME_DIR/podman/podman.sock`—.
+    #[test]
+    fn sin_podpot_podman_socket_el_defecto_cuelga_del_directorio_de_ejecucion() {
+        let config = Config::from_source(minimo()).expect("la configuración mínima debe leerse");
+
+        assert_eq!(
+            config.podman_socket,
+            std::path::Path::new("/run/user/1000/podman/podman.sock"),
+            "el defecto del socket tiene que ser el del usuario"
+        );
+        assert!(
+            config.describe().contains("podman_socket="),
+            "el volcado de arranque tiene que decir de qué socket se leen los logs: {}",
+            config.describe()
+        );
+    }
+
+    /// Escenario «Valor explícito»: `PODPOT_PODMAN_SOCKET` manda tal cual, sin
+    /// comprobarlo contra el disco —un socket ausente es un Podman parado, y eso
+    /// se explica al pedir los registros, no impidiendo el arranque—.
+    #[test]
+    fn un_podpot_podman_socket_definido_se_respeta() {
+        let config = Config::from_source(fuente(&[
+            ("DATABASE_URL", "sqlite:///tmp/podpot.db"),
+            ("PODPOT_PODMAN_SOCKET", "/otro/sitio/podman.sock"),
+        ]))
+        .expect("un socket declarado es configuración válida");
+
+        assert_eq!(
+            config.podman_socket,
+            std::path::Path::new("/otro/sitio/podman.sock")
+        );
+    }
+
+    /// Sin `XDG_RUNTIME_DIR` se deriva el mismo directorio que el sistema habría
+    /// puesto, a partir del dueño del `$HOME`: es el caso de un servicio que no
+    /// pasó por `pam_systemd`.
+    #[test]
+    fn sin_xdg_runtime_dir_el_socket_se_deriva_del_home() {
+        let home = tempfile::tempdir().expect("se tiene que poder crear un directorio temporal");
+
+        let config = Config::from_source(|clave| match clave {
+            "DATABASE_URL" => Some("sqlite:///tmp/podpot.db".to_owned()),
+            "HOME" => Some(home.path().to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .expect("sin XDG_RUNTIME_DIR se deriva del dueño del HOME");
+
+        let ruta = config.podman_socket.to_string_lossy().into_owned();
+
+        assert!(
+            ruta.starts_with("/run/user/"),
+            "el socket derivado tiene que colgar de /run/user: {ruta}"
+        );
+        assert!(
+            ruta.ends_with("/podman/podman.sock"),
+            "el socket derivado tiene que ser el de Podman: {ruta}"
+        );
+    }
+
+    /// Y sin ninguna de las dos —ni `XDG_RUNTIME_DIR` ni un `$HOME` que exista—
+    /// el arranque falla nombrando la variable, en vez de inventarse un socket
+    /// que llevaría a un `503` que no dice qué arreglar.
+    #[test]
+    fn sin_xdg_runtime_dir_ni_home_no_hay_socket_por_defecto() {
+        let error = Config::from_source(|clave| match clave {
+            "DATABASE_URL" => Some("sqlite:///tmp/podpot.db".to_owned()),
+            // Un `HOME` declarado —si no, el directorio de quadlets fallaría
+            // antes— pero que no existe: no hay dueño del que derivar el `uid`.
+            "HOME" => Some("/no/existe/este/home".to_owned()),
+            _ => None,
+        })
+        .expect_err("sin directorio de ejecución no hay socket que componer");
+
+        assert_eq!(
+            error,
+            ConfigError::Missing {
+                var: "XDG_RUNTIME_DIR"
+            },
+            "el error tiene que nombrar la variable que falta: {error}"
+        );
     }
 
     /// Secreto de firma de la sesión de las pruebas, con longitud de sobra.

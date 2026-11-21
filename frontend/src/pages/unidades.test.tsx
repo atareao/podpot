@@ -3,6 +3,7 @@ import userEvent from '@testing-library/user-event'
 import { App as AppDeAntd } from 'antd'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { unidad } from '../../tests/fixtures'
+import { EventSourceFalso } from '../../tests/eventSourceFalso'
 import { ErrorDeApi } from '../api/envelope'
 import { accionDeUnidad, listarUnidades } from '../api/units'
 import { borrarQuadlet, crearQuadlet, editarQuadlet, obtenerQuadlet } from '../api/quadlets'
@@ -49,6 +50,7 @@ function diferido<T>() {
 
 beforeEach(() => {
   vi.resetAllMocks()
+  EventSourceFalso.reset()
 })
 
 describe('pantalla de quadlets', () => {
@@ -657,5 +659,22 @@ describe('borrado de quadlets desde el panel', () => {
 
     expect(await screen.findByText('no existe la quadlet «web.container»')).toBeInTheDocument()
     expect(vi.mocked(listarUnidades)).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('visor de logs desde el panel', () => {
+  it('abre el visor de la unidad al pulsar «Logs» y se suscribe a su canal', async () => {
+    const usuario = userEvent.setup()
+    vi.mocked(listarUnidades).mockResolvedValue([unidad({ name: 'web.service' })])
+
+    montar()
+
+    await usuario.click(await screen.findByRole('button', { name: 'Logs web.service' }))
+
+    expect(await screen.findByText('Registros de web.service')).toBeInTheDocument()
+    // El canal de logs usa el nombre de unidad; la última suscripción es la suya
+    // (la primera es la del listado en vivo, abierta al montar la pantalla).
+    const fuente = EventSourceFalso.instancias.at(-1)!
+    expect(fuente.url).toBe('/api/v1/units/web.service/logs/stream')
   })
 })

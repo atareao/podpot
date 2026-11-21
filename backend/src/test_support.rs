@@ -17,6 +17,7 @@ use tower::ServiceExt;
 
 use crate::config::Config;
 use crate::db;
+use crate::registros::fake::FakeRegistros;
 use crate::secret::SecretString;
 use crate::state::{AppState, CAPACIDAD_DE_EVENTOS};
 use crate::systemd::fake::FakeSystemd;
@@ -111,6 +112,15 @@ pub async fn entorno_con(systemd: Arc<dyn SystemdClient>) -> Entorno {
     montar(systemd, None).await
 }
 
+/// Un entorno con la fuente de registros que se le inyecte.
+///
+/// Es la puerta del canal de logs: el doble se construye **antes** de montar
+/// —con su cola inicial o fingiendo una unidad sin contenedor— y la prueba lo
+/// sigue manejando después para emitir líneas con la conexión ya abierta.
+pub async fn entorno_con_registros(registros: Arc<FakeRegistros>) -> Entorno {
+    montar_con_vars(Arc::new(FakeSystemd::demo()), None, &[], registros).await
+}
+
 /// Un entorno con el doble de systemd, devolviendo además su trazo de vigilante.
 ///
 /// Es la puerta del canal en vivo: el fan-out necesita las **dos** caras del mismo
@@ -148,13 +158,33 @@ pub async fn entorno_oidc_con_emisor(emisor: &str) -> Entorno {
             ("PODPOT_OIDC_CLIENT_SECRET", OIDC_CLIENT_SECRET),
             ("PODPOT_SECRET", SECRETO),
         ],
+        Arc::new(FakeRegistros::new()),
+    )
+    .await
+}
+
+/// Un entorno en modo `oidc` con la fuente de registros que se le inyecte.
+///
+/// Es la puerta del canal de logs bajo el *gate*: con sesión, el flujo se abre y
+/// las líneas del doble tienen que llegar por él.
+pub async fn entorno_oidc_con_registros(registros: Arc<FakeRegistros>) -> Entorno {
+    montar_con_vars(
+        Arc::new(FakeSystemd::demo()),
+        None,
+        &[
+            ("PODPOT_OIDC_ISSUER_URL", EMISOR_CAIDO),
+            ("PODPOT_OIDC_CLIENT_ID", OIDC_CLIENT_ID),
+            ("PODPOT_OIDC_CLIENT_SECRET", OIDC_CLIENT_SECRET),
+            ("PODPOT_SECRET", SECRETO),
+        ],
+        registros,
     )
     .await
 }
 
 /// Compone el entorno: base temporal, configuración, canales y estado.
 async fn montar(systemd: Arc<dyn SystemdClient>, panel: Option<&std::path::Path>) -> Entorno {
-    montar_con_vars(systemd, panel, &[]).await
+    montar_con_vars(systemd, panel, &[], Arc::new(FakeRegistros::new())).await
 }
 
 /// Compone el entorno con las variables de entorno extra que pida la prueba.
@@ -162,6 +192,7 @@ async fn montar_con_vars(
     systemd: Arc<dyn SystemdClient>,
     panel: Option<&std::path::Path>,
     extra: &[(&str, &str)],
+    registros: Arc<FakeRegistros>,
 ) -> Entorno {
     let dir = tempfile::tempdir().expect("se tiene que poder crear un directorio temporal");
     let dsn = format!("sqlite://{}/podpot.db", dir.path().display());
@@ -188,6 +219,7 @@ async fn montar_con_vars(
             config_de_prueba_con_vars(&dsn, panel, quadlets.path(), extra),
             pool,
             systemd,
+            registros.clone(),
             eventos,
             apagado,
         ),
@@ -221,6 +253,11 @@ pub fn config_de_prueba_con_vars(
         "PODPOT_SYSTEMD" => Some("fake".to_owned()),
         "PODPOT_STATIC_DIR" => panel.clone(),
         "PODPOT_QUADLET_DIR" => Some(quadlets.clone()),
+        // El socket se declara y no se deja al defecto: una prueba no puede
+        // depender de que la máquina que compila tenga `XDG_RUNTIME_DIR`. Nada se
+        // conecta a él —la fuente de registros es el doble—, así que la ruta sólo
+        // tiene que ser válida.
+        "PODPOT_PODMAN_SOCKET" => Some("/run/podpot-de-prueba/podman.sock".to_owned()),
         otra => extra
             .iter()
             .find(|(nombre, _)| *nombre == otra)

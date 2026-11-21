@@ -1,12 +1,13 @@
 //! El estado compartido que se inyecta en los manejadores.
 //!
-//! Cinco piezas y todas se clonan en cada petición —es lo que hace axum con el
+//! Seis piezas y todas se clonan en cada petición —es lo que hace axum con el
 //! estado—, así que ninguna copia nada gordo: la configuración va detrás de un
 //! `Arc` porque no cambia desde el arranque, el pool de SQLite ya es un `Arc` por
 //! dentro —y clonarlo es lo que hace que todas las peticiones hablen por **las
-//! mismas** conexiones—, el cliente de systemd va detrás de un `Arc<dyn …>` porque
-//! es el objeto el que guarda la conexión de D-Bus, y los dos canales son clones
-//! de manejadores de tokio, que por dentro son un `Arc`.
+//! mismas** conexiones—, el cliente de systemd y la fuente de registros van
+//! detrás de un `Arc<dyn …>` porque son objetos que guardan su propia conexión, y
+//! los dos canales son clones de manejadores de tokio, que por dentro son un
+//! `Arc`.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -16,6 +17,7 @@ use tokio::sync::{broadcast, watch};
 
 use crate::auth::AuthState;
 use crate::config::Config;
+use crate::registros::FuenteDeRegistros;
 use crate::systemd::{SystemdClient, UnitStatus};
 
 /// Cuántas instantáneas caben en el canal de eventos antes de perder la más vieja.
@@ -42,6 +44,13 @@ pub struct AppState {
     pub pool: SqlitePool,
     /// El cliente de systemd: el real, o el doble si la configuración lo pidió.
     pub systemd: Arc<dyn SystemdClient>,
+    /// La fuente de los registros del contenedor de una quadlet.
+    ///
+    /// Va detrás de un `Arc<dyn …>` por la misma razón que el cliente de systemd:
+    /// las pruebas no pueden depender de que haya un Podman con su socket en pie,
+    /// así que la capa API sólo conoce el puerto —[`FuenteDeRegistros`]— y la
+    /// implementación real o el doble entran por aquí.
+    pub registros: Arc<dyn FuenteDeRegistros>,
     /// Las instantáneas que publica el fan-out, para el canal en vivo.
     ///
     /// Lleva **instantáneas del dominio** y no JSON: así el dominio no conoce HTTP
@@ -72,9 +81,11 @@ impl AppState {
     /// Compone el estado con las piezas ya construidas.
     ///
     /// No construye ninguna: quien arranca decide de dónde sale cada una —el
-    /// `DbusSystemdClient` contra el bus de usuario, o el doble de desarrollo— y
-    /// el estado se queda con la que le den. Así no hay dos sitios que sepan leer
-    /// el entorno, ni una decisión que sólo se pueda tomar con el proceso entero.
+    /// `DbusSystemdClient` contra el bus de usuario, o el doble de desarrollo; la
+    /// fuente de registros contra el socket de Podman, o el doble de las pruebas—
+    /// y el estado se queda con la que le den. Así no hay dos sitios que sepan
+    /// leer el entorno, ni una decisión que sólo se pueda tomar con el proceso
+    /// entero.
     ///
     /// Los canales entran hechos por la misma razón: sus extremos «de escritura»
     /// —el emisor de eventos y el disparador del cierre— tienen que quedarse fuera
@@ -88,6 +99,7 @@ impl AppState {
         config: Config,
         pool: SqlitePool,
         systemd: Arc<dyn SystemdClient>,
+        registros: Arc<dyn FuenteDeRegistros>,
         eventos: broadcast::Sender<Vec<UnitStatus>>,
         apagado: watch::Receiver<bool>,
     ) -> Self {
@@ -97,6 +109,7 @@ impl AppState {
             config: Arc::new(config),
             pool,
             systemd,
+            registros,
             eventos,
             apagado,
             auth,
