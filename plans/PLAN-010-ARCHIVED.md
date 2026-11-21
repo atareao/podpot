@@ -28,22 +28,22 @@ Eliminar la variante duplicada `QuadletError::Registro` y unificar todo fallo de
 
 Este cambio es un **refactor sin cambio de comportamiento**: la red de seguridad son los tests existentes del mapeo de errores.
 
-- [ ] 3.1 **Verde de partida (caracterización):** confirmar que `backend/src/error.rs` (`mod tests`) y `backend/src/api/quadlets.rs:804` fijan `internal`/`500` para el fallo de persistencia. — Verificación: `cargo test` EXIT 0 antes de tocar código.
-- [ ] 3.2 **Dominio:** eliminar la variante `QuadletError::Registro` (`quadlet/mod.rs:244`) y documentar en `Persistencia` que cubre creación + edición/borrado. — Verificación: `cargo check` sin usos huérfanos.
-- [ ] 3.3 **Call sites:** en `quadlet/service.rs:209` emitir `QuadletError::Persistencia`; unificar los dos `map_err`. — Verificación: compila; el test de edición/borrado sigue verde.
-- [ ] 3.4 **Traducción:** eliminar el brazo `QuadletError::Registro` de `traducir_quadlet` (`error.rs:423`) y su test. — Verificación: `cargo test` EXIT 0; el test restante de `Persistencia` sigue assertando `internal`/`500`.
-- [ ] 3.5 **Cobertura:** asegurar que existe un test que verifica `Persistencia → internal/500` en el camino de edición/borrado (reutilizar/renombrar `quadlets.rs:804`). — Verificación: test verde y ligado a `Persistencia`.
-- [ ] 3.6 **Refactor/limpieza:** `rg "QuadletError::Registro"` vacío; `cargo clippy -- -D warnings` y `cargo fmt --check` limpios.
-- [ ] 3.7 **Docs:** actualizar `docs/edicion-borrado-quadlets.md` y `docs/FEATURE-002-creacion-quadlets.md` para reflejar una única variante.
-- [ ] 3.8 **Cierre:** `just check-all` EXIT 0; reviewers (`rust-reviewer`) sin bloqueantes; `openspec validate --all` verde.
+- [x] 3.1 **Verde de partida (caracterización):** confirmar que `backend/src/error.rs` (`mod tests`) y `backend/src/api/quadlets.rs:804` fijan `internal`/`500` para el fallo de persistencia. — Verificación: `cargo test` EXIT 0 antes de tocar código.
+- [x] 3.2 **Dominio:** eliminar la variante `QuadletError::Registro` (`quadlet/mod.rs:244`) y documentar en `Persistencia` que cubre creación + edición/borrado. — Verificación: `cargo check` sin usos huérfanos.
+- [x] 3.3 **Call sites:** en `quadlet/service.rs:209` emitir `QuadletError::Persistencia`; unificar los dos `map_err`. — Verificación: compila; el test de edición/borrado sigue verde.
+- [x] 3.4 **Traducción:** eliminar el brazo `QuadletError::Registro` de `traducir_quadlet` (`error.rs:423`) y su test. — Verificación: `cargo test` EXIT 0; el test restante de `Persistencia` sigue assertando `internal`/`500`.
+- [x] 3.5 **Cobertura:** asegurar que existe un test que verifica `Persistencia → internal/500` en el camino de edición/borrado (reutilizar/renombrar `quadlets.rs:804`). — Verificación: test verde y ligado a `Persistencia`.
+- [x] 3.6 **Refactor/limpieza:** `rg "QuadletError::Registro"` vacío; `cargo clippy -- -D warnings` y `cargo fmt --check` limpios.
+- [x] 3.7 **Docs:** actualizar `docs/edicion-borrado-quadlets.md` y `docs/FEATURE-002-creacion-quadlets.md` para reflejar una única variante.
+- [x] 3.8 **Cierre:** `just check-all` EXIT 0; reviewers (`rust-reviewer`) sin bloqueantes; `openspec validate --all` verde.
 
 ## 4. Criterios de aceptación
 
-- [ ] No queda ninguna referencia a `QuadletError::Registro`.
-- [ ] El contrato HTTP es idéntico: `Persistencia → internal (500)`.
-- [ ] `just check-all` EXIT 0.
-- [ ] `openspec validate --all` verde.
-- [ ] `docs/<feature>.md` redactado al cerrar.
+- [x] No queda ninguna referencia a `QuadletError::Registro`.
+- [x] El contrato HTTP es idéntico: `Persistencia → internal (500)`.
+- [x] `just check-all` EXIT 0.
+- [x] `openspec validate --all` verde.
+- [x] `docs/<feature>.md` redactado al cerrar.
 
 ## 5. Riesgos
 
