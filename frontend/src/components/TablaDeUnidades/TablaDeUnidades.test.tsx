@@ -189,4 +189,72 @@ describe('TablaDeUnidades', () => {
     await usuario.click(botones[1]!)
     expect(await screen.findByText(/«web\.volume»/)).toBeInTheDocument()
   })
+
+  it('muestra el indicador «en curso» con el tipo de acción en español', () => {
+    render(
+      <TablaDeUnidades
+        unidades={[unidad({ name: 'web.service' })]}
+        cargando={false}
+        progresoPorUnidad={{ 'web.service': ['restart'] }}
+        onAccion={vi.fn()}
+        onEditar={vi.fn()}
+        onVerRegistros={vi.fn()}
+        onBorrar={vi.fn()}
+      />,
+    )
+
+    expect(screen.getByText('reiniciada')).toBeInTheDocument()
+    expect(
+      screen.getByRole('status', { name: 'Acción en curso en web.service: reiniciada' }),
+    ).toBeInTheDocument()
+  })
+
+  it('muestra un indicador por cada job en curso de la unidad', () => {
+    render(
+      <TablaDeUnidades
+        unidades={[unidad({ name: 'web.service' })]}
+        cargando={false}
+        progresoPorUnidad={{ 'web.service': ['start', 'restart'] }}
+        onAccion={vi.fn()}
+        onEditar={vi.fn()}
+        onVerRegistros={vi.fn()}
+        onBorrar={vi.fn()}
+      />,
+    )
+
+    expect(screen.getByText('arrancada')).toBeInTheDocument()
+    expect(screen.getByText('reiniciada')).toBeInTheDocument()
+  })
+
+  it('cae al tipo de acción crudo cuando no conoce su etiqueta', () => {
+    render(
+      <TablaDeUnidades
+        unidades={[unidad({ name: 'web.service' })]}
+        cargando={false}
+        progresoPorUnidad={{ 'web.service': ['reload'] }}
+        onAccion={vi.fn()}
+        onEditar={vi.fn()}
+        onVerRegistros={vi.fn()}
+        onBorrar={vi.fn()}
+      />,
+    )
+
+    expect(screen.getByText('reload')).toBeInTheDocument()
+  })
+
+  it('no muestra indicador en las unidades sin job en curso', () => {
+    render(
+      <TablaDeUnidades
+        unidades={[unidad({ name: 'web.service' })]}
+        cargando={false}
+        progresoPorUnidad={{ 'otra.service': ['start'] }}
+        onAccion={vi.fn()}
+        onEditar={vi.fn()}
+        onVerRegistros={vi.fn()}
+        onBorrar={vi.fn()}
+      />,
+    )
+
+    expect(screen.queryByLabelText(/Acción en curso/)).not.toBeInTheDocument()
+  })
 })

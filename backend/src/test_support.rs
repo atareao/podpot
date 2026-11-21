@@ -41,6 +41,14 @@ pub const EMISOR_CAIDO: &str = "http://127.0.0.1:1";
 /// Lo que una prueba necesita para ejercer la aplicación.
 pub struct Entorno {
     state: AppState,
+    /// El doble del progreso de los trabajos.
+    ///
+    /// Es un doble **aparte** del cliente de systemd —y no el mismo objeto— porque
+    /// el entorno admite cualquier `Arc<dyn SystemdClient>` y de ahí no se puede
+    /// recuperar el puerto. No hace falta que sean el mismo: el progreso sólo empuja
+    /// eventos y nadie los consulta, así que un doble propio para los jobs basta
+    /// para medir el canal y su endpoint.
+    trabajos: Arc<FakeSystemd>,
     /// El disparador del cierre.
     ///
     /// Vive aquí —y no dentro del estado— porque el estado sólo necesita poder
@@ -75,6 +83,15 @@ impl Entorno {
     /// El directorio en el que la creación escribe las quadlets.
     pub fn quadlet_dir(&self) -> &std::path::Path {
         &self.state.config.quadlet_dir
+    }
+
+    /// El doble del progreso de los trabajos, para que la prueba emita eventos.
+    ///
+    /// Es la puerta del canal de trabajos: sin bus no hay señales de
+    /// `JobNew`/`JobRemoved` que reenviar, así que los eventos de un job los emite
+    /// la prueba con [`FakeSystemd::emitir`] y el endpoint los lee del otro lado.
+    pub fn trabajos(&self) -> &Arc<FakeSystemd> {
+        &self.trabajos
     }
 
     /// Dispara el cierre, como haría la señal de terminación del proceso.
@@ -214,15 +231,21 @@ async fn montar_con_vars(
     let (eventos, _) = broadcast::channel(CAPACIDAD_DE_EVENTOS);
     let (cierre, apagado) = watch::channel(false);
 
+    // El doble del progreso de los trabajos: propio del entorno, para que una prueba
+    // pueda emitir eventos de job sin tocar un bus.
+    let trabajos = Arc::new(FakeSystemd::new());
+
     Entorno {
         state: AppState::new(
             config_de_prueba_con_vars(&dsn, panel, quadlets.path(), extra),
             pool,
             systemd,
+            trabajos.clone(),
             registros.clone(),
             eventos,
             apagado,
         ),
+        trabajos,
         cierre,
         _dir: dir,
         _quadlets: quadlets,

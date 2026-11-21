@@ -19,11 +19,15 @@
 //!   en vez de esperar al plazo;
 //! * que **arrancar o parar** una quadlet emita `PropertiesChanged` sobre su unidad
 //!   y el vigilante lo convierta en una notificación —el camino que el panel usa
-//!   para refrescarse solo—.
+//!   para refrescarse solo—;
+//! * que las señales de ciclo de vida de un job (`JobNew`/`JobRemoved`) lleguen al
+//!   canal de trabajos: es la mitad que el doble no puede medir —qué emite systemd
+//!   y con qué cuerpo—.
 
 use podpot::systemd::dbus::DbusSystemdClient;
 use podpot::systemd::{
-    ActiveState, SystemdClient, UnitAction, UnitFileState, UnitName, UnitStatus, UnitWatcher,
+    ActiveState, FaseDeJob, ProgresoDeJob, ProgresoDeTrabajos, SystemdClient, UnitAction,
+    UnitFileState, UnitName, UnitStatus, UnitWatcher,
 };
 
 /// El plazo con el que se esperan las notificaciones del vigilante.
@@ -325,6 +329,103 @@ async fn esperar_aviso(avisos: &mut tokio::sync::broadcast::Receiver<()>) {
         .await
         .expect("el cambio tiene que llegar como notificación antes del plazo")
         .expect("el canal sigue vivo mientras el cliente exista");
+}
+
+/// El ciclo de vida de un job de la unidad de prueba llega por el canal de
+/// trabajos: primero el alta (`new`) y después la baja (`done`), con su tipo y su
+/// resultado.
+///
+/// Es lo que **ninguna** prueba con el doble puede tocar: la firma del cuerpo que
+/// systemd emite en `JobNew`/`JobRemoved` —`(u o s s)`— y que la traducción del
+/// cliente real tiene que entender. La quadlet de prueba es la misma de la prueba
+/// de notificaciones —un `.volume` que no arranca nada—, así que la máquina no
+/// cambia.
+#[tokio::test]
+#[ignore = "necesita el bus de systemd del usuario"]
+async fn el_ciclo_de_vida_de_un_job_llega_por_el_canal_de_trabajos() {
+    let cliente = cliente().await;
+    let prueba =
+        QuadletDePrueba::nueva().expect("se tiene que poder escribir la quadlet de prueba");
+
+    // Las dos suscripciones van **antes** de provocar nada: ni el canal de avisos
+    // ni el de trabajos guardan historia para quien llega tarde.
+    let mut avisos = cliente.subscribe();
+    let mut trabajos = cliente.observar();
+
+    // La unidad no existe para el gestor hasta que recarga su configuración, y la
+    // recarga sirve además de comprobación de que la conexión está suscrita: hasta
+    // que llega su aviso, la tarea que escucha los jobs puede no haber registrado
+    // todavía su regla de señales, y un job que se pidiera antes se perdería.
+    cliente
+        .reload()
+        .await
+        .expect("el gestor tiene que poder recargar su configuración");
+    esperar_aviso(&mut avisos).await;
+
+    cliente
+        .action(&prueba.unidad, UnitAction::Start)
+        .await
+        .expect("una quadlet de volumen tiene que poder arrancarse");
+
+    let alta = esperar_transicion(&mut trabajos, &prueba.unidad, FaseDeJob::New).await;
+    assert_eq!(
+        alta.kind, "start",
+        "el tipo del job tiene que ser el de la acción pedida"
+    );
+    assert_eq!(
+        alta.result, None,
+        "un job que acaba de nacer no tiene resultado"
+    );
+
+    let baja = esperar_transicion(&mut trabajos, &prueba.unidad, FaseDeJob::Done).await;
+    assert_eq!(
+        baja.job, alta.job,
+        "el fin tiene que ser del mismo job que se vio nacer"
+    );
+    assert_eq!(
+        baja.kind, "start",
+        "el tipo del job se recuerda del alta: la señal de baja no lo trae"
+    );
+
+    // Se para y se borra la quadlet para no dejar la unidad cargada en el gestor del
+    // usuario, salga como salga la prueba.
+    cliente
+        .action(&prueba.unidad, UnitAction::Stop)
+        .await
+        .expect("la quadlet de volumen tiene que poder pararse");
+    prueba
+        .borrar()
+        .expect("se tiene que poder borrar la quadlet");
+    cliente
+        .reload()
+        .await
+        .expect("el gestor tiene que poder recargar su configuración");
+}
+
+/// Espera la transición de la fase pedida para la unidad pedida, saltando los jobs
+/// de otras unidades.
+///
+/// El canal publica **todos** los jobs del gestor —también los que arranca systemd
+/// por su cuenta—, así que no se puede dar por bueno el primer evento que llegue.
+async fn esperar_transicion(
+    trabajos: &mut tokio::sync::broadcast::Receiver<ProgresoDeJob>,
+    unidad: &UnitName,
+    fase: FaseDeJob,
+) -> ProgresoDeJob {
+    let plazo = tokio::time::Instant::now() + ESPERA_DE_AVISO;
+
+    loop {
+        let restante = plazo.saturating_duration_since(tokio::time::Instant::now());
+
+        let evento = tokio::time::timeout(restante, trabajos.recv())
+            .await
+            .expect("la transición del job tiene que llegar antes del plazo")
+            .expect("el canal sigue vivo mientras el cliente exista");
+
+        if &evento.unit == unidad && evento.phase == fase {
+            return evento;
+        }
+    }
 }
 
 /// Una quadlet de prueba —un `.volume` vacío— en el directorio de unidades del

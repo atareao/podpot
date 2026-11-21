@@ -145,6 +145,35 @@ export interface ResultadoDeAccion {
   active_state: ActiveState
 }
 
+// ─── Progreso de trabajos (jobs) ─────────────────────────────────────────────
+
+/** Fase del ciclo de vida de un job: se crea (`new`) o termina (`done`). */
+export type FaseDeJob = 'new' | 'done'
+
+/**
+ * Progreso de un job de systemd sobre una unidad.
+ *
+ * Es el `data` del evento `job` del canal `GET /api/v1/jobs/stream`: cada evento
+ * llega envuelto como `{data: {...}}`, así que esto es lo que devuelve
+ * `desenvolver`. En la fase `new` el `result` va a `null`; en la fase `done`
+ * lleva el desenlace (`done`, `failed`, …).
+ *
+ * `unit` es el **nombre de unidad** (`web.service`) —lo que alimenta el canal—,
+ * no el de fichero: es la clave con la que el panel asocia el progreso a la fila.
+ */
+export interface ProgresoDeJob {
+  /** Identificador del job en systemd. */
+  job: number
+  /** Nombre de unidad sobre la que corre el job. */
+  unit: string
+  /** Tipo de job de systemd (`start`, `stop`, `restart`, …). */
+  kind: string
+  /** Fase: `new` al crearse, `done` al terminar. */
+  phase: FaseDeJob
+  /** Desenlace en la fase `done`; `null` en `new`. */
+  result: string | null
+}
+
 // ─── Autenticación ───────────────────────────────────────────────────────────
 
 /**

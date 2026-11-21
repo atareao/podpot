@@ -13,19 +13,15 @@ import {
   useUnits,
   useVerificarQuadlet,
 } from '../hooks/useUnits'
+import { useTrabajosEnVivo } from '../hooks/useTrabajosEnVivo'
 import { mensajeDeError } from '../api/errores'
+import { VERBOS } from '../acciones'
 import type {
   AccionDeUnidad,
   PeticionDeCreacion,
   QuadletDetalle,
   QuadletUnit,
 } from '../types/api'
-
-const VERBOS: Record<AccionDeUnidad, string> = {
-  start: 'arrancada',
-  stop: 'parada',
-  restart: 'reiniciada',
-}
 
 /** Valores de arranque del formulario: los que expone, tal cual se leyeron. */
 function valoresDeEdicion(definicion: QuadletDetalle): Partial<ValoresDeFormulario> {
@@ -88,6 +84,10 @@ function completarConDefinicion(
 export default function Unidades() {
   const { message } = App.useApp()
   const unidades = useUnits()
+  // Canal de trabajos: alimenta el indicador «en curso» por unidad. Es aditivo;
+  // la acción sigue por su cauce (API + notificación) y el estado, por el canal
+  // de unidades. Se declara tras `useUnits` para no alterar el orden del resto.
+  const trabajosEnCurso = useTrabajosEnVivo()
   const accion = useAccionDeUnidad()
   const creacion = useCrearQuadlet()
   const edicion = useEditarQuadlet()
@@ -269,6 +269,7 @@ export default function Unidades() {
         unidades={unidades.data ?? []}
         cargando={unidades.isPending}
         enCurso={enCurso}
+        progresoPorUnidad={trabajosEnCurso}
         onAccion={(unidad, tipo) => void alAccionar(unidad, tipo)}
         onEditar={alEditar}
         onVerRegistros={alVerRegistros}

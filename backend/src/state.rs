@@ -1,13 +1,13 @@
 //! El estado compartido que se inyecta en los manejadores.
 //!
-//! Seis piezas y todas se clonan en cada petición —es lo que hace axum con el
+//! Siete piezas y todas se clonan en cada petición —es lo que hace axum con el
 //! estado—, así que ninguna copia nada gordo: la configuración va detrás de un
 //! `Arc` porque no cambia desde el arranque, el pool de SQLite ya es un `Arc` por
 //! dentro —y clonarlo es lo que hace que todas las peticiones hablen por **las
-//! mismas** conexiones—, el cliente de systemd y la fuente de registros van
-//! detrás de un `Arc<dyn …>` porque son objetos que guardan su propia conexión, y
-//! los dos canales son clones de manejadores de tokio, que por dentro son un
-//! `Arc`.
+//! mismas** conexiones—, el cliente de systemd, el progreso de los trabajos y la
+//! fuente de registros van detrás de un `Arc<dyn …>` porque son objetos que guardan
+//! su propia conexión —o su propio canal—, y los dos canales son clones de
+//! manejadores de tokio, que por dentro son un `Arc`.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -18,7 +18,7 @@ use tokio::sync::{broadcast, watch};
 use crate::auth::AuthState;
 use crate::config::Config;
 use crate::registros::FuenteDeRegistros;
-use crate::systemd::{SystemdClient, UnitStatus};
+use crate::systemd::{ProgresoDeTrabajos, SystemdClient, UnitStatus};
 
 /// Cuántas instantáneas caben en el canal de eventos antes de perder la más vieja.
 ///
@@ -44,6 +44,14 @@ pub struct AppState {
     pub pool: SqlitePool,
     /// El cliente de systemd: el real, o el doble si la configuración lo pidió.
     pub systemd: Arc<dyn SystemdClient>,
+    /// El progreso de los trabajos de systemd, para el canal de trabajos.
+    ///
+    /// Va detrás de un `Arc<dyn …>` por la misma razón que el cliente: las pruebas
+    /// no pueden depender de que la máquina que compila tenga un bus en pie, así que
+    /// la capa API sólo conoce el puerto —[`ProgresoDeTrabajos`]— y la
+    /// implementación real o el doble entran por aquí. Es un **trazo del mismo
+    /// objeto** que `systemd`: en el cliente real los dos son el mismo `DbusSystemdClient`.
+    pub trabajos: Arc<dyn ProgresoDeTrabajos>,
     /// La fuente de los registros del contenedor de una quadlet.
     ///
     /// Va detrás de un `Arc<dyn …>` por la misma razón que el cliente de systemd:
@@ -99,6 +107,7 @@ impl AppState {
         config: Config,
         pool: SqlitePool,
         systemd: Arc<dyn SystemdClient>,
+        trabajos: Arc<dyn ProgresoDeTrabajos>,
         registros: Arc<dyn FuenteDeRegistros>,
         eventos: broadcast::Sender<Vec<UnitStatus>>,
         apagado: watch::Receiver<bool>,
@@ -109,6 +118,7 @@ impl AppState {
             config: Arc::new(config),
             pool,
             systemd,
+            trabajos,
             registros,
             eventos,
             apagado,
@@ -119,5 +129,38 @@ impl AppState {
     /// La dirección en la que escucha el proceso.
     pub fn bind_address(&self) -> SocketAddr {
         self.config.bind_address
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use crate::systemd::{FaseDeJob, ProgresoDeJob, UnitName};
+    use crate::test_support::entorno;
+
+    /// El estado lleva el puerto del progreso de trabajos: quien se suscribe a él
+    /// recibe lo que publique la fuente que se le inyectó —el doble, sin bus—.
+    ///
+    /// Es lo que mide que el cableado esté hecho: con el puerto fuera del estado, la
+    /// capa API no tendría de dónde suscribirse y el endpoint de trabajos no
+    /// existiría.
+    #[tokio::test]
+    async fn el_estado_lleva_el_puerto_del_progreso_de_trabajos() {
+        let entorno = entorno().await;
+        let mut suscriptor = entorno.state().trabajos.observar();
+
+        let unidad = UnitName::parse("centinela-db.service").expect("nombre válido");
+        entorno
+            .trabajos()
+            .emitir(ProgresoDeJob::nuevo(7, unidad, "start"));
+
+        let recibido = tokio::time::timeout(Duration::from_secs(1), suscriptor.recv())
+            .await
+            .expect("el evento tiene que llegar antes del plazo")
+            .expect("el canal sigue vivo mientras el estado exista");
+
+        assert_eq!(recibido.job, 7);
+        assert_eq!(recibido.phase, FaseDeJob::New);
     }
 }

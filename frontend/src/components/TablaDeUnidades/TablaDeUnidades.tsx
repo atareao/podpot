@@ -1,6 +1,8 @@
-import { Button, Empty, Popconfirm, Space, Table } from 'antd'
+import { Button, Empty, Popconfirm, Space, Spin, Table, Tag } from 'antd'
 import type { TableProps } from 'antd'
 import { EstadoDeUnidad } from '../EstadoDeUnidad/EstadoDeUnidad'
+import { etiquetaDeAccionEnCurso } from '../../acciones'
+import type { TrabajosEnCurso } from '../../hooks/useTrabajosEnVivo'
 import type { AccionDeUnidad, QuadletUnit } from '../../types/api'
 
 export interface TablaDeUnidadesProps {
@@ -21,6 +23,14 @@ export interface TablaDeUnidadesProps {
   onBorrar: (unidad: QuadletUnit) => void
   /** Nombre de la unidad con una acción en curso: sus botones se deshabilitan. */
   enCurso?: string | null
+  /**
+   * Tipos de acción de los jobs en curso por unidad (nombre de unidad → `kind`s),
+   * del canal de trabajos. Una unidad presente aquí, con al menos un `kind`,
+   * muestra el indicador «en curso». Solo pinta: la acción sigue por su sitio
+   * (API + notificación). El tipo lo define el hook (`TrabajosEnCurso`), fuente
+   * única de la forma.
+   */
+  progresoPorUnidad?: TrabajosEnCurso
 }
 
 /**
@@ -49,6 +59,7 @@ export function TablaDeUnidades({
   onVerRegistros,
   onBorrar,
   enCurso = null,
+  progresoPorUnidad = {},
 }: TablaDeUnidadesProps) {
   const columnas: TableProps<QuadletUnit>['columns'] = [
     {
@@ -60,6 +71,35 @@ export function TablaDeUnidades({
       title: 'Estado',
       key: 'estado',
       render: (_valor, unidad) => <EstadoDeUnidad estado={unidad.active_state} />,
+    },
+    {
+      title: 'Progreso',
+      key: 'progreso',
+      render: (_valor, unidad) => {
+        const kinds = progresoPorUnidad[unidad.name]
+        if (kinds === undefined || kinds.length === 0) return null
+        const etiquetas = kinds.map(etiquetaDeAccionEnCurso)
+        // Indicador aditivo: mientras haya jobs para la unidad se ve un spinner
+        // con sus tipos de acción, en español. Es un `<div role="status">` (no un
+        // `<span>`): contiene el `Space`, que rinde un elemento de flujo. El
+        // `aria-label` da el nombre accesible completo, así que el `Spin` se marca
+        // decorativo con `aria-hidden` para no anunciar dos veces la región.
+        return (
+          <div
+            role="status"
+            aria-label={`Acción en curso en ${unidad.name}: ${etiquetas.join(', ')}`}
+          >
+            <Space size="small" wrap>
+              <Spin size="small" aria-hidden="true" />
+              {kinds.map((kind, indice) => (
+                <Tag color="processing" key={`${kind}-${indice}`}>
+                  {etiquetaDeAccionEnCurso(kind)}
+                </Tag>
+              ))}
+            </Space>
+          </div>
+        )
+      },
     },
     {
       title: 'Sub-estado',
