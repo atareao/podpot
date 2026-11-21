@@ -1,4 +1,4 @@
-import { ErrorDeApi } from './client'
+import { ErrorDeApi } from './envelope'
 import { accionDeUnidad, listarUnidades } from './units'
 
 function respuesta(cuerpo: unknown, status = 200): Response {

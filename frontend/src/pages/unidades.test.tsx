@@ -3,7 +3,7 @@ import userEvent from '@testing-library/user-event'
 import { App as AppDeAntd } from 'antd'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { unidad } from '../../tests/fixtures'
-import { ErrorDeApi } from '../api/client'
+import { ErrorDeApi } from '../api/envelope'
 import { accionDeUnidad, listarUnidades } from '../api/units'
 import Unidades from './unidades'
 
@@ -30,7 +30,7 @@ function montar() {
 }
 
 beforeEach(() => {
-  vi.clearAllMocks()
+  vi.resetAllMocks()
 })
 
 describe('pantalla de quadlets', () => {
@@ -87,7 +87,7 @@ describe('pantalla de quadlets', () => {
 
     expect(await screen.findByText('Parada')).toBeInTheDocument()
 
-    await usuario.click(screen.getByRole('button', { name: 'Arrancar' }))
+    await usuario.click(screen.getByRole('button', { name: 'Arrancar web.container' }))
 
     expect(await screen.findByText(/«web.container» arrancada/i)).toBeInTheDocument()
     expect(vi.mocked(accionDeUnidad)).toHaveBeenCalledWith('web.container', 'start')
@@ -109,7 +109,7 @@ describe('pantalla de quadlets', () => {
 
     expect(await screen.findByText('Parada')).toBeInTheDocument()
 
-    await usuario.click(screen.getByRole('button', { name: 'Arrancar' }))
+    await usuario.click(screen.getByRole('button', { name: 'Arrancar web.container' }))
 
     expect(await screen.findByText('la unidad está en transición')).toBeInTheDocument()
     // Sin refresco: la tabla sigue enseñando el estado real de la unidad.
