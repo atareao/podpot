@@ -1,4 +1,5 @@
-import { ErrorDeApi, ErrorDeProtocolo, ErrorDeRed } from './client'
+import { ErrorDeApi, ErrorDeProtocolo } from './envelope'
+import { ErrorDeRed } from './client'
 
 /** Mensaje presentable de un error de la API o de red, sin volcar JSON crudo. */
 export function mensajeDeError(error: unknown): string {

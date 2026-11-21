@@ -15,9 +15,22 @@ export interface TablaDeUnidadesProps {
 }
 
 /**
+ * Estados intermedios: aunque `ActiveState` no sea `active`/`inactive`, una
+ * unidad que se está activando (`activating`, `reloading`) no se puede arrancar
+ * otra vez, y una que se está desactivando (`deactivating`) no se puede parar.
+ * Es una unión abierta a propósito: un estado nuevo de systemd cae del lado
+ * permisivo en vez de romper la tabla.
+ */
+const EN_MARCHA: ReadonlySet<string> = new Set(['active', 'activating', 'reloading'])
+const PARADA: ReadonlySet<string> = new Set(['inactive', 'deactivating'])
+
+/**
  * Listado de quadlets: una fila por unidad, con su estado y las acciones de
  * control. Presentacional: no habla con la API ni con React Query —quien la usa
  * (`pages/unidades.tsx`) es el que conecta—.
+ *
+ * Cada botón lleva un `aria-label` con el nombre de la unidad: hay uno por fila
+ * y, sin él, todos los «Arrancar» comparten nombre accesible.
  */
 export function TablaDeUnidades({
   unidades,
@@ -55,19 +68,26 @@ export function TablaDeUnidades({
           <Space size="small" wrap>
             <Button
               size="small"
-              disabled={bloqueada || unidad.active_state === 'active'}
+              aria-label={`Arrancar ${unidad.name}`}
+              disabled={bloqueada || EN_MARCHA.has(unidad.active_state)}
               onClick={() => onAccion(unidad, 'start')}
             >
               Arrancar
             </Button>
             <Button
               size="small"
-              disabled={bloqueada || unidad.active_state === 'inactive'}
+              aria-label={`Parar ${unidad.name}`}
+              disabled={bloqueada || PARADA.has(unidad.active_state)}
               onClick={() => onAccion(unidad, 'stop')}
             >
               Parar
             </Button>
-            <Button size="small" disabled={bloqueada} onClick={() => onAccion(unidad, 'restart')}>
+            <Button
+              size="small"
+              aria-label={`Reiniciar ${unidad.name}`}
+              disabled={bloqueada}
+              onClick={() => onAccion(unidad, 'restart')}
+            >
               Reiniciar
             </Button>
           </Space>
@@ -76,6 +96,8 @@ export function TablaDeUnidades({
     },
   ]
 
+  // `aria-label` llega al `<table>` real: antd lo reenvía a rc-table, que lo
+  // esparce sobre el elemento (`pickAttrs(props, { aria: true })`).
   return (
     <Table<QuadletUnit>
       aria-label="Quadlets"

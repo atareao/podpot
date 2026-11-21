@@ -13,7 +13,7 @@
  * - **Cuerpo no-JSON:** `ErrorDeProtocolo`.
  */
 
-import { ErrorDeApi, ErrorDeProtocolo, desenvolver } from './envelope'
+import { ErrorDeProtocolo, desenvolver } from './envelope'
 
 /** Prefijo de todas las rutas de la API. */
 export const RUTA_BASE = '/api/v1'
@@ -40,7 +40,7 @@ function cabeceras(llevaCuerpo: boolean): HeadersInit {
 }
 
 /** Compone `/api/v1` + la ruta. */
-export function construirUrl(ruta: string): string {
+function construirUrl(ruta: string): string {
   return `${RUTA_BASE}${ruta.startsWith('/') ? '' : '/'}${ruta}`
 }
 
@@ -84,5 +84,3 @@ export async function peticion<T>(ruta: string, opciones: OpcionesDePeticion = {
 
   return desenvolver<T>({ http: respuesta.status, cuerpo })
 }
-
-export { ErrorDeApi, ErrorDeProtocolo }

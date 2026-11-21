@@ -5,8 +5,22 @@
  * `{ "data": <payload> }` y en el error `{ "error": { "code", "message" } }`.
  */
 
-/** Estado de actividad de una unidad systemd, tal como lo publica el backend. */
-export type ActiveState = 'active' | 'inactive' | 'failed'
+/**
+ * Estado de actividad (`ActiveState`) de una unidad systemd.
+ *
+ * Son los valores del enum de systemd: `active`, `reloading`, `inactive`,
+ * `failed`, `activating`, `deactivating` y `maintenance`. El panel los trata de
+ * forma tolerante: un valor desconocido no rompe la vista (ver
+ * `components/TablaDeUnidades`), así que ampliar esta unión es barato.
+ */
+export type ActiveState =
+  | 'active'
+  | 'reloading'
+  | 'inactive'
+  | 'failed'
+  | 'activating'
+  | 'deactivating'
+  | 'maintenance'
 
 /** Una quadlet descubierta, con el estado que reporta `systemd --user`. */
 export interface QuadletUnit {
