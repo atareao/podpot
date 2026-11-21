@@ -51,3 +51,22 @@ La aplicación SHALL servir el panel estático desde el directorio indicado por 
 
 - **WHEN** `PODPOT_STATIC_DIR` no está definido
 - **THEN** la aplicación SHALL servir solo `/api/v1/*` y el arranque SHALL seguir siendo correcto
+
+### Requirement: Directorio de quadlets
+
+La configuración SHALL incluir la clave `PODPOT_QUADLET_DIR`, que indica el directorio canónico donde se escriben las quadlets nuevas. Cuando no esté definida, SHALL usar por defecto `$HOME/.config/containers/systemd`. El valor SHALL validarse como un directorio.
+
+#### Scenario: Valor por defecto
+
+- **WHEN** `PODPOT_QUADLET_DIR` no está definida
+- **THEN** el directorio de quadlets SHALL ser `$HOME/.config/containers/systemd`
+
+#### Scenario: Valor no es un directorio
+
+- **WHEN** `PODPOT_QUADLET_DIR` apunta a una ruta que no es un directorio
+- **THEN** el arranque SHALL fallar nombrando `PODPOT_QUADLET_DIR`
+
+#### Scenario: Directorio válido
+
+- **WHEN** `PODPOT_QUADLET_DIR` apunta a un directorio existente
+- **THEN** la aplicación SHALL usarlo como destino de escritura de las quadlets nuevas
