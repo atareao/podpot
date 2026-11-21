@@ -3,12 +3,13 @@
 //! Vive detrás de `#[cfg(test)]`: no forma parte del contrato del crate y no
 //! compila en el binario de producción.
 
-use std::sync::Arc;
+use std::cell::RefCell;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
 use axum::Router;
 use axum::body::Body;
-use axum::http::{Method, Request, StatusCode};
+use axum::http::{HeaderName, Method, Request, StatusCode};
 use axum::response::Response;
 use http_body_util::BodyExt;
 use tokio::sync::{broadcast, watch};
@@ -16,9 +17,25 @@ use tower::ServiceExt;
 
 use crate::config::Config;
 use crate::db;
+use crate::secret::SecretString;
 use crate::state::{AppState, CAPACIDAD_DE_EVENTOS};
 use crate::systemd::fake::FakeSystemd;
 use crate::systemd::{SystemdClient, SystemdError, UnitWatcher};
+
+/// Usuario distinguible de la sesión de pruebas.
+pub const SUB: &str = "usuario-distinguible-1";
+/// Correo distinguible de la sesión de pruebas.
+pub const EMAIL: &str = "operador-distinguible@example.test";
+/// Identificador público del cliente OIDC de pruebas.
+pub const OIDC_CLIENT_ID: &str = "podpot-panel";
+/// Secreto del cliente OIDC de pruebas: solo tiene que estar presente.
+pub const OIDC_CLIENT_SECRET: &str = "secreto-de-cliente-oidc-distinguible";
+/// Secreto de firma de la sesión de las pruebas, con longitud de sobra.
+pub const SECRETO: &str = "secreto-de-firma-distinguible-000000000000000000000000000000";
+/// Un emisor donde nadie escucha: cualquier login que una prueba dispare por
+/// accidente falla al instante contra loopback, sin resolver un DNS ni salir a
+/// la red.
+pub const EMISOR_CAIDO: &str = "http://127.0.0.1:1";
 
 /// Lo que una prueba necesita para ejercer la aplicación.
 pub struct Entorno {
@@ -106,8 +123,46 @@ pub async fn entorno_con_vigilante(doble: Arc<FakeSystemd>) -> (Entorno, Arc<dyn
     (entorno_con(doble).await, vigilante)
 }
 
+/// Un entorno en modo `oidc` apuntando a un emisor donde nadie escucha.
+///
+/// Es la puerta de las pruebas que no necesitan un descubrimiento que funcione:
+/// la capa de sesión está montada, pero cualquier login que se dispare por
+/// accidente falla al instante contra loopback, sin salir a la red. Las pruebas
+/// que quieren un descubrimiento de verdad usan [`entorno_oidc_con_emisor`] con
+/// el proveedor falso.
+pub async fn entorno_oidc() -> Entorno {
+    entorno_oidc_con_emisor(EMISOR_CAIDO).await
+}
+
+/// Un entorno en modo `oidc` apuntando a un emisor dado.
+///
+/// Es lo que permite que una prueba hable con el proveedor falso local: el emisor
+/// entra por parámetro en vez de fijarse en el entorno del proceso.
+pub async fn entorno_oidc_con_emisor(emisor: &str) -> Entorno {
+    montar_con_vars(
+        Arc::new(FakeSystemd::demo()),
+        None,
+        &[
+            ("PODPOT_OIDC_ISSUER_URL", emisor),
+            ("PODPOT_OIDC_CLIENT_ID", OIDC_CLIENT_ID),
+            ("PODPOT_OIDC_CLIENT_SECRET", OIDC_CLIENT_SECRET),
+            ("PODPOT_SECRET", SECRETO),
+        ],
+    )
+    .await
+}
+
 /// Compone el entorno: base temporal, configuración, canales y estado.
 async fn montar(systemd: Arc<dyn SystemdClient>, panel: Option<&std::path::Path>) -> Entorno {
+    montar_con_vars(systemd, panel, &[]).await
+}
+
+/// Compone el entorno con las variables de entorno extra que pida la prueba.
+async fn montar_con_vars(
+    systemd: Arc<dyn SystemdClient>,
+    panel: Option<&std::path::Path>,
+    extra: &[(&str, &str)],
+) -> Entorno {
     let dir = tempfile::tempdir().expect("se tiene que poder crear un directorio temporal");
     let dsn = format!("sqlite://{}/podpot.db", dir.path().display());
 
@@ -130,7 +185,7 @@ async fn montar(systemd: Arc<dyn SystemdClient>, panel: Option<&std::path::Path>
 
     Entorno {
         state: AppState::new(
-            config_de_prueba_con(&dsn, panel, quadlets.path()),
+            config_de_prueba_con_vars(&dsn, panel, quadlets.path(), extra),
             pool,
             systemd,
             eventos,
@@ -142,14 +197,13 @@ async fn montar(systemd: Arc<dyn SystemdClient>, panel: Option<&std::path::Path>
     }
 }
 
-/// La configuración que usan las pruebas: loopback en el puerto por defecto, la
-/// base temporal de la prueba, un directorio de quadlets temporal y el doble de
-/// systemd, para no depender del bus. Con panel estático si se indica un
-/// directorio.
-pub fn config_de_prueba_con(
+/// La configuración de prueba con variables extra, para los modos que necesitan
+/// alguna —el `oidc`, por ejemplo—.
+pub fn config_de_prueba_con_vars(
     dsn: &str,
     panel: Option<&std::path::Path>,
     quadlets: &std::path::Path,
+    extra: &[(&str, &str)],
 ) -> Config {
     let panel = panel.map(|ruta| {
         ruta.to_str()
@@ -167,7 +221,10 @@ pub fn config_de_prueba_con(
         "PODPOT_SYSTEMD" => Some("fake".to_owned()),
         "PODPOT_STATIC_DIR" => panel.clone(),
         "PODPOT_QUADLET_DIR" => Some(quadlets.clone()),
-        _ => None,
+        otra => extra
+            .iter()
+            .find(|(nombre, _)| *nombre == otra)
+            .map(|(_, valor)| (*valor).to_owned()),
     })
     .expect("la configuración de prueba tiene que ser válida")
 }
@@ -425,4 +482,599 @@ pub async fn body_json(respuesta: Response) -> serde_json::Value {
         .to_bytes();
 
     serde_json::from_slice(&bytes).expect("el cuerpo de una respuesta de la API es JSON")
+}
+
+/// El valor de una cabecera de la respuesta, como texto.
+///
+/// Es lo que necesitan las pruebas del flujo de entrada: la `Location` de un
+/// `302` y la `Set-Cookie` de la sesión son cabeceras, no cuerpo.
+pub fn header_texto(respuesta: &Response, nombre: HeaderName) -> Option<String> {
+    respuesta
+        .headers()
+        .get(nombre)
+        .and_then(|valor| valor.to_str().ok())
+        .map(str::to_owned)
+}
+
+/// Una cookie de sesión válida, firmada con el secreto de las pruebas.
+///
+/// Es lo que permite entrar a la superficie de negocio sin recorrer el flujo
+/// OIDC entero: el *gate* sólo mira la firma y la vigencia, así que una cookie
+/// emitida por la misma función que la emite de verdad vale.
+pub fn cookie_de_sesion() -> String {
+    let token = crate::auth::session::issue(
+        &SecretString::new(SECRETO.to_owned()),
+        SUB.to_owned(),
+        EMAIL.to_owned(),
+    )
+    .expect("la sesión de prueba tiene que poder emitirse");
+
+    format!("{}={}", crate::auth::session::SESSION_COOKIE_NAME, token)
+}
+
+/// Lanza una petición con una cookie contra el router y devuelve el código y el
+/// cuerpo JSON.
+pub async fn peticion_con_cookie(
+    app: &Router,
+    method: Method,
+    uri: &str,
+    cookie: &str,
+) -> (StatusCode, serde_json::Value) {
+    let respuesta = peticion_cruda_con_cookie(app, method, uri, cookie).await;
+    let status = respuesta.status();
+
+    (status, body_json(respuesta).await)
+}
+
+/// Lanza una petición con una cookie y devuelve la respuesta **sin leer** el
+/// cuerpo.
+///
+/// Es lo que necesitan las pruebas del canal en vivo y de las cabeceras: un flujo
+/// `text/event-stream` no termina, así que leerlo entero colgaría la prueba.
+pub async fn peticion_cruda_con_cookie(
+    app: &Router,
+    method: Method,
+    uri: &str,
+    cookie: &str,
+) -> Response {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(axum::http::header::COOKIE, cookie)
+                .body(Body::empty())
+                .expect("la petición de prueba se construye siempre"),
+        )
+        .await
+        .expect("el router no puede fallar al atender")
+}
+
+/// Un proveedor OIDC falso local para las pruebas del flujo de entrada.
+///
+/// **Por qué un servidor de verdad y no dobles de las funciones de red.** Un
+/// doble de `reqwest` —o de la propia capa de descubrimiento— devolvería lo que
+/// la prueba le pidiera, y con eso el flujo pasaría sin tocar la red. Eso dejaría
+/// sin probar precisamente lo central: que el ID token se **verifica** —firma
+/// `RS256` contra el `jwks_uri`, `iss`, `aud`, `exp`/`iat` y `nonce`—. Un doble
+/// de la red haría que la verificación de la firma nunca se ejercitara: se
+/// probaría que el código llama a las cosas, no que las cosas funcionan.
+///
+/// Por eso el arnés es `wiremock` sirviendo un proveedor de verdad: un par RSA
+/// **real** (con `rsa`), el ID token firmado **`RS256` de verdad** con ese par, y
+/// la clave pública publicada como JWK en el `jwks_uri`. La firma que se publica
+/// y la que se verifica son la misma matemática que en producción.
+///
+/// **Ninguna prueba sale a internet**: `wiremock` levanta un servidor HTTP real
+/// atado a `127.0.0.1` con un puerto efímero, y todas las peticiones se quedan en
+/// la máquina.
+pub mod proveedor_falso {
+    use jsonwebtoken::jwk::{Jwk, JwkSet};
+    use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+    use rsa::RsaPrivateKey;
+    use rsa::pkcs1::{EncodeRsaPrivateKey, EncodeRsaPublicKey};
+    use serde::{Deserialize, Serialize};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::{EMAIL, SUB};
+
+    /// Ruta del documento de descubrimiento.
+    const RUTA_DESCUBRIMIENTO: &str = "/.well-known/openid-configuration";
+    /// Ruta del canje del código.
+    const RUTA_TOKEN: &str = "/token";
+    /// Ruta del conjunto de claves públicas.
+    const RUTA_JWKS: &str = "/jwks";
+
+    /// `kid` con el que el proveedor falso etiqueta su clave pública y sus tokens.
+    ///
+    /// Es coherente entre la cabecera del JWT y el JWK a propósito: la
+    /// verificación tiene que encontrar la clave por su `kid` y comprobar la firma
+    /// contra ella, no tropezar antes con una clave ausente.
+    pub const KID: &str = "podpot-clave-de-prueba";
+
+    /// `kid` que el `jwks_uri` **no** publica.
+    ///
+    /// Sirve para fabricar un token cuya firma cuadra con la clave publicada pero
+    /// cuya cabecera apunta a una clave que el conjunto no tiene: el rechazo sale
+    /// de la búsqueda por `kid`, que es anterior a la firma.
+    pub const KID_AJENO: &str = "podpot-clave-que-no-se-publica";
+
+    /// Claims del ID token que el proveedor falso firma.
+    ///
+    /// Los valores por defecto de [`IdToken::valido`] son distinguibles: `sub` y
+    /// `email` son los de la sesión de pruebas, y `nonce` viaja tal cual, de modo
+    /// que las pruebas localizan la identidad literalmente.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct IdToken {
+        /// Emisor del token (`iss`).
+        pub iss: String,
+        /// Audiencia (`aud`): el `client_id` con el que se pidió la sesión.
+        pub aud: String,
+        /// Usuario (`sub`).
+        pub sub: String,
+        /// Correo (`email`).
+        pub email: String,
+        /// `nonce` devuelto: se compara con el emitido en el login.
+        pub nonce: String,
+        /// Caducidad, en segundos desde la época (`exp`).
+        pub exp: u64,
+        /// Emisión, en segundos desde la época (`iat`).
+        pub iat: u64,
+    }
+
+    impl IdToken {
+        /// Un ID token válido para el emisor, el `client_id` y el `nonce` dados.
+        ///
+        /// Caduca a diez minutos vista y se emite ahora: dentro de la ventana de
+        /// vigencia y sin adelantarse al reloj. Las pruebas que quieren un token
+        /// que falle **un** campo parten de aquí y lo tuercen.
+        pub fn valido(issuer: &str, client_id: &str, nonce: &str) -> Self {
+            let ahora = jsonwebtoken::get_current_timestamp();
+
+            Self {
+                iss: issuer.to_owned(),
+                aud: client_id.to_owned(),
+                sub: SUB.to_owned(),
+                email: EMAIL.to_owned(),
+                nonce: nonce.to_owned(),
+                exp: ahora + 600,
+                iat: ahora,
+            }
+        }
+    }
+
+    /// Proveedor OIDC falso: un servidor `wiremock` que sirve el descubrimiento,
+    /// el `token_endpoint` y el `jwks_uri`, con un par RSA real.
+    pub struct ProveedorFalso {
+        /// El servidor real, vivo mientras lo esté el proveedor.
+        server: MockServer,
+        /// Emisor: la base contra la que se construyen los endpoints.
+        pub issuer: String,
+        /// Clave con la que se firman los ID tokens **válidos**.
+        clave: EncodingKey,
+        /// Clave que el `jwks_uri` **no** publica: firma los tokens que deben
+        /// rechazarse por una firma que no cuadra.
+        clave_no_publicada: EncodingKey,
+        /// Clave `HMAC` cuyo secreto es la **clave pública** del proveedor: firma
+        /// el token `HS256` de la confusión de algoritmo.
+        ///
+        /// El material es público —lo publica el propio `jwks_uri`—, así que
+        /// cualquiera puede fabricar este token. Es exactamente lo que lo hace el
+        /// ataque: lo único que lo para es que la verificación fije `RS256` en vez
+        /// de leer el algoritmo de la cabecera.
+        clave_confusa: EncodingKey,
+    }
+
+    impl ProveedorFalso {
+        /// Levanta el proveedor y monta el descubrimiento y el JWKS.
+        ///
+        /// El documento de descubrimiento **no** publica `userinfo_endpoint`, y
+        /// eso es deliberado: el flujo no puede depender de `userinfo`.
+        pub async fn servir() -> Self {
+            let server = MockServer::start().await;
+            let issuer = server.uri();
+
+            // El par de claves es real: la firma que el callback verifica es la
+            // misma matemática que en producción. La segunda clave nunca se publica.
+            let (clave, publica) = generar_clave();
+            let (clave_no_publicada, _) = generar_clave();
+
+            let documento = serde_json::json!({
+                "authorization_endpoint": format!("{issuer}/authorize"),
+                "token_endpoint": format!("{issuer}{RUTA_TOKEN}"),
+                "jwks_uri": format!("{issuer}{RUTA_JWKS}"),
+            });
+
+            Mock::given(method("GET"))
+                .and(path(RUTA_DESCUBRIMIENTO))
+                .respond_with(ResponseTemplate::new(200).set_body_json(documento))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("GET"))
+                .and(path(RUTA_JWKS))
+                .respond_with(ResponseTemplate::new(200).set_body_json(jwks(&clave)))
+                .mount(&server)
+                .await;
+
+            Self {
+                server,
+                issuer,
+                clave,
+                clave_no_publicada,
+                // El secreto `HMAC` es el DER de la clave pública: el mismo
+                // material que el `jwks_uri` publica. `EncodingKey::from_secret`
+                // no distingue familias, así que el token se firma de verdad.
+                clave_confusa: EncodingKey::from_secret(&publica),
+            }
+        }
+
+        /// Firma un ID token `RS256` con la clave que el JWKS **sí** publica.
+        pub fn firmar(&self, claims: &IdToken) -> String {
+            firmar_con(&self.clave, claims)
+        }
+
+        /// Firma un ID token `RS256` a partir de claims **crudos**.
+        ///
+        /// Es lo que permite fabricar tokens que **omiten** un claim obligatorio:
+        /// [`IdToken`] declara `exp` e `iat` y no sabe representar su ausencia, y
+        /// los candados necesitan un token sin `exp` y otro sin `iat` para probar
+        /// que se rechazan.
+        pub fn firmar_claims(&self, claims: &serde_json::Value) -> String {
+            let mut cabecera = Header::new(Algorithm::RS256);
+            cabecera.kid = Some(KID.to_owned());
+
+            encode(&cabecera, claims, &self.clave).expect("el ID token de prueba debe firmarse")
+        }
+
+        /// Firma un ID token `RS256` con la clave que el JWKS **no** publica.
+        ///
+        /// La cabecera lleva el mismo `kid` que el JWK publicado: así la
+        /// verificación encuentra la clave y el rechazo sale de que la firma no
+        /// cuadra, que es lo que la prueba quiere cazar. Con un `kid` ajeno, el
+        /// token se rechazaría por no encontrar la clave y la comprobación
+        /// criptográfica nunca se ejercitaría.
+        pub fn firmar_con_clave_ajena(&self, claims: &IdToken) -> String {
+            firmar_con(&self.clave_no_publicada, claims)
+        }
+
+        /// Firma un ID token `RS256` **sin `kid`** en la cabecera.
+        ///
+        /// La firma es legítima —la hace la clave que el JWKS publica—, pero la
+        /// cabecera no dice con cuál, así que no hay clave que elegir. Un «si el
+        /// conjunto trae una sola clave, úsala» aceptaría este token.
+        pub fn firmar_sin_kid(&self, claims: &serde_json::Value) -> String {
+            let cabecera = Header::new(Algorithm::RS256);
+
+            encode(&cabecera, claims, &self.clave).expect("el ID token de prueba debe firmarse")
+        }
+
+        /// Firma un ID token `RS256` con la clave publicada pero con el `kid` de
+        /// [`KID_AJENO`], que el JWKS no publica.
+        ///
+        /// La firma cuadra con la única clave del conjunto; lo que falla es la
+        /// búsqueda por `kid`. Es el complemento de
+        /// [`Self::firmar_con_clave_ajena`]: allí el `kid` resuelve a una clave y
+        /// la firma no cuadra; aquí la firma cuadraría y es el `kid` el que no
+        /// resuelve.
+        pub fn firmar_con_kid_ajeno(&self, claims: &serde_json::Value) -> String {
+            let mut cabecera = Header::new(Algorithm::RS256);
+            cabecera.kid = Some(KID_AJENO.to_owned());
+
+            encode(&cabecera, claims, &self.clave).expect("el ID token de prueba debe firmarse")
+        }
+
+        /// Firma un ID token `HS256` usando como secreto `HMAC` la **clave
+        /// pública** del proveedor: la confusión de algoritmo clásica.
+        ///
+        /// El `kid` es el legítimo, así que la resolución de la clave no falla: lo
+        /// único que separa a este token de la sesión es que la verificación fija
+        /// `RS256` en vez de leer el algoritmo de la cabecera.
+        pub fn firmar_confundiendo_algoritmo(&self, claims: &serde_json::Value) -> String {
+            let mut cabecera = Header::new(Algorithm::HS256);
+            cabecera.kid = Some(KID.to_owned());
+
+            encode(&cabecera, claims, &self.clave_confusa)
+                .expect("el ID token de prueba debe firmarse")
+        }
+
+        /// Monta el `token_endpoint` para que devuelva el ID token dado.
+        ///
+        /// Devuelve también un `access_token` distinguible: el flujo no lo usa
+        /// —con el ID token verificado sobra— y así se comprueba que no acaba en
+        /// la cookie.
+        pub async fn montar_token_endpoint(&self, id_token: &str) {
+            let cuerpo = serde_json::json!({
+                "id_token": id_token,
+                "access_token": "access-token-del-proveedor-distinguible",
+                "token_type": "Bearer",
+                "expires_in": 600,
+            });
+
+            Mock::given(method("POST"))
+                .and(path(RUTA_TOKEN))
+                .respond_with(ResponseTemplate::new(200).set_body_json(cuerpo))
+                .mount(&self.server)
+                .await;
+        }
+
+        /// Cuántas peticiones de descubrimiento han llegado al proveedor.
+        ///
+        /// Es lo que hace creíble la caché: contar las peticiones es la única
+        /// forma de probar que un segundo login **no** vuelve a pedir el documento.
+        pub async fn peticiones_de_descubrimiento(&self) -> usize {
+            self.peticiones_a(RUTA_DESCUBRIMIENTO).await
+        }
+
+        /// Cuántas veces se ha llamado al `token_endpoint`.
+        pub async fn peticiones_al_token(&self) -> usize {
+            self.peticiones_a(RUTA_TOKEN).await
+        }
+
+        /// Cuenta las peticiones recibidas cuya ruta coincide con `ruta`.
+        async fn peticiones_a(&self, ruta: &str) -> usize {
+            self.server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter(|peticion| peticion.url.path() == ruta)
+                .count()
+        }
+    }
+
+    /// Genera un par RSA real y devuelve la clave privada como clave de firma.
+    ///
+    /// A 2048 bits, que es el mínimo que la verificación `RS256` de `jsonwebtoken`
+    /// espera. La clave se exporta en PKCS#1 DER porque es lo que acepta
+    /// `EncodingKey::from_rsa_der` y lo que `Jwk::from_encoding_key` sabe leer.
+    /// Devuelve también la **clave pública** en PKCS#1 DER.
+    fn generar_clave() -> (EncodingKey, Vec<u8>) {
+        let mut rng = rand::thread_rng();
+
+        let privada = RsaPrivateKey::new(&mut rng, 2048)
+            .expect("la generación de un par RSA de prueba no puede fallar");
+        let der = privada
+            .to_pkcs1_der()
+            .expect("la clave privada de prueba debe codificarse en PKCS#1")
+            .as_bytes()
+            .to_vec();
+        let publica = privada
+            .to_public_key()
+            .to_pkcs1_der()
+            .expect("la clave pública de prueba debe codificarse en PKCS#1")
+            .as_bytes()
+            .to_vec();
+
+        (EncodingKey::from_rsa_der(&der), publica)
+    }
+
+    /// Publica la clave pública de `clave` como JWKS, con su `kid`.
+    ///
+    /// Se usa `Jwk::from_encoding_key`, que extrae el módulo y el exponente y los
+    /// codifica en base64url sin relleno —como exige el RFC 7518—, de modo que la
+    /// misma biblioteca que firma y verifica construye la clave que publica.
+    fn jwks(clave: &EncodingKey) -> serde_json::Value {
+        let mut jwk = Jwk::from_encoding_key(clave, Algorithm::RS256)
+            .expect("la clave pública de prueba debe poder publicarse como JWK");
+        jwk.common.key_id = Some(KID.to_owned());
+
+        serde_json::to_value(JwkSet { keys: vec![jwk] })
+            .expect("el JWKS de prueba debe serializarse")
+    }
+
+    /// Firma `claims` con `clave` y el `kid` del proveedor.
+    fn firmar_con(clave: &EncodingKey, claims: &IdToken) -> String {
+        let mut cabecera = Header::new(Algorithm::RS256);
+        cabecera.kid = Some(KID.to_owned());
+
+        encode(&cabecera, claims, clave).expect("el ID token de prueba debe firmarse")
+    }
+
+    /// JWT con la cabecera `{"alg":"none","kid":…}` y **sin firma**.
+    ///
+    /// Es la confusión de algoritmo más burda: el token declara que no va firmado
+    /// y los claims son los legítimos. No se construye con `jsonwebtoken` porque
+    /// su `Algorithm` no tiene la variante `none` —es justo la razón de que este
+    /// token se rechace al leer la cabecera—, así que las tres partes se codifican
+    /// a mano en base64url sin relleno, como manda el RFC 7515. La tercera va
+    /// vacía: eso es exactamente lo que significa `alg: none`.
+    pub fn token_con_alg_none(claims: &serde_json::Value) -> String {
+        use base64::Engine as _;
+
+        let cabecera = serde_json::json!({ "alg": "none", "kid": KID });
+
+        let codificar = |valor: &serde_json::Value| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(valor.to_string())
+        };
+
+        format!("{}.{}.", codificar(&cabecera), codificar(claims))
+    }
+}
+
+// ── Captura del registro ─────────────────────────────────────────────────────
+//
+// Los candados de las comprobaciones del ID token no se conforman con el `401`:
+// un token rechazado por la firma, por el `kid`, por `iss`, por `aud` o por el
+// algoritmo da **el mismo** `401`, así que sin mirar la causa registrada el
+// candado no fija de qué comprobación viene el rechazo que anuncia. Eso obliga a
+// leer lo que se registra, y de ahí este arnés.
+//
+// El arnés instala **un suscriptor global**, una sola vez por proceso, y elige a
+// qué buffer escribe cada evento por **hilo**: un `thread_local` guarda el buffer
+// del test que está capturando en ese hilo, y el evento que sale de un hilo sin
+// captura se descarta en silencio. Así la suite sigue corriendo en paralelo, sin
+// un `Mutex` global compartido y sin serializar tests.
+//
+// **No reintroducir `set_default` ni `with_default` en este arnés**: con un
+// suscriptor **de hilo**, reconstruir el interés de un callsite puede preguntarle
+// a un hilo que no tiene ninguno y dejarlo cacheado como `never` para **todo el
+// proceso** —`tracing-core` lo hace así cuando solo hay un despachante vivo—, y
+// desde entonces ese registro desaparece, en cualquier hilo, aunque el suscriptor
+// esté instalado. El síntoma es «un registro que falta», no un test rojo: el test
+// cae por la aserción que comprueba que la captura está en pie. Si vuelve a
+// fallar así, se arregla aquí, no aflojando la aserción.
+
+thread_local! {
+    /// Buffer de captura del hilo actual, si ese hilo está capturando.
+    static BUFFER_DEL_HILO: RefCell<Option<BufferDeLog>> = const { RefCell::new(None) };
+}
+
+/// Marca de que el suscriptor global del arnés ya está instalado.
+///
+/// Un `OnceLock` y no un `bool`: la instalación tiene que ser **idempotente** y
+/// segura ante dos tests que la pidan a la vez, porque `set_global_default` solo
+/// se puede llamar una vez por proceso.
+static SUSCRIPTOR_GLOBAL: OnceLock<()> = OnceLock::new();
+
+/// Buffer de registro en memoria, compartido por todas las copias que se clonen.
+///
+/// Es el destino al que el suscriptor de [`capturar_log`] escribe: lo que se
+/// registre en el hilo pasa a ser texto que la prueba puede inspeccionar, en vez
+/// de salir por la salida estándar.
+#[derive(Clone, Default)]
+pub struct BufferDeLog(Arc<Mutex<Vec<u8>>>);
+
+impl BufferDeLog {
+    /// Texto acumulado hasta este instante.
+    pub fn texto(&self) -> String {
+        let bytes = self
+            .0
+            .lock()
+            .expect("el buffer de log no puede envenenarse");
+
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+
+impl std::io::Write for BufferDeLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .expect("el buffer de log no puede envenenarse")
+            .extend_from_slice(buf);
+
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufferDeLog {
+    type Writer = BufferDeLog;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Escritor del suscriptor global: escribe en el buffer del hilo, si lo hay.
+///
+/// Fuera del alcance de una captura no hay buffer y el registro se descarta **en
+/// silencio**, como un `/dev/null`: así un hilo que no captura no contamina a
+/// nadie.
+struct EscritorDeCaptura(Option<BufferDeLog>);
+
+impl std::io::Write for EscritorDeCaptura {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match &mut self.0 {
+            Some(buffer) => buffer.write(buf),
+            None => Ok(buf.len()),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// `MakeWriter` del suscriptor global: elige el buffer **por hilo**.
+struct CapturaGlobal;
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturaGlobal {
+    type Writer = EscritorDeCaptura;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        EscritorDeCaptura(BUFFER_DEL_HILO.with(|celda| celda.borrow().clone()))
+    }
+}
+
+/// Instala el suscriptor global de las pruebas, una sola vez por proceso.
+///
+/// El filtro es por **nivel**, no por `target` ni por `EnvFilter`: `LevelFilter`
+/// contesta `Interest::always` a todo lo que pasa el nivel y no cachea interés por
+/// callsite, así que le quita una capa de caché al fallo que este arnés existe
+/// para no tener. El nivel es `TRACE` a propósito: un candado de «esto no se
+/// registra» solo vale si el registro estaba en su nivel más hablador cuando se
+/// comprobó.
+///
+/// **No cambiar esto por `init()` ni `try_init()`**: ésos instalan además el
+/// puente `log` → `tracing`, y `wiremock` instrumenta con `log` —con el cuerpo de
+/// la petición, y el del canje lleva el `client_secret`—, así que el puente
+/// metería credenciales en el buffer de captura.
+fn instalar_suscriptor_global() {
+    SUSCRIPTOR_GLOBAL.get_or_init(|| {
+        let suscriptor = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(CapturaGlobal)
+            .finish();
+
+        if let Err(error) = tracing::subscriber::set_global_default(suscriptor) {
+            panic!(
+                "el arnés de captura no pudo instalar su suscriptor global: {error}. \
+                 Este arnés es el único que instala un suscriptor en el binario de \
+                 pruebas: quita el que lo pisa —el único del crate está en \
+                 `src/main.rs:178`, y usa `try_init()`—, o la captura de registro \
+                 deja de ser fiable."
+            );
+        }
+
+        // Aquí hace falta, y no es ceremonia: `set_global_default` ya reconstruye
+        // el interés de lo **ya registrado**, pero lo hace **antes** de marcar el
+        // global como inicializado. En esa ventana, un callsite estrenado por un
+        // test que no captura puede quedar cacheado como `never`. Esta llamada, ya
+        // con el global puesto, repara esos callsites.
+        tracing::callsite::rebuild_interest_cache();
+    });
+}
+
+/// Guardián de una captura: al soltarse, devuelve al hilo el buffer que tenía.
+///
+/// Guarda el valor **anterior** del `thread_local`, no un `None` a secas: si una
+/// captura se anidara dentro de otra, al cerrar la de dentro hay que volver a la
+/// de fuera. Mantenerlo vivo mientras se leen los eventos es obligatorio: al
+/// soltarlo, el hilo deja de capturar.
+/// No la muevas de hilo: su `Drop` escribe en el `thread_local` del hilo que la
+/// suelta.
+#[must_use = "soltar la guardia deja de capturar: manténla viva mientras leas el buffer"]
+pub struct GuardiaDeCaptura(Option<BufferDeLog>);
+
+impl Drop for GuardiaDeCaptura {
+    fn drop(&mut self) {
+        BUFFER_DEL_HILO.with(|celda| *celda.borrow_mut() = self.0.take());
+    }
+}
+
+/// Captura el registro del hilo actual en memoria y devuelve el buffer.
+///
+/// El suscriptor es **global** y se instala una sola vez; lo que cada llamada fija
+/// es el **buffer del hilo**. Se usa así:
+///
+/// ```ignore
+/// let (buffer, _guardia) = capturar_log();
+/// // …lo que registre…
+/// assert!(buffer.texto().contains("…"));
+/// ```
+pub fn capturar_log() -> (BufferDeLog, GuardiaDeCaptura) {
+    instalar_suscriptor_global();
+
+    let buffer = BufferDeLog::default();
+    let anterior = BUFFER_DEL_HILO.with(|celda| celda.borrow_mut().replace(buffer.clone()));
+
+    (buffer, GuardiaDeCaptura(anterior))
 }

@@ -14,6 +14,7 @@ use std::sync::Arc;
 use sqlx::SqlitePool;
 use tokio::sync::{broadcast, watch};
 
+use crate::auth::AuthState;
 use crate::config::Config;
 use crate::systemd::{SystemdClient, UnitStatus};
 
@@ -58,6 +59,13 @@ pub struct AppState {
     /// momento. Los flujos SSE lo esperan para terminar y no dejar colgado el
     /// apagado ordenado, que espera a las conexiones en curso.
     pub apagado: watch::Receiver<bool>,
+    /// El estado de la autenticación: `None` cuando no se monta ninguna capa.
+    ///
+    /// Es `Some` **sólo** en modo `Oidc`, y por eso es un `Option` y no un campo
+    /// vacío: el modo se lee en el tipo, y quien tenga un [`AuthState`] en la
+    /// mano sabe que hay autenticación sin consultar la configuración. Lo deriva
+    /// [`AppState::new`] de la configuración ya resuelta.
+    pub auth: Option<AuthState>,
 }
 
 impl AppState {
@@ -72,6 +80,10 @@ impl AppState {
     /// —el emisor de eventos y el disparador del cierre— tienen que quedarse fuera
     /// del estado, en quien arranca, y un canal se construye con sus dos mitades a
     /// la vez.
+    ///
+    /// La autenticación **no** entra por parámetro: se deriva de la configuración
+    /// —es lo que hace que el modo se lea en un solo sitio— y sólo existe en modo
+    /// `Oidc`.
     pub fn new(
         config: Config,
         pool: SqlitePool,
@@ -79,12 +91,15 @@ impl AppState {
         eventos: broadcast::Sender<Vec<UnitStatus>>,
         apagado: watch::Receiver<bool>,
     ) -> Self {
+        let auth = AuthState::from_config(&config);
+
         Self {
             config: Arc::new(config),
             pool,
             systemd,
             eventos,
             apagado,
+            auth,
         }
     }
 
