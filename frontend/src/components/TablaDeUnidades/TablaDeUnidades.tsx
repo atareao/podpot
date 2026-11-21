@@ -1,6 +1,7 @@
-import { Button, Empty, Space, Table } from 'antd'
+import { Button, Empty, Popconfirm, Space, Table } from 'antd'
 import type { TableProps } from 'antd'
 import { EstadoDeUnidad } from '../EstadoDeUnidad/EstadoDeUnidad'
+import { identidadDeUnidad } from '../../quadlets/identidad'
 import type { AccionDeUnidad, QuadletUnit } from '../../types/api'
 
 export interface TablaDeUnidadesProps {
@@ -10,6 +11,13 @@ export interface TablaDeUnidadesProps {
   cargando: boolean
   /** Acción solicitada desde una fila. */
   onAccion: (unidad: QuadletUnit, accion: AccionDeUnidad) => void
+  /** Edición solicitada desde una fila. */
+  onEditar: (unidad: QuadletUnit) => void
+  /**
+   * Borrado **confirmado** desde una fila: la confirmación vive aquí, así que
+   * cancelarla no llega a emitir nada.
+   */
+  onBorrar: (unidad: QuadletUnit) => void
   /** Nombre de la unidad con una acción en curso: sus botones se deshabilitan. */
   enCurso?: string | null
 }
@@ -36,6 +44,8 @@ export function TablaDeUnidades({
   unidades,
   cargando,
   onAccion,
+  onEditar,
+  onBorrar,
   enCurso = null,
 }: TablaDeUnidadesProps) {
   const columnas: TableProps<QuadletUnit>['columns'] = [
@@ -64,6 +74,9 @@ export function TablaDeUnidades({
       key: 'acciones',
       render: (_valor, unidad) => {
         const bloqueada = enCurso === unidad.name
+        // La identidad no es inyectiva (se deduce del nombre de unidad), así que
+        // la acción destructiva nombra el fichero exacto que se va a borrar.
+        const identidad = identidadDeUnidad(unidad.name)
         return (
           <Space size="small" wrap>
             <Button
@@ -90,6 +103,37 @@ export function TablaDeUnidades({
             >
               Reiniciar
             </Button>
+            <Button
+              size="small"
+              aria-label={`Editar ${unidad.name}`}
+              disabled={bloqueada}
+              onClick={() => onEditar(unidad)}
+            >
+              Editar
+            </Button>
+            {/* El borrado es destructivo: la confirmación vive aquí y solo al
+                confirmarla se emite `onBorrar`; cancelar no sale de la fila. */}
+            <Popconfirm
+              title={`¿Borrar la quadlet «${unidad.name}»?`}
+              description={
+                identidad === null
+                  ? 'No se pudo identificar su fichero. No se puede deshacer.'
+                  : `Se borrará el fichero «${identidad.file_name}». No se puede deshacer.`
+              }
+              okText="Sí, borrar"
+              cancelText="Cancelar"
+              okButtonProps={{ danger: true }}
+              onConfirm={() => onBorrar(unidad)}
+            >
+              <Button
+                size="small"
+                danger
+                aria-label={`Borrar ${unidad.name}`}
+                disabled={bloqueada}
+              >
+                Borrar
+              </Button>
+            </Popconfirm>
           </Space>
         )
       },

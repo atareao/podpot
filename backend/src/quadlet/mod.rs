@@ -82,6 +82,20 @@ impl QuadletKind {
         }
     }
 
+    /// La cabecera de la sección principal del fichero, sin los corchetes.
+    ///
+    /// Es la sección donde el render escribe las claves del tipo
+    /// ([`QuadletDraft::render`]) y, por tanto, la única que la lectura considera:
+    /// una clave modelada escrita en otra sección no es un campo de esta quadlet.
+    pub const fn seccion(&self) -> &'static str {
+        match self {
+            Self::Container => "Container",
+            Self::Volume => "Volume",
+            Self::Network => "Network",
+            Self::Pod => "Pod",
+        }
+    }
+
     /// El nombre de unidad que systemd genera para `<stem>.<ext>`.
     ///
     /// El mapeo no es el mismo para todos: un `.container` da `<stem>.service`
@@ -126,6 +140,17 @@ pub enum QuadletError {
     #[error("ya existe una quadlet con el fichero `{file_name}` en el directorio de quadlets")]
     Duplicate {
         /// El nombre de fichero que ya estaba en uso.
+        file_name: String,
+    },
+
+    /// No existe ninguna quadlet con ese nombre en el directorio de quadlets.
+    ///
+    /// La identidad es el nombre de fichero `<stem>.<kind>`: si no hay fichero
+    /// con ese nombre, no hay nada que editar ni que borrar. El directorio queda
+    /// intacto —no se escribe ni se borra nada—.
+    #[error("no existe una quadlet con el fichero `{file_name}` en el directorio de quadlets")]
+    NotFound {
+        /// El nombre de fichero que no se encontró.
         file_name: String,
     },
 
@@ -180,6 +205,22 @@ pub enum QuadletError {
         causa: std::io::Error,
     },
 
+    /// El fichero no se pudo leer.
+    ///
+    /// Es el hermano de [`QuadletError::WriteFailed`] para la lectura: un fallo
+    /// del sistema de ficheros que **no** es «no existe» —un permiso, un
+    /// directorio donde se esperaba un fichero, un contenido que no es UTF-8—. Se
+    /// traduce a un `500` genérico y, como en la escritura, el mensaje **no**
+    /// publica la ruta.
+    #[error("no se pudo leer la quadlet `{file_name}`: {causa}")]
+    ReadFailed {
+        /// El nombre de fichero que no se pudo leer.
+        file_name: String,
+        /// El motivo, tal y como lo informó el sistema de ficheros.
+        #[source]
+        causa: std::io::Error,
+    },
+
     /// La creación se completó, pero no se pudo registrar.
     ///
     /// Es un fallo del propio podpot, no de la petición: se traduce a un `500`
@@ -187,6 +228,21 @@ pub enum QuadletError {
     #[error("no se pudo registrar la creación de `{file_name}`: {causa}")]
     Persistencia {
         /// El nombre de fichero de la quadlet creada.
+        file_name: String,
+        /// El motivo, tal y como lo informó SQLite.
+        #[source]
+        causa: Box<sqlx::Error>,
+    },
+
+    /// La operación se completó, pero no se pudo registrar.
+    ///
+    /// Es el mismo desenlace que [`QuadletError::Persistencia`] para las
+    /// operaciones de edición y borrado: un fallo del propio podpot que se
+    /// traduce a un `500` genérico, con el detalle en el registro. El hecho
+    /// ocurrido —el fichero reescrito o borrado— **no** se deshace.
+    #[error("no se pudo registrar la operación sobre `{file_name}`: {causa}")]
+    Registro {
+        /// El nombre de fichero afectado.
         file_name: String,
         /// El motivo, tal y como lo informó SQLite.
         #[source]
@@ -216,7 +272,13 @@ pub enum QuadletError {
 /// objeto JSON; los que exige cada tipo se validan al renderizar
 /// ([`QuadletDraft::render`]), no aquí: un `Option` que no se usa en ese tipo se
 /// ignora en silencio, que es lo que se espera de un campo de otro tipo.
-#[derive(Debug, Clone, Default, Deserialize)]
+///
+/// El mismo struct es también la **respuesta** de la lectura
+/// ([`QuadletDraft::parse`]): así el cuerpo de `GET` tiene exactamente la forma
+/// del de `POST`/`PATCH` y un cliente puede precargar el formulario de edición sin
+/// traducir nada. Los opcionales ausentes **no** se serializan —ni `null` ni
+/// inventados—, y el contenido del fichero nunca viaja.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct QuadletDraft {
     /// El stem del fichero, sin la extensión.
@@ -224,10 +286,10 @@ pub struct QuadletDraft {
     /// La extensión, sin el punto (`container`, `volume`, `network`, `pod`).
     pub kind: String,
     /// La imagen del contenedor (`.container`, obligatoria).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
     /// El `ContainerName=` del contenedor.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container_name: Option<String>,
     /// Los `PublishPort=` del contenedor o del pod, en orden.
     #[serde(default)]
@@ -239,16 +301,16 @@ pub struct QuadletDraft {
     #[serde(default)]
     pub environments: Vec<String>,
     /// El `VolumeName=` del volumen.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volume_name: Option<String>,
     /// El `NetworkName=` de la red.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_name: Option<String>,
     /// El `Subnet=` de la red.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subnet: Option<String>,
     /// El `PodName=` del pod.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pod_name: Option<String>,
 }
 
@@ -375,6 +437,93 @@ impl QuadletDraft {
         Ok(fichero)
     }
 
+    /// Parsea el **contenido de un fichero** de vuelta a los campos tipados de su
+    /// tipo: es el inverso de [`QuadletDraft::render`].
+    ///
+    /// La identidad —el stem y el tipo— sale de la quadlet ya resuelta
+    /// ([`Quadlet::from_file_name`]), no del contenido: el fichero sólo aporta los
+    /// campos. Sólo se consideran las claves **modeladas** y dentro de la sección
+    /// del tipo ([`QuadletKind::seccion`]); las directivas que podpot no modela
+    /// (`User=`, `Network=`…), los comentarios y las demás secciones (`[Unit]`,
+    /// `[Service]`…) se ignoran. El contenido libre **no** viaja: la lectura es un
+    /// struct tipado, nunca un volcado del fichero.
+    ///
+    /// Un campo que no esté en el fichero se queda con el valor por defecto
+    /// coherente con el render: `None` para los opcionales y vacío para los
+    /// vectores. La lectura **no** exige los campos obligatorios de la escritura
+    /// —un `.container` sin `Image=` se lee con `image: None`—: quien lee informa
+    /// de lo que el fichero tiene, y es la escritura la que vuelve a exigirlos.
+    ///
+    /// No es falible: el contenido de un fichero que existe se lee tal cual, y las
+    /// líneas que no encajan en el contrato se ignoran en vez de rechazar la
+    /// lectura entera.
+    pub fn parse(quadlet: &Quadlet, contenido: &str) -> Self {
+        let mut draft = Self {
+            name: quadlet.stem().to_owned(),
+            kind: quadlet.kind.extension().to_owned(),
+            ..Self::default()
+        };
+
+        // Sólo cuenta lo que está en la sección del tipo: las claves de otras
+        // secciones son de otras cosas (la unidad, el servicio) y no de esta
+        // quadlet.
+        let mut en_objetivo = false;
+
+        for linea in contenido.lines() {
+            let linea = linea.trim();
+
+            // Una cabecera `[Sección]` cambia de sección; nada más se interpreta.
+            if let Some(nombre) = linea
+                .strip_prefix('[')
+                .and_then(|resto| resto.strip_suffix(']'))
+            {
+                en_objetivo = nombre.trim() == quadlet.kind.seccion();
+                continue;
+            }
+
+            if !en_objetivo || linea.is_empty() || linea.starts_with('#') || linea.starts_with(';')
+            {
+                continue;
+            }
+
+            // Una línea que no sea `Clave=valor` no es un campo: se ignora.
+            let Some((clave, valor)) = linea.split_once('=') else {
+                continue;
+            };
+
+            let clave = clave.trim();
+            let valor = valor.trim().to_owned();
+
+            match quadlet.kind {
+                QuadletKind::Container => match clave {
+                    "Image" => draft.image = Some(valor),
+                    "ContainerName" => draft.container_name = Some(valor),
+                    "PublishPort" => draft.publish_ports.push(valor),
+                    "Volume" => draft.volumes.push(valor),
+                    "Environment" => draft.environments.push(valor),
+                    _ => {}
+                },
+                QuadletKind::Volume => {
+                    if clave == "VolumeName" {
+                        draft.volume_name = Some(valor);
+                    }
+                }
+                QuadletKind::Network => match clave {
+                    "NetworkName" => draft.network_name = Some(valor),
+                    "Subnet" => draft.subnet = Some(valor),
+                    _ => {}
+                },
+                QuadletKind::Pod => match clave {
+                    "PodName" => draft.pod_name = Some(valor),
+                    "PublishPort" => draft.publish_ports.push(valor),
+                    _ => {}
+                },
+            }
+        }
+
+        draft
+    }
+
     /// Resuelve el nombre de fichero y el de unidad generado.
     pub fn quadlet(&self) -> Result<Quadlet, QuadletError> {
         let kind = self.validate()?;
@@ -384,6 +533,24 @@ impl QuadletDraft {
             file_name: self.file_name(),
             unit_name: kind.unit_name(stem)?,
             kind,
+        })
+    }
+
+    /// ¿El borrador describe exactamente el recurso cuyo nombre de fichero es
+    /// `file_name`?
+    ///
+    /// Editar **nunca** renombra: el stem y la extensión son la identidad, y un
+    /// borrador que resuelva a otro nombre de fichero es un intento de renombrar
+    /// —o de cambiar el tipo—, que se rechaza con [`QuadletError::InvalidName`]
+    /// sin tocar nada. Se compara el nombre de fichero completo, así que da igual
+    /// si lo que cambió fue el stem o la extensión.
+    pub fn describe_a(&self, file_name: &str) -> Result<(), QuadletError> {
+        if self.file_name() == file_name {
+            return Ok(());
+        }
+
+        Err(QuadletError::InvalidName {
+            stem: self.stem().to_owned(),
         })
     }
 }
@@ -401,6 +568,57 @@ pub struct Quadlet {
     pub unit_name: UnitName,
     /// El tipo de quadlet creada.
     pub kind: QuadletKind,
+}
+
+impl Quadlet {
+    /// Resuelve la identidad de una quadlet existente a partir de su **nombre de
+    /// fichero** `<stem>.<kind>`.
+    ///
+    /// Es la clave de las rutas de edición y borrado: el nombre de fichero —y no
+    /// el de la unidad— es lo que identifica el recurso, porque no depende del
+    /// mapeo de nombres ni de ambigüedades entre tipos.
+    ///
+    /// El tipo se lee de la extensión —la última, para que un stem con punto
+    /// (`voicebox.prod.container`) no se confunda— y el stem pasa por la misma
+    /// validación que la creación: un nombre que pudiera convertirse en una ruta
+    /// o que systemd no supiera leer es `InvalidName`, y una extensión que no sea
+    /// de un tipo creable es `InvalidKind`. Aquí **no** se toca el disco: que el
+    /// fichero exista lo comprueba quien llama.
+    pub fn from_file_name(file_name: &str) -> Result<Self, QuadletError> {
+        // La extensión es lo que va tras el **último** punto: un stem puede
+        // llevar puntos (`voicebox.prod`), así que no vale partir por el primero.
+        let (stem, extension) =
+            file_name
+                .rsplit_once('.')
+                .ok_or_else(|| QuadletError::InvalidName {
+                    stem: file_name.to_owned(),
+                })?;
+
+        if !stem_valido(stem) {
+            return Err(QuadletError::InvalidName {
+                stem: stem.to_owned(),
+            });
+        }
+
+        let kind = QuadletKind::from_extension(extension)?;
+
+        Ok(Self {
+            file_name: file_name.to_owned(),
+            unit_name: kind.unit_name(stem)?,
+            kind,
+        })
+    }
+
+    /// El **stem** del fichero, sin la extensión.
+    ///
+    /// Sale del nombre de fichero partiendo por el último punto, que es el mismo
+    /// criterio con el que [`Quadlet::from_file_name`] separó el tipo: un stem con
+    /// punto (`voicebox.prod.container`) conserva sus puntos.
+    pub fn stem(&self) -> &str {
+        self.file_name
+            .rsplit_once('.')
+            .map_or(self.file_name.as_str(), |(stem, _)| stem)
+    }
 }
 
 /// El valor de un campo, ya comprobado y recortado, o el rechazo que le toca.
@@ -455,7 +673,7 @@ mod tests {
 
     use crate::systemd::UnitName;
 
-    use super::{QuadletDraft, QuadletError, QuadletKind};
+    use super::{Quadlet, QuadletDraft, QuadletError, QuadletKind};
 
     /// Un borrador con sólo el nombre y el tipo.
     fn borrador(name: &str, kind: &str) -> QuadletDraft {
@@ -905,5 +1123,244 @@ mod tests {
         assert_eq!(quadlet.file_name, "web-data.volume");
         assert_eq!(quadlet.unit_name.as_str(), "web-data-volume.service");
         assert_eq!(quadlet.kind, QuadletKind::Volume);
+    }
+
+    /// Escenario «Edición correcta» (identidad): el nombre de fichero
+    /// `<stem>.<kind>` es la clave y se resuelve a la quadlet que le toca.
+    #[test]
+    fn el_nombre_de_fichero_resuelve_la_identidad() {
+        let quadlet = Quadlet::from_file_name("web.container").expect("es una quadlet válida");
+
+        assert_eq!(quadlet.file_name, "web.container");
+        assert_eq!(quadlet.kind, QuadletKind::Container);
+        assert_eq!(quadlet.unit_name.as_str(), "web.service");
+    }
+
+    /// Cada extensión creable resuelve su tipo y el nombre de unidad que genera
+    /// systemd, y el nombre de fichero se conserva tal cual.
+    #[test]
+    fn cada_extension_resuelve_su_tipo_y_su_unidad() {
+        let casos = [
+            ("web.container", QuadletKind::Container, "web.service"),
+            (
+                "web-data.volume",
+                QuadletKind::Volume,
+                "web-data-volume.service",
+            ),
+            (
+                "web-net.network",
+                QuadletKind::Network,
+                "web-net-network.service",
+            ),
+            ("web.pod", QuadletKind::Pod, "web-pod.service"),
+        ];
+
+        for (nombre, tipo, unidad) in casos {
+            let quadlet = Quadlet::from_file_name(nombre)
+                .unwrap_or_else(|error| panic!("{nombre:?} tendría que resolver: {error}"));
+
+            assert_eq!(quadlet.file_name, nombre);
+            assert_eq!(quadlet.kind, tipo);
+            assert_eq!(quadlet.unit_name.as_str(), unidad);
+        }
+    }
+
+    /// Un nombre sin extensión, con un stem no admisible o con una ruta dentro es
+    /// `InvalidName`: nunca puede convertirse en una ruta de escritura.
+    #[test]
+    fn un_nombre_de_fichero_no_admisible_es_invalid_name() {
+        for malo in [
+            "",
+            "web",
+            "web malo.container",
+            "/etc/web.container",
+            "../web.container",
+            ".container",
+        ] {
+            let error =
+                Quadlet::from_file_name(malo).expect_err("no puede colarse como nombre de quadlet");
+
+            assert!(
+                matches!(error, QuadletError::InvalidName { .. }),
+                "se esperaba un nombre inválido para {malo:?}: {error}"
+            );
+        }
+    }
+
+    /// Y una extensión que no sea de un tipo creable es `InvalidKind`.
+    #[test]
+    fn una_extension_no_creable_es_invalid_kind_al_resolver() {
+        for malo in ["web.desktop", "web.kube", "web.", "web.service"] {
+            let error =
+                Quadlet::from_file_name(malo).expect_err("no puede colarse como nombre de quadlet");
+
+            assert!(
+                matches!(error, QuadletError::InvalidKind { .. }),
+                "se esperaba un tipo inválido para {malo:?}: {error}"
+            );
+        }
+    }
+
+    /// Escenario «Intento de renombrado»: editar nunca renombra. Un borrador que
+    /// no describe exactamente el recurso indicado se rechaza con `InvalidName`.
+    #[test]
+    fn un_borrador_que_renombra_es_invalid_name() {
+        let contenedor = contenedor("web");
+
+        // El mismo recurso: el borrador describe `web.container`.
+        assert!(
+            contenedor.describe_a("web.container").is_ok(),
+            "un borrador del mismo nombre describe el recurso"
+        );
+
+        // Otro stem: intento de renombrar.
+        let error = contenedor
+            .describe_a("otro.container")
+            .expect_err("renombrar no está permitido");
+
+        assert!(matches!(error, QuadletError::InvalidName { .. }), "{error}");
+    }
+
+    /// Y un borrador de otro tipo tampoco describe el recurso: `web.volume` no es
+    /// `web.container`.
+    #[test]
+    fn un_borrador_de_otro_tipo_no_describe_el_recurso() {
+        let error = borrador("web", "volume")
+            .describe_a("web.container")
+            .expect_err("cambiar el tipo tampoco es editar el mismo recurso");
+
+        assert!(matches!(error, QuadletError::InvalidName { .. }), "{error}");
+    }
+
+    /// Un contenedor con todos sus campos opcionales rellenos, para el ida y
+    /// vuelta del parseo.
+    fn contenedor_completo(name: &str) -> QuadletDraft {
+        QuadletDraft {
+            image: Some("docker.io/library/nginx:latest".to_owned()),
+            container_name: Some("web".to_owned()),
+            publish_ports: vec!["8080:80".to_owned(), "8443:443".to_owned()],
+            volumes: vec!["web-data:/data:Z".to_owned()],
+            environments: vec!["TZ=Europe/Madrid".to_owned()],
+            ..borrador(name, "container")
+        }
+    }
+
+    /// Escenario «Lectura de una quadlet»: el contenido que produce el render se
+    /// parsea de vuelta a **los mismos** campos. La lectura es el inverso de la
+    /// escritura, y el ida y vuelta vale para los cuatro tipos creables.
+    #[test]
+    fn el_contenido_se_parsea_de_vuelta_a_los_campos() {
+        let casos = [
+            ("web.container", contenedor_completo("web")),
+            (
+                "web-data.volume",
+                QuadletDraft {
+                    volume_name: Some("web-data".to_owned()),
+                    ..borrador("web-data", "volume")
+                },
+            ),
+            (
+                "web-net.network",
+                QuadletDraft {
+                    network_name: Some("web-net".to_owned()),
+                    subnet: Some("10.88.0.0/24".to_owned()),
+                    ..borrador("web-net", "network")
+                },
+            ),
+            (
+                "web.pod",
+                QuadletDraft {
+                    pod_name: Some("web".to_owned()),
+                    publish_ports: vec!["8080:80".to_owned()],
+                    ..borrador("web", "pod")
+                },
+            ),
+        ];
+
+        for (file_name, draft) in casos {
+            let contenido = draft
+                .render()
+                .unwrap_or_else(|error| panic!("{file_name:?} tendría que renderizar: {error}"));
+            let quadlet = Quadlet::from_file_name(file_name).expect("es una quadlet válida");
+
+            assert_eq!(
+                QuadletDraft::parse(&quadlet, &contenido),
+                draft,
+                "el ida y vuelta de {file_name:?} no devolvió los mismos campos"
+            );
+        }
+    }
+
+    /// Escenario «Campo ausente»: lo que no está en el fichero se queda con el
+    /// valor por defecto coherente con el render —`None` para los opcionales y
+    /// vacío para los vectores—, sin inventar valores.
+    #[test]
+    fn un_campo_ausente_queda_ausente() {
+        let quadlet = Quadlet::from_file_name("web.container").expect("es una quadlet válida");
+
+        let leido = QuadletDraft::parse(&quadlet, "[Container]\n");
+
+        assert_eq!(leido, borrador("web", "container"));
+        assert_eq!(
+            leido.image, None,
+            "un contenedor sin imagen leída no la inventa"
+        );
+        assert!(leido.publish_ports.is_empty());
+    }
+
+    /// Y el orden de los vectores se conserva: el parseo acumula en el orden en
+    /// que aparecen las líneas, igual que el render las escribió.
+    #[test]
+    fn el_orden_de_los_vectores_se_conserva_al_parsear() {
+        let quadlet = Quadlet::from_file_name("web.container").expect("es una quadlet válida");
+        let contenido = "[Container]\nImage=nginx\n\
+                         PublishPort=8080:80\nPublishPort=8443:443\n\
+                         Volume=web-data:/data\nVolume=otra:/otra\n\
+                         Environment=TZ=Europe/Madrid\nEnvironment=LANG=es_ES.UTF-8\n";
+
+        let leido = QuadletDraft::parse(&quadlet, contenido);
+
+        assert_eq!(leido.publish_ports, ["8080:80", "8443:443"]);
+        assert_eq!(leido.volumes, ["web-data:/data", "otra:/otra"]);
+        assert_eq!(leido.environments, ["TZ=Europe/Madrid", "LANG=es_ES.UTF-8"]);
+    }
+
+    /// Escenario «Contenido libre»: el parseo sólo reconoce las claves que el
+    /// contrato modela **y dentro de la sección de su tipo**. Las directivas que
+    /// podpot no modela, los comentarios y las otras secciones (`[Unit]`,
+    /// `[Service]`) se ignoran y no se devuelven: la lectura no es un volcado del
+    /// fichero.
+    #[test]
+    fn el_parseo_ignora_lo_que_no_modela() {
+        let quadlet = Quadlet::from_file_name("web.container").expect("es una quadlet válida");
+        let contenido = "\
+# un comentario\n\
+[Unit]\n\
+Description=lo que sea\n\
+[Container]\n\
+Image=nginx\n\
+User=root\n\
+Network=host\n\
+[Service]\n\
+ExecStart=/usr/bin/algo\n";
+
+        let leido = QuadletDraft::parse(&quadlet, contenido);
+
+        assert_eq!(
+            leido.image.as_deref(),
+            Some("nginx"),
+            "lee la clave modelada"
+        );
+        assert_eq!(leido.container_name, None, "no inventa campos que no están");
+
+        // Una clave **modelada** fuera de su sección tampoco cuenta: `VolumeName=`
+        // en `[Volume]` no es un campo del contenedor que se está leyendo.
+        let clave_en_otra_seccion = "[Volume]\nVolumeName=otra\n[Container]\nImage=nginx\n";
+
+        assert_eq!(
+            QuadletDraft::parse(&quadlet, clave_en_otra_seccion).volume_name,
+            None,
+            "una clave de otro tipo no puede colarse en la lectura"
+        );
     }
 }

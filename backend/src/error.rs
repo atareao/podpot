@@ -73,6 +73,9 @@ const CODE_INVALID_VALUE: &str = "invalid_value";
 /// El código de una quadlet que no se pudo escribir.
 const CODE_WRITE_FAILED: &str = "write_failed";
 
+/// El código de una quadlet que no se pudo leer.
+const CODE_READ_FAILED: &str = "read_failed";
+
 /// El código de un fallo del propio servidor.
 const CODE_INTERNAL: &str = "internal";
 
@@ -307,11 +310,42 @@ fn traducir_quadlet(causa: QuadletError) -> (StatusCode, &'static str, String) {
                 INTERNAL_MESSAGE.to_owned(),
             )
         }
+        QuadletError::ReadFailed { file_name, causa } => {
+            tracing::error!(fichero = %file_name, error = %causa, "no se pudo leer la quadlet");
+
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                CODE_READ_FAILED,
+                INTERNAL_MESSAGE.to_owned(),
+            )
+        }
         QuadletError::Persistencia { file_name, causa } => {
             tracing::error!(
                 fichero = %file_name,
                 error = %causa,
                 "no se pudo registrar la creación de la quadlet"
+            );
+
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                CODE_INTERNAL,
+                INTERNAL_MESSAGE.to_owned(),
+            )
+        }
+        QuadletError::NotFound { file_name } => {
+            tracing::debug!(fichero = %file_name, "la quadlet no existe");
+
+            (
+                StatusCode::NOT_FOUND,
+                CODE_NOT_FOUND,
+                "no existe una quadlet con ese nombre en el directorio de quadlets".to_owned(),
+            )
+        }
+        QuadletError::Registro { file_name, causa } => {
+            tracing::error!(
+                fichero = %file_name,
+                error = %causa,
+                "no se pudo registrar la operación sobre la quadlet"
             );
 
             (

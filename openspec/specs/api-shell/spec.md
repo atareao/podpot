@@ -29,6 +29,11 @@ Todas las rutas de negocio bajo `/api/v1/` SHALL responder con una envoltura JSO
 - **WHEN** se usa un método distinto de `POST` sobre `/api/v1/quadlets`
 - **THEN** la respuesta SHALL ser `405` con la misma envoltura, preservando el fallback existente
 
+#### Scenario: Fallbacks preservados en la ruta de una quadlet
+
+- **WHEN** se usa un método distinto de `GET`/`PATCH`/`DELETE` sobre `/api/v1/quadlets/{name}`
+- **THEN** la respuesta SHALL ser `405` con la misma envoltura
+
 ### Requirement: Ruta de salud
 
 El servidor SHALL exponer `GET /api/v1/health` sin autenticación, con el estado del proceso.
@@ -59,4 +64,46 @@ El servidor SHALL exponer `POST /api/v1/quadlets` para crear una quadlet de un t
 #### Scenario: Error de creación envuelto
 
 - **WHEN** la creación falla con un error tipado
+- **THEN** la respuesta SHALL usar `{error:{code,message}}` con el estado HTTP correspondiente al tipo de error
+
+### Requirement: Ruta de consulta de quadlets
+
+El servidor SHALL exponer `GET /api/v1/quadlets/{name}` para leer la definición de una quadlet existente, devolviendo su tipo y sus campos. La respuesta SHALL usar la envoltura existente `{data}`/`{error}`. Si el fichero no existe, SHALL producirse `NotFound` (`not_found`, `404`).
+
+#### Scenario: Consulta correcta
+
+- **WHEN** se pide una quadlet existente por su nombre de fichero
+- **THEN** SHALL responder `200` con `{data}` conteniendo, al menos, el tipo (`kind`) y los campos de la quadlet
+
+#### Scenario: Consulta de inexistente
+
+- **WHEN** se pide un nombre de fichero que no existe en el directorio configurado
+- **THEN** la respuesta SHALL ser `NotFound` (`not_found`, `404`) con la misma envoltura
+
+### Requirement: Ruta de edición de quadlets
+
+El servidor SHALL exponer `PATCH /api/v1/quadlets/{name}` para actualizar una quadlet existente. La respuesta SHALL usar la envoltura existente `{data}`/`{error}`.
+
+#### Scenario: Edición correcta
+
+- **WHEN** se envía una petición válida de edición de una quadlet existente
+- **THEN** SHALL responder `200` con `{data}` conteniendo, al menos, el nombre de unidad afectado
+
+#### Scenario: Error de edición envuelto
+
+- **WHEN** la edición falla con un error tipado
+- **THEN** la respuesta SHALL usar `{error:{code,message}}` con el estado HTTP correspondiente al tipo de error
+
+### Requirement: Ruta de borrado de quadlets
+
+El servidor SHALL exponer `DELETE /api/v1/quadlets/{name}` para borrar una quadlet existente. La respuesta SHALL usar la envoltura existente `{data}`/`{error}`.
+
+#### Scenario: Borrado correcto
+
+- **WHEN** se envía una petición válida de borrado de una quadlet existente
+- **THEN** SHALL responder `200` con `{data}` confirmando el nombre de fichero borrado
+
+#### Scenario: Error de borrado envuelto
+
+- **WHEN** el borrado falla con un error tipado
 - **THEN** la respuesta SHALL usar `{error:{code,message}}` con el estado HTTP correspondiente al tipo de error

@@ -1,0 +1,80 @@
+# Spec Delta — api-shell
+
+## Purpose
+
+El servidor HTTP de podpot: arranque, envoltura JSON única de las respuestas, ruta de salud, manejo de errores y apagado ordenado. Este delta añade las rutas de consulta, edición y borrado de quadlets y confirma que la envoltura y los fallbacks se preservan.
+
+## MODIFIED Requirements
+
+### Requirement: Envoltura JSON única
+
+Todas las rutas de negocio bajo `/api/v1/` SHALL responder con una envoltura JSON uniforme (un campo con los datos y, cuando proceda, un campo de error), también en los errores.
+
+#### Scenario: Respuesta de negocio correcta
+
+- **WHEN** una ruta de negocio devuelve datos
+- **THEN** la respuesta SHALL ser `200` con la envoltura JSON y los datos dentro
+
+#### Scenario: Recurso desconocido
+
+- **WHEN** se pide una ruta inexistente
+- **THEN** la respuesta SHALL ser `404` con la misma envoltura y un error descriptivo
+
+#### Scenario: Método no permitido
+
+- **WHEN** se usa un método no permitido sobre una ruta existente
+- **THEN** la respuesta SHALL ser `405` con la misma envoltura
+
+#### Scenario: Fallbacks preservados en la ruta de creación
+
+- **WHEN** se usa un método distinto de `POST` sobre `/api/v1/quadlets`
+- **THEN** la respuesta SHALL ser `405` con la misma envoltura, preservando el fallback existente
+
+#### Scenario: Fallbacks preservados en la ruta de una quadlet
+
+- **WHEN** se usa un método distinto de `GET`/`PATCH`/`DELETE` sobre `/api/v1/quadlets/{name}`
+- **THEN** la respuesta SHALL ser `405` con la misma envoltura
+
+## ADDED Requirements
+
+### Requirement: Ruta de consulta de quadlets
+
+El servidor SHALL exponer `GET /api/v1/quadlets/{name}` para leer la definición de una quadlet existente, devolviendo su tipo y sus campos. La respuesta SHALL usar la envoltura existente `{data}`/`{error}`. Si el fichero no existe, SHALL producirse `NotFound` (`not_found`, `404`).
+
+#### Scenario: Consulta correcta
+
+- **WHEN** se pide una quadlet existente por su nombre de fichero
+- **THEN** SHALL responder `200` con `{data}` conteniendo, al menos, el tipo (`kind`) y los campos de la quadlet
+
+#### Scenario: Consulta de inexistente
+
+- **WHEN** se pide un nombre de fichero que no existe en el directorio configurado
+- **THEN** la respuesta SHALL ser `NotFound` (`not_found`, `404`) con la misma envoltura
+
+### Requirement: Ruta de edición de quadlets
+
+El servidor SHALL exponer `PATCH /api/v1/quadlets/{name}` para actualizar una quadlet existente. La respuesta SHALL usar la envoltura existente `{data}`/`{error}`.
+
+#### Scenario: Edición correcta
+
+- **WHEN** se envía una petición válida de edición de una quadlet existente
+- **THEN** SHALL responder `200` con `{data}` conteniendo, al menos, el nombre de unidad afectado
+
+#### Scenario: Error de edición envuelto
+
+- **WHEN** la edición falla con un error tipado
+- **THEN** la respuesta SHALL usar `{error:{code,message}}` con el estado HTTP correspondiente al tipo de error
+
+### Requirement: Ruta de borrado de quadlets
+
+El servidor SHALL exponer `DELETE /api/v1/quadlets/{name}` para borrar una quadlet existente. La respuesta SHALL usar la envoltura existente `{data}`/`{error}`.
+
+#### Scenario: Borrado correcto
+
+- **WHEN** se envía una petición válida de borrado de una quadlet existente
+- **THEN** SHALL responder `200` con `{data}` confirmando el nombre de fichero borrado
+
+#### Scenario: Error de borrado envuelto
+
+- **WHEN** el borrado falla con un error tipado
+- **THEN** la respuesta SHALL usar `{error:{code,message}}` con el estado HTTP correspondiente al tipo de error
