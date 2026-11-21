@@ -55,6 +55,21 @@ const ERROR_FILE_NOT_FOUND: &str = "org.freedesktop.DBus.Error.FileNotFound";
 /// no la generó ningún fichero.
 const ERROR_UNKNOWN_PROPERTY: &str = "org.freedesktop.DBus.Error.UnknownProperty";
 
+/// El prefijo de los errores propios del gestor de systemd.
+///
+/// Todo lo que el gestor contesta por su cuenta —unidad enmascarada, que no se
+/// puede cargar, transacción destructiva o cíclica…— va bajo su espacio de
+/// nombres (`org.freedesktop.systemd1.*`). Es lo que distingue «el gestor dijo
+/// que no» de «no hubo respuesta que traducir».
+const PREFIJO_ERROR_SYSTEMD: &str = "org.freedesktop.systemd1.";
+
+/// Los errores que significan «esa unidad —o esa propiedad— no está».
+const ERRORES_DE_AUSENCIA: &[&str] = &[
+    ERROR_NO_SUCH_UNIT,
+    ERROR_FILE_NOT_FOUND,
+    ERROR_UNKNOWN_PROPERTY,
+];
+
 /// El modo con el que se pide una operación; `replace` es el que usa `systemctl`.
 const MODO: &str = "replace";
 
@@ -312,30 +327,132 @@ fn transporte(causa: impl std::error::Error + Send + Sync + 'static) -> SystemdE
 
 /// Traduce un error de D-Bus al de la capa.
 ///
-/// La traducción tiene un solo caso: si el fallo es que la unidad no está, se
-/// nombra la unidad y el error sale como `UnitNotFound` —y de ahí a un `404`—;
-/// cualquier otro se queda en fallo de transporte. El detalle del error de D-Bus
-/// no viaja nunca al cliente: lo consume el registro de `src/error.rs`.
+/// La traducción separa tres desenlaces que el bus mete en el mismo tipo: que la
+/// unidad no esté (`UnitNotFound`, y de ahí a un `404`), que el gestor haya
+/// contestado que **no** a la operación (`UnitRejected`, y de ahí a un `502`) y
+/// que no haya habido respuesta que traducir (`Transport`, y de ahí a un `503`).
+/// El detalle del error no viaja nunca al cliente: lo consume el registro de
+/// `src/error.rs`.
 fn traducir(unit: &UnitName, error: zbus::Error) -> SystemdError {
-    if es_ausencia(&error) {
-        return SystemdError::UnitNotFound {
+    match clase(&error) {
+        Clase::Ausencia => SystemdError::UnitNotFound {
             unit: unit.as_str().to_owned(),
-        };
+        },
+        Clase::Rechazo => SystemdError::UnitRejected {
+            unit: unit.as_str().to_owned(),
+            causa: Box::new(error),
+        },
+        Clase::Transporte => transporte(error),
+    }
+}
+
+/// A qué desenlace corresponde un fallo de D-Bus.
+///
+/// Aislar la decisión en un enumerado —y no resolverla con dos `if` sobre
+/// [`zbus::Error`]— es lo que la hace medible: la clase depende sólo del nombre
+/// del error, así que se puede comprobar sin fabricar un `Message` de D-Bus ni
+/// levantar un bus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Clase {
+    /// La unidad —o la propiedad— no está.
+    Ausencia,
+    /// El gestor contestó y dijo que no.
+    Rechazo,
+    /// No hubo respuesta que traducir.
+    Transporte,
+}
+
+/// La clase de un fallo de D-Bus.
+fn clase(error: &zbus::Error) -> Clase {
+    match error {
+        zbus::Error::MethodError(nombre, _, _) => clase_del_nombre(nombre.as_str()),
+        // Lo que no es un error de método no lo dijo el gestor: un `InputOutput`
+        // o un `Connection` son el bus que no llegó a contestar.
+        _ => Clase::Transporte,
+    }
+}
+
+/// La clase que corresponde al nombre de un error de D-Bus.
+fn clase_del_nombre(nombre: &str) -> Clase {
+    if ERRORES_DE_AUSENCIA.contains(&nombre) {
+        return Clase::Ausencia;
     }
 
-    transporte(error)
+    // Cualquier otro error del espacio de nombres del gestor es una negativa
+    // suya: `UnitMasked`, `LoadFailed`, `TransactionIsDestructive`,
+    // `TransactionOrderIsCyclic`, `UnitExists`… La lista no se cierra a mano
+    // para no traducir como avería de red un rechazo que systemd estrene.
+    if nombre.starts_with(PREFIJO_ERROR_SYSTEMD) {
+        return Clase::Rechazo;
+    }
+
+    Clase::Transporte
 }
 
 /// ¿El error de D-Bus significa «esa unidad —o esa propiedad— no está»?
 fn es_ausencia(error: &zbus::Error) -> bool {
-    let zbus::Error::MethodError(nombre, _, _) = error else {
-        return false;
+    matches!(clase(error), Clase::Ausencia)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::{
+        Clase, ERROR_FILE_NOT_FOUND, ERROR_NO_SUCH_UNIT, ERROR_UNKNOWN_PROPERTY, clase,
+        clase_del_nombre,
     };
 
-    [
-        ERROR_NO_SUCH_UNIT,
-        ERROR_FILE_NOT_FOUND,
-        ERROR_UNKNOWN_PROPERTY,
-    ]
-    .contains(&nombre.as_str())
+    /// Unidad que no está: los tres códigos que systemd usa para decirlo caen en
+    /// la misma clase, que es lo que permite dar un solo `404`.
+    #[test]
+    fn los_errores_de_ausencia_son_ausencia() {
+        for nombre in [
+            ERROR_NO_SUCH_UNIT,
+            ERROR_FILE_NOT_FOUND,
+            ERROR_UNKNOWN_PROPERTY,
+        ] {
+            assert_eq!(clase_del_nombre(nombre), Clase::Ausencia, "{nombre}");
+        }
+    }
+
+    /// Unidad enmascarada, que no se puede cargar, transacción destructiva o
+    /// cíclica: el gestor contestó que no, y eso es un rechazo —un `502`—, no un
+    /// fallo de transporte.
+    #[test]
+    fn los_errores_propios_del_gestor_son_rechazo() {
+        for nombre in [
+            "org.freedesktop.systemd1.UnitMasked",
+            "org.freedesktop.systemd1.LoadFailed",
+            "org.freedesktop.systemd1.TransactionIsDestructive",
+            "org.freedesktop.systemd1.TransactionOrderIsCyclic",
+            "org.freedesktop.systemd1.UnitExists",
+        ] {
+            assert_eq!(clase_del_nombre(nombre), Clase::Rechazo, "{nombre}");
+        }
+    }
+
+    /// Un error del bus —y no del gestor— no es una negativa a operar: se queda
+    /// como transporte. La lista de rechazos no se ensancha a todo lo que conteste
+    /// el bus, sólo al espacio de nombres de systemd.
+    #[test]
+    fn los_errores_del_bus_no_son_rechazo() {
+        assert_eq!(
+            clase_del_nombre("org.freedesktop.DBus.Error.AccessDenied"),
+            Clase::Transporte
+        );
+        assert_eq!(
+            clase_del_nombre("org.freedesktop.DBus.Error.Disconnected"),
+            Clase::Transporte
+        );
+    }
+
+    /// Un error que no es un error de método —el bus que no llegó a contestar— no
+    /// es un rechazo: es un transporte.
+    #[test]
+    fn un_fallo_de_io_es_transporte() {
+        let error = zbus::Error::InputOutput(Arc::new(std::io::Error::other("sin bus")));
+
+        assert_eq!(clase(&error), Clase::Transporte);
+    }
 }

@@ -404,6 +404,45 @@ mod tests {
         );
     }
 
+    /// Y un gestor que rechaza la operación —unidad enmascarada, no cargable— da
+    /// un `502`: contestó, pero dijo que no. No es un `503`, que es cuando no
+    /// contesta, ni un `404`, que es cuando la unidad no está.
+    #[tokio::test]
+    async fn un_gestor_que_rechaza_la_operacion_da_502_sin_filtrar_detalles() {
+        let entorno = entorno_con(Arc::new(DobleQueFalla::con(|| {
+            SystemdError::UnitRejected {
+                unit: "masked.service".to_owned(),
+                causa: Box::new(std::io::Error::other(
+                    "org.freedesktop.systemd1.UnitMasked: Unit masked.service is masked",
+                )),
+            }
+        })))
+        .await;
+
+        let (status, cuerpo) = peticion(
+            &entorno.app(),
+            Method::POST,
+            "/api/v1/units/masked.service/start",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(cuerpo["error"]["code"], "systemd_unit_rejected");
+        assert!(
+            cuerpo["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("masked.service"),
+            "el 502 tiene que nombrar la unidad: {cuerpo}"
+        );
+
+        let texto = cuerpo.to_string();
+        assert!(
+            !texto.contains("UnitMasked"),
+            "el 502 publicó el texto del gestor: {texto}"
+        );
+    }
+
     /// La ruta de la acción también pregunta al gestor por el estado de la unidad:
     /// un fallo al leerlo sale por el mismo camino que el de la acción.
     #[tokio::test]

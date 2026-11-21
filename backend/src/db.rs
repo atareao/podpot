@@ -33,6 +33,7 @@ pub enum DbError {
         /// El DSN tal y como llegó.
         dsn: String,
         /// El motivo, tal y como lo informó el lector.
+        #[source]
         causa: sqlx::Error,
     },
 

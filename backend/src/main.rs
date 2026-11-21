@@ -23,7 +23,7 @@ async fn main() -> ExitCode {
     // 1. Configuración. Un fallo no arranca el proceso, y el mensaje nombra la
     //    variable que falta y nunca su valor. Sale por `stderr` porque el registro
     //    todavía no está en pie.
-    let config = match Config::from_env() {
+    let mut config = match Config::from_env() {
         Ok(config) => config,
         Err(error) => {
             eprintln!("podpot no puede arrancar: {error}");
@@ -33,9 +33,15 @@ async fn main() -> ExitCode {
 
     // 2. Registro, con el filtro de la configuración.
     init_tracing(&config.log_filter);
+
+    // 3. El panel, contra el disco: definido **y** existente, o nada. Va después
+    //    de levantar el registro para que el aviso de un `PODPOT_STATIC_DIR` que
+    //    no existe llegue a alguien; un panel ausente no impide el arranque.
+    config.confirmar_panel();
+
     tracing::info!(config = %config.describe(), "configuración efectiva al arrancar");
 
-    // 3. La base, ya migrada: cuando `preparar` vuelve, el esquema está al día.
+    // 4. La base, ya migrada: cuando `preparar` vuelve, el esquema está al día.
     let pool = match db::preparar(&config.database_url).await {
         Ok(pool) => pool,
         Err(error) => {
@@ -46,7 +52,7 @@ async fn main() -> ExitCode {
 
     tracing::info!(systemd = %config.systemd_backend, "base lista");
 
-    // 4. El cliente de systemd. La elección se toma aquí y en ningún otro sitio:
+    // 5. El cliente de systemd. La elección se toma aquí y en ningún otro sitio:
     //    el estado se queda con el objeto que se le dé, así que ninguna ruta tiene
     //    que saber si por debajo hay bus o doble.
     let systemd = match cliente_de_systemd(config.systemd_backend).await {
@@ -58,7 +64,7 @@ async fn main() -> ExitCode {
         }
     };
 
-    // 5. Escucha y apagado: el estado se compone con las tres piezas ya resueltas.
+    // 6. Escucha y apagado: el estado se compone con las tres piezas ya resueltas.
     let estado = AppState::new(config, pool.clone(), systemd);
     let direccion = estado.bind_address();
 

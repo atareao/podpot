@@ -45,6 +45,9 @@ const CODE_UNIT_NOT_FOUND: &str = "unit_not_found";
 /// El código de una operación que systemd no pudo completar.
 const CODE_SYSTEMD_OPERATION_FAILED: &str = "systemd_operation_failed";
 
+/// El código de una operación que el gestor rechazó.
+const CODE_SYSTEMD_UNIT_REJECTED: &str = "systemd_unit_rejected";
+
 /// El código de una operación que no terminó en plazo.
 const CODE_SYSTEMD_TIMEOUT: &str = "systemd_timeout";
 
@@ -128,13 +131,14 @@ impl IntoResponse for AppError {
 /// Traduce un fallo de la capa de systemd al código y el mensaje que le tocan.
 ///
 /// La frontera es la que separa «lo que pidió quien llama está mal» de «el
-/// sistema no pudo»: una unidad que no existe es un `404` y una operación que no
-/// llega a su estado es un `502` —el fallo está en el gestor, no en podpot—,
-/// mientras que un bus que no contesta es un `503`, porque la petición está bien
-/// y lo que falta es poder atenderla ahora.
+/// sistema no pudo»: una unidad que no existe es un `404`; que el gestor diga
+/// que **no** a la operación —enmascarada, no cargable, transacción destructiva—
+/// es un `502`, y una operación que no llega a su estado, otro `502`: en los dos
+/// el fallo está en el gestor, no en podpot. Un bus que no contesta es un `503`,
+/// porque la petición está bien y lo que falta es poder atenderla ahora.
 ///
-/// Los dos `5xx` publican un mensaje propio que **nombra la unidad** y no copia
-/// ni el texto de la causa ni el resultado crudo del job.
+/// Los `5xx` publican un mensaje propio que **nombra la unidad** y no copia ni el
+/// texto de la causa ni el resultado crudo del job.
 fn traducir_systemd(causa: SystemdError) -> (StatusCode, &'static str, String) {
     match causa {
         SystemdError::UnitNotFound { unit } => (
@@ -142,11 +146,17 @@ fn traducir_systemd(causa: SystemdError) -> (StatusCode, &'static str, String) {
             CODE_UNIT_NOT_FOUND,
             format!("la unidad `{unit}` no existe"),
         ),
-        SystemdError::InvalidUnitName { name } => (
-            StatusCode::BAD_REQUEST,
-            CODE_BAD_REQUEST,
-            format!("`{name}` no es un nombre de unidad de systemd válido"),
-        ),
+        SystemdError::InvalidUnitName { name } => {
+            // El valor que llegó se queda en el registro: un `4xx` explica el
+            // motivo nombrando el campo, no repitiendo lo que mandó quien llama.
+            tracing::debug!(nombre = %name, "nombre de unidad rechazado");
+
+            (
+                StatusCode::BAD_REQUEST,
+                CODE_BAD_REQUEST,
+                "el nombre de unidad no es un nombre de systemd válido".to_owned(),
+            )
+        }
         SystemdError::OperationFailed {
             unit,
             action,
@@ -163,6 +173,19 @@ fn traducir_systemd(causa: SystemdError) -> (StatusCode, &'static str, String) {
                 StatusCode::BAD_GATEWAY,
                 CODE_SYSTEMD_OPERATION_FAILED,
                 format!("no se pudo completar la operación sobre la unidad `{unit}`"),
+            )
+        }
+        SystemdError::UnitRejected { unit, causa } => {
+            tracing::error!(
+                unit = %unit,
+                error = %causa,
+                "el gestor de systemd rechazó la operación"
+            );
+
+            (
+                StatusCode::BAD_GATEWAY,
+                CODE_SYSTEMD_UNIT_REJECTED,
+                format!("el gestor de systemd rechazó la operación sobre la unidad `{unit}`"),
             )
         }
         SystemdError::TimedOut { unit } => {
@@ -307,6 +330,52 @@ mod tests {
 
         assert_eq!(cuerpo["error"]["code"], "systemd_unavailable");
         assert_eq!(cuerpo["error"]["message"], SYSTEMD_UNAVAILABLE_MESSAGE);
+    }
+
+    /// Un nombre de unidad inválido da `400` y **no** repite el valor que llegó:
+    /// un `4xx` explica el motivo nombrando el campo, no devolviendo la entrada.
+    #[tokio::test]
+    async fn un_nombre_de_unidad_invalido_no_repite_el_valor() {
+        let respuesta = AppError::Systemd(SystemdError::InvalidUnitName {
+            name: "  <script>alert(1)</script>.service".to_owned(),
+        })
+        .into_response();
+
+        assert_eq!(respuesta.status(), StatusCode::BAD_REQUEST);
+
+        let texto = serde_json::to_string(&body_json(respuesta).await).expect("el cuerpo es JSON");
+
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&texto).expect("es JSON")["error"]["code"],
+            "bad_request"
+        );
+        assert!(
+            !texto.contains("script"),
+            "el 400 repitió el valor que llegó: {texto}"
+        );
+    }
+
+    /// Un gestor que rechaza la operación da `502` nombrando la unidad, sin
+    /// publicar la negativa del gestor.
+    #[tokio::test]
+    async fn un_rechazo_del_gestor_da_502_sin_filtrar_la_causa() {
+        let respuesta = AppError::Systemd(SystemdError::UnitRejected {
+            unit: "centinela-db.service".to_owned(),
+            causa: Box::new(std::io::Error::other(
+                "org.freedesktop.systemd1.UnitMasked: Unit is masked",
+            )),
+        })
+        .into_response();
+
+        assert_eq!(respuesta.status(), StatusCode::BAD_GATEWAY);
+
+        let texto = serde_json::to_string(&body_json(respuesta).await).expect("el cuerpo es JSON");
+
+        assert!(texto.contains("centinela-db.service"), "{texto}");
+        assert!(
+            !texto.contains("UnitMasked"),
+            "el 502 publicó la negativa del gestor: {texto}"
+        );
     }
 
     /// Un fallo interno no publica su causa: el detalle va al registro.

@@ -47,6 +47,15 @@ pub async fn entorno() -> Entorno {
     entorno_con(Arc::new(FakeSystemd::demo())).await
 }
 
+/// Un entorno con el doble de muestra y un panel estático servido desde `panel`.
+///
+/// Es la puerta de las pruebas del requisito «Servicio del panel»: la misma
+/// aplicación, con la única diferencia de que lo que no es de la API se sirve del
+/// directorio en vez de contestar el `404` de la casa.
+pub async fn entorno_con_panel(panel: &std::path::Path) -> Entorno {
+    montar(Arc::new(FakeSystemd::demo()), Some(panel)).await
+}
+
 /// Un entorno con el cliente de systemd que se le inyecte.
 ///
 /// Es la puerta que permite medir desenlaces que el doble de muestra no alcanza
@@ -54,6 +63,11 @@ pub async fn entorno() -> Entorno {
 /// es donde se decide el código HTTP: con un cliente cableado dentro del
 /// manejador, esos caminos sólo se podrían medir en la traducción suelta.
 pub async fn entorno_con(systemd: Arc<dyn SystemdClient>) -> Entorno {
+    montar(systemd, None).await
+}
+
+/// Compone el entorno: base temporal, configuración y estado.
+async fn montar(systemd: Arc<dyn SystemdClient>, panel: Option<&std::path::Path>) -> Entorno {
     let dir = tempfile::tempdir().expect("se tiene que poder crear un directorio temporal");
     let dsn = format!("sqlite://{}/podpot.db", dir.path().display());
 
@@ -65,18 +79,26 @@ pub async fn entorno_con(systemd: Arc<dyn SystemdClient>) -> Entorno {
         .expect("la base temporal de la prueba tiene que abrirse y migrarse");
 
     Entorno {
-        state: AppState::new(config_de_prueba(&dsn), pool, systemd),
+        state: AppState::new(config_de_prueba_con(&dsn, panel), pool, systemd),
         _dir: dir,
     }
 }
 
 /// La configuración que usan las pruebas: loopback en el puerto por defecto, la
 /// base temporal de la prueba y el doble de systemd, para no depender del bus.
-pub fn config_de_prueba(dsn: &str) -> Config {
+/// Con panel estático si se indica un directorio.
+pub fn config_de_prueba_con(dsn: &str, panel: Option<&std::path::Path>) -> Config {
+    let panel = panel.map(|ruta| {
+        ruta.to_str()
+            .expect("la ruta del panel de prueba es UTF-8")
+            .to_owned()
+    });
+
     Config::from_source(|clave| match clave {
         "BIND_ADDRESS" => Some("127.0.0.1:8080".to_owned()),
         "DATABASE_URL" => Some(dsn.to_owned()),
         "PODPOT_SYSTEMD" => Some("fake".to_owned()),
+        "PODPOT_STATIC_DIR" => panel.clone(),
         _ => None,
     })
     .expect("la configuración de prueba tiene que ser válida")
@@ -153,6 +175,35 @@ pub async fn peticion(app: &Router, method: Method, uri: &str) -> (StatusCode, s
     let status = respuesta.status();
 
     (status, body_json(respuesta).await)
+}
+
+/// Lanza una petición contra el router y devuelve el código y el cuerpo como
+/// texto.
+///
+/// Es lo que necesitan las pruebas del panel: su respuesta es el `index.html` o
+/// el fichero del build, no la envoltura JSON de la API.
+pub async fn peticion_texto(app: &Router, method: Method, uri: &str) -> (StatusCode, String) {
+    let respuesta = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(Body::empty())
+                .expect("la petición de prueba se construye siempre"),
+        )
+        .await
+        .expect("el router no puede fallar al atender");
+
+    let status = respuesta.status();
+    let bytes = respuesta
+        .into_body()
+        .collect()
+        .await
+        .expect("el cuerpo de la respuesta se puede leer")
+        .to_bytes();
+
+    (status, String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Lee el cuerpo de una respuesta como JSON.

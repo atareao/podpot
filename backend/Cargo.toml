@@ -26,6 +26,12 @@ dotenvy = "0.15.7"
 # es lo que lo hace compatible con el despacho dinámico.
 async-trait = "0.1.92"
 
+# El panel estático (`PODPOT_STATIC_DIR`) se sirve desde el propio backend con
+# `ServeDir`/`ServeFile`: sólo la feature `fs`, que es la que trae esos dos.
+# `tower-http` sin features por defecto para no arrastrar compresión ni
+# trazado, que aquí no se usan.
+tower-http = { version = "0.6.11", default-features = false, features = ["fs"] }
+
 # SQLite con `runtime-tokio` (el runtime de la app), `sqlite` (el driver),
 # `migrate` (el migrador embebido) y `macros` (`sqlx::migrate!()` lee
 # `backend/migrations/` en tiempo de compilación).

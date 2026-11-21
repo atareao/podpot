@@ -69,6 +69,24 @@ pub enum SystemdError {
         result: String,
     },
 
+    /// El gestor rechazó la operación sobre la unidad.
+    ///
+    /// No es un fallo de transporte: el bus contestó y fue el gestor el que dijo
+    /// que no —la unidad está enmascarada, no se puede cargar, la transacción que
+    /// pide es destructiva o cíclica…—. Tampoco es culpa de quien llama: el
+    /// sistema es el que se niega, y de ahí que sea un `502` y no un `4xx`.
+    ///
+    /// La causa va detrás de un `Box<dyn Error>` por la misma razón que en
+    /// [`SystemdError::Transport`]; el texto no sale al cliente.
+    #[error("el gestor rechazó la operación sobre `{unit}`: {causa}")]
+    UnitRejected {
+        /// Nombre de la unidad.
+        unit: String,
+        /// La negativa, tal y como la informó el gestor.
+        #[source]
+        causa: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     /// La operación no terminó dentro del plazo.
     #[error("la operación sobre `{unit}` no terminó en el plazo esperado")]
     TimedOut {
@@ -103,15 +121,21 @@ pub struct UnitName(String);
 impl UnitName {
     /// Valida y envuelve un nombre de unidad.
     ///
-    /// Se exige un sufijo conocido y se rechazan las barras: un nombre de unidad
+    /// Se exige un sufijo conocido y se rechazan las barras —un nombre de unidad
     /// no lleva rutas, y dejar pasar una convertiría el nombre en una ruta de
-    /// D-Bus arbitraria.
+    /// D-Bus arbitraria—, los espacios **interiores** y los caracteres de
+    /// control: systemd no admite ninguno de los dos en un nombre, y colarlos en
+    /// una ruta de D-Bus sería colar basura. No es una lista blanca de lo
+    /// permitido: `\`, `@` y `:` son válidos y siguen pasando.
     pub fn parse(name: &str) -> Result<Self, SystemdError> {
         let invalido = || SystemdError::InvalidUnitName {
             name: name.to_owned(),
         };
 
-        if name.is_empty() || name.contains('/') || name.trim() != name {
+        if name.is_empty()
+            || name.contains('/')
+            || name.chars().any(|c| c.is_whitespace() || c.is_control())
+        {
             return Err(invalido());
         }
 
@@ -625,6 +649,42 @@ mod tests {
                 matches!(error, SystemdError::InvalidUnitName { .. }),
                 "se esperaba un nombre inválido para {malo:?}: {error}"
             );
+        }
+    }
+
+    /// Un nombre con un espacio **interior** o un carácter de control se rechaza:
+    /// el sufijo lo delataría como válido, pero el nombre no lo es, y colarlo en
+    /// una ruta de D-Bus sería colar basura.
+    ///
+    /// No es una lista blanca: `\`, `@` y `:` siguen siendo válidos (ver
+    /// [`el_escape_cubre_todo_lo_que_no_es_alfanumerico`]).
+    #[test]
+    fn un_nombre_con_espacio_interior_o_control_se_rechaza() {
+        for malo in [
+            "foo bar.service",
+            "foo\nbar.service",
+            "foo\tbar.service",
+            "foo\rbar.service",
+            "foo\0bar.service",
+        ] {
+            let error = UnitName::parse(malo).expect_err("no puede colarse como nombre de unidad");
+
+            assert!(
+                matches!(error, SystemdError::InvalidUnitName { .. }),
+                "se esperaba un nombre inválido para {malo:?}: {error}"
+            );
+        }
+    }
+
+    /// Los caracteres que systemd sí admite —y que una lista blanca habría
+    /// tumbado por error— siguen pasando.
+    #[test]
+    fn los_caracteres_legitimos_siguen_siendo_validos() {
+        for bueno in [
+            "app-ca\\x2dautostart@autostart.service",
+            "dbus-:1.1-org.gnome.Identity@0.service",
+        ] {
+            UnitName::parse(bueno).expect("es un nombre de unidad válido");
         }
     }
 

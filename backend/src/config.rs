@@ -7,6 +7,7 @@
 
 use std::fmt;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::str::FromStr;
 
 use thiserror::Error;
@@ -30,6 +31,13 @@ pub const ENV_PREFIX: &str = "PODPOT_";
 
 /// El backend de systemd que debe usar el proceso.
 pub const SYSTEMD_VAR: &str = "PODPOT_SYSTEMD";
+
+/// El directorio del panel estático que sirve el propio backend.
+///
+/// La imagen de producción copia el build del panel a `/app/static` y exporta
+/// esta variable (ver `Containerfile`); en desarrollo, sin ella, el proceso
+/// arranca sólo como API.
+pub const STATIC_DIR_VAR: &str = "PODPOT_STATIC_DIR";
 
 /// La dirección de escucha por defecto: sólo loopback.
 ///
@@ -127,6 +135,12 @@ pub struct Config {
     pub log_filter: String,
     /// De dónde se lee el estado de las unidades.
     pub systemd_backend: SystemdBackend,
+    /// El directorio del panel estático, si el entorno pidió uno.
+    ///
+    /// Es lo que dijo `PODPOT_STATIC_DIR`, sin tocar el sistema de ficheros:
+    /// para saber si hay panel que servir hay que preguntarle al disco, y eso lo
+    /// hace [`Config::confirmar_panel`] —con el registro ya levantado—.
+    pub static_dir: Option<PathBuf>,
 }
 
 impl Config {
@@ -147,7 +161,33 @@ impl Config {
             log_filter: opcional(&leer, RUST_LOG_VAR)
                 .unwrap_or_else(|| DEFAULT_LOG_FILTER.to_owned()),
             systemd_backend: backend(&leer)?,
+            static_dir: static_dir(&leer),
         })
+    }
+
+    /// Confirma el panel estático: definido **y** existente, o nada.
+    ///
+    /// El chequeo contra el disco va aquí —y no al leer el entorno— porque el
+    /// registro todavía no está en pie cuando la configuración se lee, y el aviso
+    /// de un directorio que no existe se daría en el vacío. Se llama una vez, al
+    /// arrancar, con el registro ya levantado: un `PODPOT_STATIC_DIR` que apunta a
+    /// un directorio que no existe se descarta con un aviso —es un error de
+    /// despliegue, y callarlo dejaría un panel en blanco sin explicación— y el
+    /// proceso sigue en pie, sólo como API.
+    pub fn confirmar_panel(&mut self) {
+        let Some(dir) = self.static_dir.as_ref() else {
+            return;
+        };
+
+        if dir.is_dir() {
+            return;
+        }
+
+        tracing::warn!(
+            directorio = %dir.display(),
+            "`{STATIC_DIR_VAR}` apunta a un directorio que no existe: se arranca sólo como API"
+        );
+        self.static_dir = None;
     }
 
     /// Un volcado de la configuración para el registro de arranque.
@@ -157,8 +197,14 @@ impl Config {
     /// su configuración efectiva sin depender de qué DSN le hayan puesto.
     pub fn describe(&self) -> String {
         format!(
-            "bind_address={} systemd={} log_filter={}",
-            self.bind_address, self.systemd_backend, self.log_filter
+            "bind_address={} systemd={} log_filter={} panel={}",
+            self.bind_address,
+            self.systemd_backend,
+            self.log_filter,
+            match &self.static_dir {
+                Some(dir) => dir.display().to_string(),
+                None => "ausente".to_owned(),
+            }
         )
     }
 }
@@ -230,6 +276,16 @@ fn backend(leer: &impl Fn(&str) -> Option<String>) -> Result<SystemdBackend, Con
             ),
         }),
     }
+}
+
+/// El directorio del panel estático tal y como lo pidió el entorno.
+///
+/// Es `Some` sólo cuando `PODPOT_STATIC_DIR` está definida; aquí **no** se toca el
+/// sistema de ficheros. Que el directorio exista —y que por tanto haya panel que
+/// servir— lo confirma [`Config::confirmar_panel`] al arrancar, donde el registro
+/// ya está en pie para avisar de un directorio que no existe.
+fn static_dir(leer: &impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    Some(PathBuf::from(opcional(leer, STATIC_DIR_VAR)?))
 }
 
 #[cfg(test)]
@@ -395,6 +451,64 @@ mod tests {
         );
     }
 
+    /// Requisito «Servicio del panel»: sin `PODPOT_STATIC_DIR` no hay panel y la
+    /// configuración sigue siendo válida —la aplicación arranca sólo como API—.
+    #[test]
+    fn sin_podpot_static_dir_la_app_es_solo_api() {
+        let config = Config::from_source(minimo()).expect("la configuración mínima debe leerse");
+
+        assert_eq!(config.static_dir, None);
+    }
+
+    /// Requisito «Servicio del panel»: definido **y** existente, se sirve desde ahí.
+    #[test]
+    fn un_podpot_static_dir_que_existe_se_usa() {
+        let dir = tempfile::tempdir().expect("se tiene que poder crear un directorio temporal");
+        let ruta = dir.path().to_str().expect("la ruta de prueba es UTF-8");
+
+        let mut config = Config::from_source(fuente(&[
+            ("DATABASE_URL", "sqlite:///tmp/podpot.db"),
+            ("PODPOT_STATIC_DIR", ruta),
+        ]))
+        .expect("un directorio de panel existente es configuración válida");
+
+        config.confirmar_panel();
+
+        assert_eq!(config.static_dir.as_deref(), Some(dir.path()));
+    }
+
+    /// El entorno pide un panel, pero quien sabe si existe es el disco: leer la
+    /// configuración no toca el sistema de ficheros.
+    #[test]
+    fn podpot_static_dir_se_lee_tal_y_como_llega() {
+        let config = Config::from_source(fuente(&[
+            ("DATABASE_URL", "sqlite:///tmp/podpot.db"),
+            ("PODPOT_STATIC_DIR", "/no/existe/este/panel"),
+        ]))
+        .expect("un panel ausente no puede impedir el arranque");
+
+        assert_eq!(
+            config.static_dir.as_deref(),
+            Some(std::path::Path::new("/no/existe/este/panel"))
+        );
+    }
+
+    /// Y al confirmarlo contra el disco, uno que no existe se descarta —con el
+    /// aviso que el arranque ya puede dar—: definido pero inexistente **no**
+    /// rompe el arranque, se arranca sólo como API.
+    #[test]
+    fn un_podpot_static_dir_inexistente_se_descarta_al_confirmar() {
+        let mut config = Config::from_source(fuente(&[
+            ("DATABASE_URL", "sqlite:///tmp/podpot.db"),
+            ("PODPOT_STATIC_DIR", "/no/existe/este/panel"),
+        ]))
+        .expect("un panel ausente no puede impedir el arranque");
+
+        config.confirmar_panel();
+
+        assert_eq!(config.static_dir, None);
+    }
+
     /// El volcado de arranque no puede publicar el valor de las variables que no son
     /// suyas: describe lo que sí puede contar.
     #[test]
@@ -409,5 +523,9 @@ mod tests {
 
         assert!(descrito.contains("127.0.0.1:9999"), "{descrito}");
         assert!(descrito.contains("dbus"), "{descrito}");
+        assert!(
+            descrito.contains("panel=ausente"),
+            "el volcado tiene que decir si hay panel: {descrito}"
+        );
     }
 }
