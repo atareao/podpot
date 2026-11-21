@@ -50,6 +50,12 @@ pub fn router(state: AppState) -> Router {
         .route("/units", get(units::listar))
         .route("/units/{name}/{action}", post(units::accionar))
         .route("/quadlets", post(quadlets::crear))
+        .route(
+            "/quadlets/{name}",
+            get(quadlets::leer)
+                .patch(quadlets::editar)
+                .delete(quadlets::borrar),
+        )
         .fallback(ruta_inexistente)
         .method_not_allowed_fallback(metodo_no_permitido);
 

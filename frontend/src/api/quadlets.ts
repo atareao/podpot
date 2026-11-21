@@ -1,5 +1,10 @@
 import { peticion } from './client'
-import type { PeticionDeCreacion, QuadletCreada } from '../types/api'
+import type {
+  PeticionDeCreacion,
+  QuadletAfectada,
+  QuadletCreada,
+  QuadletDetalle,
+} from '../types/api'
 
 /**
  * `POST /api/v1/quadlets`: crea una quadlet a partir de su nombre, tipo y campos.
@@ -11,4 +16,41 @@ import type { PeticionDeCreacion, QuadletCreada } from '../types/api'
  */
 export function crearQuadlet(datos: PeticionDeCreacion): Promise<QuadletCreada> {
   return peticion<QuadletCreada>('/quadlets', { method: 'POST', cuerpo: datos })
+}
+
+/**
+ * `GET /api/v1/quadlets/{name}`: lee la definición de una quadlet existente.
+ *
+ * `nombre` es el nombre de fichero completo (`web.container`) —la identidad—,
+ * no el de unidad. La respuesta trae el tipo y los campos con los que se
+ * precarga el formulario; un fichero que no existe da `404` (`not_found`).
+ */
+export function obtenerQuadlet(nombre: string, signal?: AbortSignal): Promise<QuadletDetalle> {
+  return peticion<QuadletDetalle>(`/quadlets/${encodeURIComponent(nombre)}`, { signal })
+}
+
+/**
+ * `PATCH /api/v1/quadlets/{name}`: reescribe una quadlet existente.
+ *
+ * `nombre` es el **nombre de fichero completo** (`web.container`) —la identidad
+ * de la quadlet—, no el nombre de unidad (`web.service`). El cuerpo es el mismo
+ * contrato tipado de la creación, plano y sin contenido de fichero.
+ */
+export function editarQuadlet(nombre: string, datos: PeticionDeCreacion): Promise<QuadletAfectada> {
+  return peticion<QuadletAfectada>(`/quadlets/${encodeURIComponent(nombre)}`, {
+    method: 'PATCH',
+    cuerpo: datos,
+  })
+}
+
+/**
+ * `DELETE /api/v1/quadlets/{name}`: borra una quadlet existente.
+ *
+ * Como en la edición, `nombre` es el nombre de fichero completo. La petición no
+ * lleva cuerpo.
+ */
+export function borrarQuadlet(nombre: string): Promise<QuadletAfectada> {
+  return peticion<QuadletAfectada>(`/quadlets/${encodeURIComponent(nombre)}`, {
+    method: 'DELETE',
+  })
 }

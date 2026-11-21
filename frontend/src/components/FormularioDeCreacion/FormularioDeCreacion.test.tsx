@@ -72,4 +72,46 @@ describe('formulario de creación de quadlets', () => {
     await waitFor(() => expect(alCrear).toHaveBeenCalledTimes(1))
     expect(screen.getByLabelText('Nombre')).toHaveValue('web')
   })
+
+  it('en modo edición precarga el tipo y el nombre, y no deja tocarlos', async () => {
+    const usuario = userEvent.setup()
+    const alCrear = vi.fn().mockResolvedValue(true)
+    render(
+      <FormularioDeCreacion
+        onCrear={alCrear}
+        valoresIniciales={{ kind: 'volume', name: 'web-data' }}
+        etiquetaDeEnvio="Guardar"
+        identidadFija
+        alCancelar={vi.fn()}
+      />,
+    )
+
+    // El volumen precargado no pide imagen; el nombre sale del stem, fijo.
+    expect(screen.getByLabelText('Nombre')).toHaveValue('web-data')
+    expect(screen.queryByLabelText('Imagen')).not.toBeInTheDocument()
+
+    await usuario.click(screen.getByRole('button', { name: 'Guardar' }))
+
+    await waitFor(() =>
+      expect(alCrear).toHaveBeenCalledWith({ name: 'web-data', kind: 'volume' }),
+    )
+  })
+
+  it('no pinta el botón de cancelar si no hay acción de cancelar', () => {
+    render(<FormularioDeCreacion onCrear={vi.fn()} />)
+
+    expect(screen.queryByRole('button', { name: 'Cancelar' })).not.toBeInTheDocument()
+  })
+
+  it('avisa al cancelar sin enviar nada', async () => {
+    const usuario = userEvent.setup()
+    const alCrear = vi.fn()
+    const alCancelar = vi.fn()
+    render(<FormularioDeCreacion onCrear={alCrear} alCancelar={alCancelar} />)
+
+    await usuario.click(screen.getByRole('button', { name: 'Cancelar' }))
+
+    expect(alCancelar).toHaveBeenCalledTimes(1)
+    expect(alCrear).not.toHaveBeenCalled()
+  })
 })

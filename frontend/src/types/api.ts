@@ -77,6 +77,33 @@ export interface QuadletCreada {
   kind: TipoDeQuadlet
 }
 
+/**
+ * Resultado de `PATCH`/`DELETE /api/v1/quadlets/{name}` sobre una quadlet
+ * existente.
+ *
+ * Espejo de `QuadletOutcome` (`backend/src/api/quadlets.rs`), la misma forma que
+ * devuelve la creación: el fichero afectado, su nombre de unidad y su tipo.
+ */
+export interface QuadletAfectada {
+  /** Nombre del fichero afectado (`web.container`). */
+  file_name: string
+  /** Nombre de unidad afectado (`web.service`). */
+  unit_name: string
+  /** Tipo de la quadlet afectada. */
+  kind: TipoDeQuadlet
+}
+
+/**
+ * Definición leída de una quadlet (`GET /api/v1/quadlets/{name}`).
+ *
+ * Es el mismo contrato **plano** de la escritura —lo que el servidor lee del
+ * fichero y con lo que lo vuelve a renderizar—: el `GET` no añade ni el nombre de
+ * fichero ni el de unidad, que el panel ya conoce por la fila. El alias existe
+ * para que el sentido de la lectura se lea en las firmas, no para modelar campos
+ * que la API no manda.
+ */
+export type QuadletDetalle = PeticionDeCreacion
+
 /** Acciones de control admitidas por la API. */
 export type AccionDeUnidad = 'start' | 'stop' | 'restart'
 

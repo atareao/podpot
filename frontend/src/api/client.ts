@@ -27,7 +27,7 @@ export class ErrorDeRed extends Error {
 }
 
 export interface OpcionesDePeticion {
-  method?: 'GET' | 'POST' | 'PUT' | 'DELETE'
+  method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
   /** Cuerpo de la petición; se serializa a JSON. */
   cuerpo?: unknown
   signal?: AbortSignal

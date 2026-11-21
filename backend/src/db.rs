@@ -239,7 +239,59 @@ mod tests {
                 .await
                 .expect("el registro de migraciones tiene que existir");
 
-        assert_eq!(aplicadas, 2, "se esperaban dos migraciones aplicadas");
+        assert_eq!(aplicadas, 3, "se esperaban tres migraciones aplicadas");
+    }
+
+    /// Requisito «Registro de ediciones y borrados»: la migración nueva introduce
+    /// la tabla de operaciones, con su tipo, su nombre de fichero y su marca
+    /// temporal rellenada sola.
+    #[tokio::test]
+    async fn la_tabla_de_operaciones_existe_tras_migrar() {
+        let (_dir, dsn) = base_temporal();
+        let pool = preparar(&dsn)
+            .await
+            .expect("la base temporal tiene que abrirse");
+
+        sqlx::query("INSERT INTO quadlet_operations (operation, file_name) VALUES (?, ?)")
+            .bind("edit")
+            .bind("web.container")
+            .execute(&pool)
+            .await
+            .expect("la tabla de operaciones tiene que existir tras migrar");
+
+        let (operacion, fichero, marca): (String, String, String) =
+            sqlx::query_as("SELECT operation, file_name, occurred_at FROM quadlet_operations")
+                .fetch_one(&pool)
+                .await
+                .expect("el registro tiene que poder leerse");
+
+        assert_eq!(operacion, "edit");
+        assert_eq!(fichero, "web.container");
+        assert!(
+            !marca.is_empty(),
+            "la marca temporal tiene que rellenarse sola"
+        );
+    }
+
+    /// La tabla sólo admite los dos tipos de operación que podpot registra.
+    #[tokio::test]
+    async fn la_tabla_de_operaciones_rechaza_un_tipo_desconocido() {
+        let (_dir, dsn) = base_temporal();
+        let pool = preparar(&dsn)
+            .await
+            .expect("la base temporal tiene que abrirse");
+
+        let resultado =
+            sqlx::query("INSERT INTO quadlet_operations (operation, file_name) VALUES (?, ?)")
+                .bind("renombrar")
+                .bind("web.container")
+                .execute(&pool)
+                .await;
+
+        assert!(
+            resultado.is_err(),
+            "un tipo de operación desconocido no puede registrarse"
+        );
     }
 
     /// Requisito «Migraciones embebidas»: aplicarlas dos veces no rompe nada ni
@@ -261,7 +313,7 @@ mod tests {
                 .await
                 .expect("el registro de migraciones tiene que existir");
 
-        assert_eq!(aplicadas, 2, "la migración se aplicó más de una vez");
+        assert_eq!(aplicadas, 3, "la migración se aplicó más de una vez");
     }
 
     /// Escenario «Directorio ausente»: si el directorio del DSN no existe, el
