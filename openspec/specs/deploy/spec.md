@@ -1,10 +1,9 @@
-# Spec Delta — deploy
+# deploy Specification
 
 ## Purpose
-
 El empaquetado de podpot como contenedor rootless capaz de hablar con el systemd y el Podman del host.
 
-## ADDED Requirements
+## Requirements
 
 ### Requirement: Imagen autocontenida
 
@@ -28,3 +27,12 @@ El despliegue de referencia SHALL montar el bus de usuario, el directorio de qua
 
 - **WHEN** el contenedor corre sin el bus de usuario montado
 - **THEN** la aplicación SHALL informar de forma explícita de que no puede alcanzar systemd, en vez de fallar de forma opaca
+
+### Requirement: Panel incorporado
+
+La imagen SHALL incorporar el build del panel y servirlo desde el propio backend (un único contenedor autocontenido), sin depender de un servidor web externo.
+
+#### Scenario: Panel servido por el contenedor
+
+- **WHEN** el contenedor arranca con los montajes de producción
+- **THEN** `GET /` SHALL devolver el panel y `GET /api/v1/health` SHALL responder `200`

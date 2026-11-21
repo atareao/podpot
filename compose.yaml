@@ -1,0 +1,58 @@
+# Despliegue de podpot — panel de quadlets de Podman (systemd de usuario).
+#
+# podpot controla las quadlets de la instancia ROOTLESS del usuario: habla con
+# el systemd de usuario por D-Bus y con el Podman rootless por su socket. Por eso
+# necesita los montajes de abajo y, sobre todo, `userns_mode: keep-id`.
+#
+# Requisito en el host (UNA vez):  loginctl enable-linger $USER
+#   Sin `linger` no existen ni el bus de usuario ni el Podman rootless cuando no
+#   hay sesión abierta, y el contenedor no arranca.
+#
+# El uid del host sale de `PODPOT_UID` (por defecto 1000): el bus, el socket y
+# los quadlets viven en `/run/user/<uid>` y en `$HOME`. Construye la imagen con
+# el MISMO uid para que `keep-id` encaje:
+#
+#   podman build --format docker \
+#     --build-arg PODPOT_UID=$(id -u) --build-arg PODPOT_GID=$(id -g) \
+#     -t localhost/podpot:dev .
+#
+services:
+  podpot:
+    image: localhost/podpot:dev
+    container_name: podpot
+    restart: always
+    ports:
+      - "8080:8080"
+    # IMPRESCINDIBLE (spike validado): sin `keep-id` el bus montado existe pero
+    # NO responde (`Did not receive a reply`). El proceso corre con el uid del
+    # host, de ahí que la imagen se construya con ese uid.
+    userns_mode: keep-id
+    environment:
+      # Bus de sesión de systemd (D-Bus de usuario).
+      DBUS_SESSION_BUS_ADDRESS: unix:path=/run/user/${PODPOT_UID:-1000}/bus
+      XDG_RUNTIME_DIR: /run/user/${PODPOT_UID:-1000}
+      # El defecto del binario es loopback; en el contenedor hay que abrirlo.
+      BIND_ADDRESS: 0.0.0.0:8080
+      DATABASE_URL: sqlite:///app/data/podpot.db
+      # El backend sirve el panel desde aquí (copia de frontend/dist en la imagen).
+      PODPOT_STATIC_DIR: /app/static
+      # Explícito aunque sea el valor por defecto: el modo de verdad es D-Bus.
+      PODPOT_SYSTEMD: dbus
+      RUST_LOG: info
+      # systemd reporta los quadlets por su ruta ABSOLUTA del host
+      # (`FragmentPath`), así que el HOME dentro del contenedor debe ser el del
+      # host para que el panel pueda abrir esos ficheros.
+      HOME: ${HOME}
+    volumes:
+      # Bus de sesión del usuario (D-Bus de systemd).
+      - /run/user/${PODPOT_UID:-1000}:/run/user/${PODPOT_UID:-1000}
+      # Socket de Podman rootless. Queda dentro del montaje anterior; se declara
+      # explícito porque es la API que el panel consulta.
+      - /run/user/${PODPOT_UID:-1000}/podman/podman.sock:/run/user/${PODPOT_UID:-1000}/podman/podman.sock
+      # Quadlets del usuario, en la MISMA ruta que en el host (ver `HOME`).
+      - ${HOME}/.config/containers/systemd:${HOME}/.config/containers/systemd
+      # Persistencia interna (SQLite) de la aplicación.
+      - podpot_data:/app/data
+
+volumes:
+  podpot_data:

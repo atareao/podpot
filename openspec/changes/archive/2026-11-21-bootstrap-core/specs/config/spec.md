@@ -33,3 +33,22 @@ Las variables obligatorias SHALL exigirse al arrancar; su ausencia SHALL ser un 
 
 - **WHEN** `DATABASE_URL` no está definida
 - **THEN** el arranque SHALL fallar nombrando `DATABASE_URL`
+
+### Requirement: Servicio del panel
+
+La aplicación SHALL servir el panel estático desde el directorio indicado por `PODPOT_STATIC_DIR` cuando esté definido y exista, con reserva a `index.html` para rutas que no son de la API (SPA). Si no está definido, la aplicación SHALL funcionar solo como API.
+
+#### Scenario: Panel en la raíz
+
+- **WHEN** `PODPOT_STATIC_DIR` apunta al build del panel y se pide `/`
+- **THEN** SHALL responder con el `index.html` del panel
+
+#### Scenario: Ruta SPA desconocida
+
+- **WHEN** se pide una ruta que no es de la API y no corresponde a un fichero
+- **THEN** SHALL responder el `index.html` del panel (reserva SPA), no el `404` de la envoltura
+
+#### Scenario: Sin panel configurado
+
+- **WHEN** `PODPOT_STATIC_DIR` no está definido
+- **THEN** la aplicación SHALL servir solo `/api/v1/*` y el arranque SHALL seguir siendo correcto
