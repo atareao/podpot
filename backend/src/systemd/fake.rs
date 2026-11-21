@@ -14,6 +14,7 @@
 //! pruebas estarían midiendo el doble y no la aplicación.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use async_trait::async_trait;
@@ -32,6 +33,12 @@ pub struct FakeSystemd {
     /// ser estable: un panel que cambia el orden entre dos peticiones idénticas
     /// es un panel que parece roto.
     unidades: Mutex<BTreeMap<String, UnitStatus>>,
+    /// Cuántas recargas se le han pedido.
+    ///
+    /// Un contador y no un `bool`: lo que las pruebas miden es que la recarga
+    /// **ocurre** —una por creación—, y con un booleano una recarga de más
+    /// pasaría desapercibida.
+    recargas: AtomicU32,
 }
 
 impl Default for FakeSystemd {
@@ -45,6 +52,7 @@ impl FakeSystemd {
     pub fn new() -> Self {
         Self {
             unidades: Mutex::new(BTreeMap::new()),
+            recargas: AtomicU32::new(0),
         }
     }
 
@@ -88,6 +96,11 @@ impl FakeSystemd {
                 ),
             },
         ])
+    }
+
+    /// Cuántas recargas se le han pedido.
+    pub fn recargas(&self) -> u32 {
+        self.recargas.load(Ordering::SeqCst)
     }
 
     /// Toma el candado de las unidades sin poder entrar en pánico.
@@ -156,5 +169,13 @@ impl SystemdClient for FakeSystemd {
         }
 
         Ok(estado.clone())
+    }
+
+    async fn reload(&self) -> Result<(), SystemdError> {
+        // No hay nada que recargar —el doble no lee ficheros—, pero la llamada
+        // se apunta: lo que las pruebas miden es que la creación la haga.
+        self.recargas.fetch_add(1, Ordering::SeqCst);
+
+        Ok(())
     }
 }

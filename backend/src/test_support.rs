@@ -28,6 +28,12 @@ pub struct Entorno {
     /// borra cuando el valor se suelta: sin esta referencia, la base desaparecería
     /// en mitad de la prueba.
     _dir: tempfile::TempDir,
+    /// El directorio de quadlets de la prueba.
+    ///
+    /// Es temporal y **propio de cada entorno**, para que una prueba no escriba
+    /// donde otra mira. Vive aquí por la misma razón que el de la base: soltarlo
+    /// lo borraría antes de que la prueba termine.
+    _quadlets: tempfile::TempDir,
 }
 
 impl Entorno {
@@ -39,6 +45,11 @@ impl Entorno {
     /// El estado, para las pruebas que no pasan por HTTP.
     pub fn state(&self) -> &AppState {
         &self.state
+    }
+
+    /// El directorio en el que la creación escribe las quadlets.
+    pub fn quadlet_dir(&self) -> &std::path::Path {
+        &self.state.config.quadlet_dir
     }
 }
 
@@ -78,27 +89,46 @@ async fn montar(systemd: Arc<dyn SystemdClient>, panel: Option<&std::path::Path>
         .await
         .expect("la base temporal de la prueba tiene que abrirse y migrarse");
 
+    // El directorio de quadlets también es temporal: la creación **escribe** en
+    // él, así que no puede apuntar al del usuario que compila.
+    let quadlets = tempfile::tempdir().expect("se tiene que poder crear un directorio temporal");
+
     Entorno {
-        state: AppState::new(config_de_prueba_con(&dsn, panel), pool, systemd),
+        state: AppState::new(
+            config_de_prueba_con(&dsn, panel, quadlets.path()),
+            pool,
+            systemd,
+        ),
         _dir: dir,
+        _quadlets: quadlets,
     }
 }
 
 /// La configuración que usan las pruebas: loopback en el puerto por defecto, la
-/// base temporal de la prueba y el doble de systemd, para no depender del bus.
-/// Con panel estático si se indica un directorio.
-pub fn config_de_prueba_con(dsn: &str, panel: Option<&std::path::Path>) -> Config {
+/// base temporal de la prueba, un directorio de quadlets temporal y el doble de
+/// systemd, para no depender del bus. Con panel estático si se indica un
+/// directorio.
+pub fn config_de_prueba_con(
+    dsn: &str,
+    panel: Option<&std::path::Path>,
+    quadlets: &std::path::Path,
+) -> Config {
     let panel = panel.map(|ruta| {
         ruta.to_str()
             .expect("la ruta del panel de prueba es UTF-8")
             .to_owned()
     });
+    let quadlets = quadlets
+        .to_str()
+        .expect("la ruta de quadlets de prueba es UTF-8")
+        .to_owned();
 
     Config::from_source(|clave| match clave {
         "BIND_ADDRESS" => Some("127.0.0.1:8080".to_owned()),
         "DATABASE_URL" => Some(dsn.to_owned()),
         "PODPOT_SYSTEMD" => Some("fake".to_owned()),
         "PODPOT_STATIC_DIR" => panel.clone(),
+        "PODPOT_QUADLET_DIR" => Some(quadlets.clone()),
         _ => None,
     })
     .expect("la configuración de prueba tiene que ser válida")
@@ -156,6 +186,10 @@ impl SystemdClient for DobleQueFalla {
     ) -> Result<crate::systemd::UnitStatus, SystemdError> {
         Err(self.error())
     }
+
+    async fn reload(&self) -> Result<(), SystemdError> {
+        Err(self.error())
+    }
 }
 
 /// Lanza una petición contra el router y devuelve el código y el cuerpo JSON.
@@ -164,6 +198,35 @@ pub async fn peticion(app: &Router, method: Method, uri: &str) -> (StatusCode, s
         .method(method)
         .uri(uri)
         .body(Body::empty())
+        .expect("la petición de prueba se construye siempre");
+
+    let respuesta = app
+        .clone()
+        .oneshot(peticion)
+        .await
+        .expect("el router no puede fallar al atender");
+
+    let status = respuesta.status();
+
+    (status, body_json(respuesta).await)
+}
+
+/// Lanza una petición con un cuerpo JSON contra el router.
+///
+/// Es la mitad que [`peticion`] no cubre: las rutas que leen un cuerpo —la de
+/// creación de quadlets— necesitan que el JSON llegue de verdad, y con el
+/// `Content-Type` puesto, o axum no lo mira.
+pub async fn peticion_json(
+    app: &Router,
+    method: Method,
+    uri: &str,
+    cuerpo: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let peticion = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(Body::from(cuerpo.to_string()))
         .expect("la petición de prueba se construye siempre");
 
     let respuesta = app

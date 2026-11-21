@@ -39,6 +39,21 @@ pub const SYSTEMD_VAR: &str = "PODPOT_SYSTEMD";
 /// arranca sólo como API.
 pub const STATIC_DIR_VAR: &str = "PODPOT_STATIC_DIR";
 
+/// El directorio canónico en el que se escriben las quadlets nuevas.
+///
+/// Es el **destino** de la creación, y no el origen: podpot escribe la definición
+/// donde el generador de systemd la busca, sin factoría de symlinks (ver
+/// `docs/creacion-quadlets`). Se valida contra el disco al leer la configuración:
+/// un destino que no es un directorio impide arrancar, porque arrancar con un
+/// destino imposible sólo serviría para fallar en la primera creación.
+pub const QUADLET_DIR_VAR: &str = "PODPOT_QUADLET_DIR";
+
+/// El `$HOME` con el que se compone el directorio de quadlets por defecto.
+///
+/// **No** es una variable de podpot y por eso no lleva el prefijo: es la del
+/// sistema, y sólo se lee para resolver el defecto de [`QUADLET_DIR_VAR`].
+pub const HOME_VAR: &str = "HOME";
+
 /// La dirección de escucha por defecto: sólo loopback.
 ///
 /// El defecto es loopback a propósito: podpot controla contenedores del usuario y
@@ -141,6 +156,11 @@ pub struct Config {
     /// para saber si hay panel que servir hay que preguntarle al disco, y eso lo
     /// hace [`Config::confirmar_panel`] —con el registro ya levantado—.
     pub static_dir: Option<PathBuf>,
+    /// El directorio canónico en el que se escriben las quadlets nuevas.
+    ///
+    /// A diferencia del panel, **sí** se valida contra el disco al leerlo: es el
+    /// destino de la creación, y un destino que no existe no se puede crear.
+    pub quadlet_dir: PathBuf,
 }
 
 impl Config {
@@ -162,6 +182,7 @@ impl Config {
                 .unwrap_or_else(|| DEFAULT_LOG_FILTER.to_owned()),
             systemd_backend: backend(&leer)?,
             static_dir: static_dir(&leer),
+            quadlet_dir: quadlet_dir(&leer)?,
         })
     }
 
@@ -197,14 +218,15 @@ impl Config {
     /// su configuración efectiva sin depender de qué DSN le hayan puesto.
     pub fn describe(&self) -> String {
         format!(
-            "bind_address={} systemd={} log_filter={} panel={}",
+            "bind_address={} systemd={} log_filter={} panel={} quadlets={}",
             self.bind_address,
             self.systemd_backend,
             self.log_filter,
             match &self.static_dir {
                 Some(dir) => dir.display().to_string(),
                 None => "ausente".to_owned(),
-            }
+            },
+            self.quadlet_dir.display()
         )
     }
 }
@@ -288,6 +310,39 @@ fn static_dir(leer: &impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
     Some(PathBuf::from(opcional(leer, STATIC_DIR_VAR)?))
 }
 
+/// El directorio de quadlets: el que pida la variable, o el del `$HOME`.
+///
+/// A diferencia del panel estático, aquí sí se pregunta al disco —y se falla—:
+/// el destino de la creación tiene que ser un directorio de verdad, y arrancar
+/// con uno imposible sólo serviría para fallar en la primera creación con un
+/// mensaje peor. Un `PODPOT_QUADLET_DIR` mal puesto es un error de quien
+/// despliega, y el error lo nombra a él y nunca el valor.
+fn quadlet_dir(leer: &impl Fn(&str) -> Option<String>) -> Result<PathBuf, ConfigError> {
+    // Una variable definida manda: se valida contra el disco y, si no es un
+    // directorio, el arranque falla. No se cae en silencio al defecto —quien la
+    // puso creía que se iba a usar, y resolverlo a la callada escribiría donde no
+    // se pidió—.
+    if let Some(ruta) = opcional(leer, QUADLET_DIR_VAR) {
+        let ruta = PathBuf::from(ruta);
+
+        if ruta.is_dir() {
+            return Ok(ruta);
+        }
+
+        return Err(ConfigError::Invalid {
+            var: QUADLET_DIR_VAR,
+            causa: "el valor no es un directorio existente".to_owned(),
+        });
+    }
+
+    // Sin variable, el destino cuelga del home del usuario. Sin `$HOME` no hay
+    // defecto que componer: se falla nombrando la variable en vez de inventarse
+    // un directorio.
+    let home = obligatoria(leer, HOME_VAR)?;
+
+    Ok(PathBuf::from(home).join(".config/containers/systemd"))
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -295,10 +350,16 @@ mod tests {
     use super::{Config, ConfigError, DEFAULT_BIND_ADDRESS, SystemdBackend};
 
     /// Un entorno con sólo las variables indicadas: el resto se lee como ausente.
+    ///
+    /// `HOME` entra siempre, y al final, para que el defecto del directorio de
+    /// quadlets se resuelva sin que cada prueba tenga que acordarse: como la
+    /// búsqueda se queda con la **primera** coincidencia, una prueba que declare
+    /// su propio `HOME` sigue mandando.
     fn fuente(pares: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
         let pares: Vec<(String, String)> = pares
             .iter()
             .map(|(clave, valor)| ((*clave).to_owned(), (*valor).to_owned()))
+            .chain([(super::HOME_VAR.to_owned(), "/home/tester".to_owned())])
             .collect();
 
         move |clave: &str| {
@@ -527,5 +588,113 @@ mod tests {
             descrito.contains("panel=ausente"),
             "el volcado tiene que decir si hay panel: {descrito}"
         );
+    }
+
+    /// Escenario «Valor por defecto»: sin `PODPOT_QUADLET_DIR` el destino es
+    /// `$HOME/.config/containers/systemd`.
+    #[test]
+    fn sin_podpot_quadlet_dir_el_destino_cuelga_del_home() {
+        let config = Config::from_source(minimo()).expect("la configuración mínima debe leerse");
+
+        assert_eq!(
+            config.quadlet_dir,
+            std::path::Path::new("/home/tester/.config/containers/systemd"),
+            "el defecto del directorio de quadlets tiene que ser el del usuario"
+        );
+
+        assert!(
+            config.describe().contains("quadlets="),
+            "el volcado de arranque tiene que decir dónde escribe: {}",
+            config.describe()
+        );
+    }
+
+    /// Sin `$HOME` no hay defecto que componer, y el error lo dice: no se
+    /// inventa un directorio.
+    #[test]
+    fn sin_home_no_hay_directorio_de_quadlets_por_defecto() {
+        let error = Config::from_source(|clave| match clave {
+            "DATABASE_URL" => Some("sqlite:///tmp/podpot.db".to_owned()),
+            _ => None,
+        })
+        .expect_err("sin HOME no se puede resolver el defecto");
+
+        assert_eq!(
+            error,
+            ConfigError::Missing { var: "HOME" },
+            "el error tiene que nombrar la variable que falta: {error}"
+        );
+    }
+
+    /// Escenario «Valor no es un directorio»: el arranque falla nombrando la
+    /// variable, nunca el valor.
+    #[test]
+    fn un_podpot_quadlet_dir_que_no_es_directorio_no_arranca() {
+        let dir = tempfile::tempdir().expect("se tiene que poder crear un directorio temporal");
+        let fichero = dir.path().join("no-es-un-directorio");
+        std::fs::write(&fichero, "no soy un directorio").expect("el fichero de prueba se escribe");
+        let ruta = fichero.to_str().expect("la ruta de prueba es UTF-8");
+
+        let error = Config::from_source(fuente(&[
+            ("DATABASE_URL", "sqlite:///tmp/podpot.db"),
+            ("PODPOT_QUADLET_DIR", ruta),
+        ]))
+        .expect_err("un destino que no es un directorio no puede dar un arranque");
+
+        assert!(
+            matches!(
+                error,
+                ConfigError::Invalid {
+                    var: "PODPOT_QUADLET_DIR",
+                    ..
+                }
+            ),
+            "se esperaba un error nombrando la variable: {error}"
+        );
+        assert!(
+            error.to_string().contains("PODPOT_QUADLET_DIR"),
+            "el mensaje tiene que nombrar la variable: {error}"
+        );
+        assert!(
+            !error.to_string().contains("no-es-un-directorio"),
+            "el mensaje no puede publicar el valor: {error}"
+        );
+    }
+
+    /// Y un `PODPOT_QUADLET_DIR` que no existe tampoco vale: el destino tiene que
+    /// estar en pie, porque la creación no inventa directorios.
+    #[test]
+    fn un_podpot_quadlet_dir_ausente_no_arranca() {
+        let error = Config::from_source(fuente(&[
+            ("DATABASE_URL", "sqlite:///tmp/podpot.db"),
+            ("PODPOT_QUADLET_DIR", "/no/existe/esta/carpeta"),
+        ]))
+        .expect_err("un destino que no existe no puede dar un arranque");
+
+        assert!(
+            matches!(
+                error,
+                ConfigError::Invalid {
+                    var: "PODPOT_QUADLET_DIR",
+                    ..
+                }
+            ),
+            "se esperaba un error nombrando la variable: {error}"
+        );
+    }
+
+    /// Escenario «Directorio válido»: existe, se usa tal cual.
+    #[test]
+    fn un_podpot_quadlet_dir_que_existe_se_usa() {
+        let dir = tempfile::tempdir().expect("se tiene que poder crear un directorio temporal");
+        let ruta = dir.path().to_str().expect("la ruta de prueba es UTF-8");
+
+        let config = Config::from_source(fuente(&[
+            ("DATABASE_URL", "sqlite:///tmp/podpot.db"),
+            ("PODPOT_QUADLET_DIR", ruta),
+        ]))
+        .expect("un directorio existente es configuración válida");
+
+        assert_eq!(config.quadlet_dir, dir.path());
     }
 }

@@ -239,7 +239,7 @@ mod tests {
                 .await
                 .expect("el registro de migraciones tiene que existir");
 
-        assert_eq!(aplicadas, 1, "se esperaba una migración aplicada");
+        assert_eq!(aplicadas, 2, "se esperaban dos migraciones aplicadas");
     }
 
     /// Requisito «Migraciones embebidas»: aplicarlas dos veces no rompe nada ni
@@ -261,7 +261,7 @@ mod tests {
                 .await
                 .expect("el registro de migraciones tiene que existir");
 
-        assert_eq!(aplicadas, 1, "la migración se aplicó más de una vez");
+        assert_eq!(aplicadas, 2, "la migración se aplicó más de una vez");
     }
 
     /// Escenario «Directorio ausente»: si el directorio del DSN no existe, el
