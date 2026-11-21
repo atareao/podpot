@@ -46,5 +46,5 @@ Issue **#1**. TDD por bloques: primero las pruebas (rojo), luego la implementaci
 
 - [x] 7.1 `.justfile` (`check`, `check-all`, `ui-*`).
 - [x] 7.2 `docs/FEATURE-001-bootstrap-core.md`.
-- [ ] 7.3 `just check` en verde y revisión (`@rust-reviewer` / `@react-reviewer`).
-- [ ] 7.4 PR a `development` (cierra #1) y archivar el change (`openspec archive bootstrap-core`).
+- [x] 7.3 `just check` en verde y revisión (`@rust-reviewer` / `@react-reviewer`).
+- [x] 7.4 PR a `development` (cierra #1) y archivar el change (`openspec archive bootstrap-core`).

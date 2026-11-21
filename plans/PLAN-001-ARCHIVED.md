@@ -29,3 +29,5 @@ Creación de quadlets; autenticación OIDC; SSE/`PropertiesChanged`.
 ## Al cerrar
 
 Marcar tareas, crear `docs/FEATURE-001-bootstrap-core.md` y renombrar este plan a `plans/PLAN-001-ARCHIVED.md`.
+
+- **Cierre (2026-11-21):** PR #2 a `development` (cierra #1). Change archivado (`openspec/changes/archive/2026-11-21-bootstrap-core`), specs fusionadas en `openspec/specs/`. Plan archivado.
