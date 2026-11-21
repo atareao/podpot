@@ -19,7 +19,9 @@
 //!   en vez de esperar al plazo.
 
 use podpot::systemd::dbus::DbusSystemdClient;
-use podpot::systemd::{ActiveState, SystemdClient, UnitAction, UnitName, UnitStatus};
+use podpot::systemd::{
+    ActiveState, SystemdClient, UnitAction, UnitFileState, UnitName, UnitStatus,
+};
 
 /// Se conecta al bus de usuario; si no hay, la prueba no tiene sentido y se dice.
 async fn cliente() -> DbusSystemdClient {
@@ -90,6 +92,41 @@ async fn las_quadlets_del_bus_se_listan_y_su_ruta_escapada_existe() {
             !matches!(estado.active_state, ActiveState::Unknown(_)),
             "`{nombre}` informó de un ActiveState que podpot no conoce: {}",
             estado.active_state
+        );
+    }
+}
+
+/// El listado **no** trae unidades transitorias.
+///
+/// Es la comprobación contra el bus real del defecto que el doble mide en
+/// pequeño: el listado enseñaba los `scope` de sesión
+/// (`app-ghostty-surface-transient-13530.scope`), los `dbus-…@0.service` y los
+/// `<hash>.timer` como si fueran contenedores. Todos tienen `SourcePath` vacío
+/// —o `UnitFileState=transient`—, y una quadlet **siempre** sale de un fichero.
+#[tokio::test]
+#[ignore = "necesita el bus de systemd del usuario"]
+async fn el_listado_no_trae_unidades_transitorias() {
+    let cliente = cliente().await;
+
+    for quadlet in quadlets_o_aviso(&cliente).await {
+        let nombre = quadlet.name.as_str();
+        let origen = quadlet.origin.as_str();
+
+        assert!(
+            !matches!(quadlet.unit_file_state, UnitFileState::Transient),
+            "`{nombre}` se listó como quadlet siendo una unidad transitoria"
+        );
+        assert!(
+            !quadlet.origin.es_desconocido(),
+            "`{nombre}` se listó como quadlet sin fichero de origen (¿transitoria?)"
+        );
+        assert!(
+            !nombre.ends_with(".scope"),
+            "`{nombre}` se listó como quadlet y es un scope de sesión"
+        );
+        assert!(
+            !origen.ends_with(".desktop"),
+            "`{nombre}` se listó como quadlet y viene de un `.desktop` de escritorio: {origen}"
         );
     }
 }

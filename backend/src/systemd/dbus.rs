@@ -124,11 +124,11 @@ impl DbusSystemdClient {
     ///
     /// Se lee `SourcePath` porque `UnitFileState=generated` no basta para
     /// reconocer una quadlet: entre las generadas también están las unidades de
-    /// inicio automático de escritorio, que salen de un `.desktop`. Cuando el
-    /// origen no se puede leer —una unidad transitoria no tiene fichero— se
-    /// devuelve el origen desconocido, y [`UnitStatus::is_quadlet`] deja la unidad
-    /// en el listado: esconder una quadlet real por no poder leer una propiedad
-    /// sería peor que enseñar de más.
+    /// inicio automático de escritorio, que salen de un `.desktop`, y las
+    /// **transitorias**, que no salen de ningún fichero. Cuando el origen no se
+    /// puede leer —una unidad transitoria contesta `UnknownProperty`— se devuelve
+    /// el origen desconocido, y [`UnitStatus::is_quadlet`] **descarta** la unidad:
+    /// una quadlet siempre viene de un fichero, así que sin fichero no hay quadlet.
     async fn origen(&self, unit: &UnitName) -> Result<UnitOrigin, SystemdError> {
         let proxy = self.unidad(unit).await?;
 

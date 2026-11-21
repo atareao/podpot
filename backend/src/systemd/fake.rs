@@ -63,6 +63,10 @@ impl FakeSystemd {
     }
 
     /// Un doble con dos quadlets de muestra, para mirar el panel sin systemd.
+    ///
+    /// Las dos llevan fichero de origen de quadlet, que es lo que las hace pasar
+    /// por [`UnitStatus::is_quadlet`]: sin él no serían quadlets y el doble de
+    /// muestra saldría vacío.
     pub fn demo() -> Self {
         Self::con([
             UnitStatus {
@@ -70,14 +74,18 @@ impl FakeSystemd {
                 active_state: ActiveState::Active,
                 sub_state: "running".to_owned(),
                 unit_file_state: UnitFileState::Generated,
-                origin: UnitOrigin::desconocido(),
+                origin: UnitOrigin::desde(
+                    "/home/lorenzo/.config/containers/systemd/podpot-demo-db.container",
+                ),
             },
             UnitStatus {
                 name: UnitName::sin_validar("podpot-demo-web.service"),
                 active_state: ActiveState::Inactive,
                 sub_state: "dead".to_owned(),
                 unit_file_state: UnitFileState::Generated,
-                origin: UnitOrigin::desconocido(),
+                origin: UnitOrigin::desde(
+                    "/home/lorenzo/.config/containers/systemd/podpot-demo-web.container",
+                ),
             },
         ])
     }

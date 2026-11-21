@@ -257,7 +257,10 @@ impl Serialize for ActiveState {
 ///
 /// A podpot sólo le importa una cosa de aquí: que `generated` es lo que delata a
 /// una unidad creada por el generador de quadlets, que no es ni `enabled` ni
-/// `disabled`.
+/// `disabled`. `transient` **no** cuenta como `generated`: una unidad transitoria
+/// se crea en tiempo de ejecución y no sale de ningún fichero, así que no puede
+/// ser una quadlet —que siempre es un fichero del que el generador **deriva** una
+/// unidad—.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnitFileState {
     /// Habilitada.
@@ -268,6 +271,12 @@ pub enum UnitFileState {
     Static,
     /// **Generada** por el generador de quadlets.
     Generated,
+    /// Creada en tiempo de ejecución, sin fichero de unidad detrás.
+    ///
+    /// Es lo que systemd informa de los `scope` de sesión
+    /// (`app-…-transient-13530.scope`) y de los `dbus-:1.2-…@0.service`. No sale
+    /// de un fichero, así que **no** es una quadlet.
+    Transient,
     /// Un alias de otra unidad.
     Alias,
     /// Enmascarada.
@@ -287,7 +296,8 @@ impl UnitFileState {
             "enabled" | "enabled-runtime" => Self::Enabled,
             "disabled" => Self::Disabled,
             "static" => Self::Static,
-            "generated" | "transient" => Self::Generated,
+            "generated" => Self::Generated,
+            "transient" => Self::Transient,
             "alias" => Self::Alias,
             "masked" | "masked-runtime" => Self::Masked,
             "linked" | "linked-runtime" => Self::Linked,
@@ -303,6 +313,7 @@ impl UnitFileState {
             Self::Disabled => "disabled",
             Self::Static => "static",
             Self::Generated => "generated",
+            Self::Transient => "transient",
             Self::Alias => "alias",
             Self::Masked => "masked",
             Self::Linked => "linked",
@@ -311,11 +322,12 @@ impl UnitFileState {
         }
     }
 
-    /// ¿La unidad la generó una quadlet?
+    /// ¿El gestor marca la unidad como generada?
     ///
-    /// Es el filtro del descubrimiento: las quadlets aparecen como `generated`,
-    /// **no** como `enabled` ni `disabled`, así que tratarlas como unidades
-    /// normales las dejaría fuera del listado.
+    /// Es el primer filtro del descubrimiento: las quadlets aparecen como
+    /// `generated`, **no** como `enabled` ni `disabled`, así que tratarlas como
+    /// unidades normales las dejaría fuera del listado. Una unidad `transient`
+    /// —sin fichero— **no** cuenta.
     pub fn is_generated(&self) -> bool {
         matches!(self, Self::Generated)
     }
@@ -338,9 +350,10 @@ impl Serialize for UnitFileState {
 /// Existe porque `UnitFileState=generated` **no** basta para reconocer una
 /// quadlet: systemd llama `generated` a todo lo que sale de un generador, y de
 /// ahí salen también las unidades de inicio automático de escritorio
-/// (`app-…@autostart.service`, generadas a partir de un `.desktop`). Sin mirar la
-/// procedencia, el panel listaría veinte programas de escritorio como si fueran
-/// contenedores.
+/// (`app-…@autostart.service`, generadas a partir de un `.desktop`) y las
+/// unidades **transitorias** (`app-…-transient-13530.scope`, sin fichero alguno).
+/// Las primeras se distinguen por la extensión; las segundas, porque no tienen
+/// procedencia: una quadlet **siempre** viene de un fichero.
 ///
 /// **No viaja al cliente**: la API publica nombre y estados, no rutas del
 /// sistema de ficheros del usuario.
@@ -355,8 +368,8 @@ impl UnitOrigin {
 
     /// Una procedencia que no se pudo leer.
     ///
-    /// No es «sin fichero», es «no se sabe»: una unidad transitoria no tiene
-    /// fichero de origen, y para ésas lo prudente es no descartar la unidad.
+    /// Es «sin fichero»: una unidad transitoria no tiene fichero de origen, y por
+    /// eso mismo **no** es una quadlet (ver [`UnitOrigin::es_fuente_de_quadlet`]).
     pub fn desconocido() -> Self {
         Self(String::new())
     }
@@ -369,6 +382,33 @@ impl UnitOrigin {
     /// ¿No se pudo leer la procedencia?
     pub fn es_desconocido(&self) -> bool {
         self.0.is_empty()
+    }
+
+    /// ¿Esta procedencia es la de un fichero del que puede salir una quadlet?
+    ///
+    /// Es la mitad de [`UnitStatus::is_quadlet`] que mira la procedencia; ver
+    /// allí por qué `UnitFileState=generated` no basta. Tres casos:
+    ///
+    /// * **Sin fichero**: no. Es lo que delata a una unidad transitoria, que
+    ///   systemd marca como `generated` pero que no salió de ningún fichero.
+    /// * **Extensión de quadlet** ([`QUADLET_EXTENSIONS`]): sí.
+    /// * **Cualquier otra extensión con fichero**: sí, por prudencia —una
+    ///   extensión desconocida puede ser un tipo de quadlet que esta versión aún
+    ///   no nombre—, salvo las de escritorio ([`EXTENSIONES_DE_ESCRITORIO`]), que
+    ///   salen del mismo generador y **con** fichero pero no son quadlets.
+    pub fn es_fuente_de_quadlet(&self) -> bool {
+        // Sin fichero no hay quadlet: es una unidad transitoria.
+        if self.es_desconocido() {
+            return false;
+        }
+
+        // Con fichero, una extensión de quadlet lo confirma…
+        if es_origen_de_quadlet(self.as_str()) {
+            return true;
+        }
+
+        // …y una que no conozcamos no lo descarta, salvo las de escritorio.
+        !termina_en(self.as_str(), EXTENSIONES_DE_ESCRITORIO)
     }
 }
 
@@ -397,13 +437,19 @@ impl UnitStatus {
     /// ¿Es una quadlet de Podman?
     ///
     /// La regla vive aquí, y no en cada cliente, porque los dos tienen que
-    /// contestar lo mismo: `generated` para el gestor, y la procedencia para
-    /// distinguir una quadlet de una unidad de escritorio que también es
-    /// `generated`. Una procedencia desconocida **no** descarta la unidad: es más
-    /// grave esconder una quadlet que enseñar una de más.
+    /// contestar lo mismo. Dos condiciones, y las dos hacen falta:
+    ///
+    /// * `generated` **para el gestor**: una quadlet aparece así, no como
+    ///   `enabled` ni como `transient`.
+    /// * un **fichero de origen** ([`UnitOrigin::es_fuente_de_quadlet`]): una
+    ///   quadlet siempre sale de un `.container`/`.volume`/… Una unidad
+    ///   transitoria —un `scope` de sesión, un `dbus-…@0.service`— también sale
+    ///   como `generated` pero no tiene fichero, así que no es una quadlet.
+    ///
+    /// Antes bastaba con que el origen fuera desconocido para dejar pasar la
+    /// unidad; aquello enseñaba las transitorias como si fueran contenedores.
     pub fn is_quadlet(&self) -> bool {
-        self.is_generated()
-            && (self.origin.es_desconocido() || es_origen_de_quadlet(self.origin.as_str()))
+        self.is_generated() && self.origin.es_fuente_de_quadlet()
     }
 }
 
@@ -465,14 +511,27 @@ pub const QUADLET_EXTENSIONS: &[&str] = &[
     ".build",
 ];
 
-/// ¿El fichero de origen de una unidad es una quadlet?
+/// Las extensiones de fichero de las que sale una unidad **que no** es quadlet.
 ///
-/// Es la mitad de [`UnitStatus::is_quadlet`] que mira la procedencia; ver allí
-/// por qué `UnitFileState=generated` no basta.
-fn es_origen_de_quadlet(origen: &str) -> bool {
-    QUADLET_EXTENSIONS
+/// Las unidades de inicio automático de escritorio salen del mismo generador
+/// (`UnitFileState=generated`) y **con** fichero —el `.desktop`—, así que ni el
+/// estado ni la presencia del fichero las distingue: sólo la extensión. Sin esto,
+/// el panel listaría cada programa de escritorio como si fuera un contenedor.
+const EXTENSIONES_DE_ESCRITORIO: &[&str] = &[".desktop"];
+
+/// ¿El fichero de origen termina en alguna de estas extensiones?
+fn termina_en(origen: &str, extensiones: &[&str]) -> bool {
+    extensiones
         .iter()
         .any(|extension| origen.ends_with(extension))
+}
+
+/// ¿El fichero de origen de una unidad tiene extensión de quadlet?
+///
+/// Es la parte de [`UnitOrigin::es_fuente_de_quadlet`] que reconoce una quadlet
+/// por su extensión; ver allí el caso de las extensiones desconocidas.
+fn es_origen_de_quadlet(origen: &str) -> bool {
+    termina_en(origen, QUADLET_EXTENSIONS)
 }
 
 /// El contrato del cliente de systemd.
@@ -584,9 +643,71 @@ mod tests {
 
         assert!(!habilitada.is_generated());
         assert!(!habilitada.is_quadlet());
-        assert_eq!(
-            UnitFileState::from_dbus("transient"),
-            UnitFileState::Generated
+    }
+
+    /// Una unidad **transitoria** no cuenta como generada.
+    ///
+    /// Antes `transient` se mapeaba a `Generated`, y con la lenidad de la
+    /// procedencia desconocida eso dejaba colarse los `scope` de sesión y los
+    /// `dbus-…@0.service` en el listado de quadlets.
+    #[test]
+    fn una_unidad_transitoria_no_cuenta_como_generada() {
+        let transitoria = UnitFileState::from_dbus("transient");
+
+        assert_eq!(transitoria, UnitFileState::Transient);
+        assert_eq!(transitoria.as_str(), "transient");
+        assert!(
+            !transitoria.is_generated(),
+            "una unidad transitoria no la generó ninguna quadlet"
+        );
+    }
+
+    /// Regresión: una unidad `generated` **sin** fichero de origen —una
+    /// transitoria— no es una quadlet; una con fichero de quadlet, sí.
+    ///
+    /// Es el falso positivo que el listado real enseñaba
+    /// (`app-ghostty-surface-transient-13530.scope`, `<hash>.timer`): tienen
+    /// `UnitFileState=transient`/`generated` y `SourcePath` vacío.
+    #[test]
+    fn una_unidad_generada_sin_fichero_no_es_una_quadlet() {
+        let sin_fichero = UnitStatus {
+            origin: UnitOrigin::desconocido(),
+            ..unidad(
+                "app-ghostty-surface-transient-13530.scope",
+                ActiveState::Active,
+                "running",
+            )
+        };
+
+        assert!(sin_fichero.is_generated());
+        assert!(
+            !sin_fichero.is_quadlet(),
+            "una unidad sin SourcePath no puede ser una quadlet"
+        );
+
+        let contenedor = UnitStatus {
+            origin: UnitOrigin::desde("/x/y.container"),
+            ..unidad("centinela-db.service", ActiveState::Active, "running")
+        };
+
+        assert!(
+            contenedor.is_quadlet(),
+            "una unidad generada con un fichero de quadlet sí lo es"
+        );
+    }
+
+    /// Y las extensiones desconocidas **con** fichero no se descartan: pueden ser
+    /// un tipo de quadlet que esta versión aún no nombre.
+    #[test]
+    fn una_extension_desconocida_con_fichero_no_se_descarta() {
+        let futura = UnitStatus {
+            origin: UnitOrigin::desde("/home/lorenzo/.config/containers/systemd/algo.quadlet"),
+            ..unidad("algo.service", ActiveState::Active, "running")
+        };
+
+        assert!(
+            futura.is_quadlet(),
+            "una extensión desconocida con fichero no puede descartarse"
         );
     }
 
@@ -682,22 +803,22 @@ mod tests {
         }
     }
 
-    /// Una unidad de prueba: generada y con procedencia desconocida, que es el
-    /// caso que no descarta nada. Las pruebas que miran la procedencia la fijan
-    /// con la sintaxis de actualización de estructura.
+    /// Una unidad de prueba: una quadlet —generada y con fichero de origen—. Las
+    /// pruebas que miran la procedencia la fijan con la sintaxis de actualización
+    /// de estructura.
     fn unidad(nombre: &str, active_state: ActiveState, sub_state: &str) -> UnitStatus {
         UnitStatus {
             name: UnitName::parse(nombre).expect("el nombre de prueba tiene que ser válido"),
             active_state,
             sub_state: sub_state.to_owned(),
             unit_file_state: UnitFileState::Generated,
-            origin: UnitOrigin::desconocido(),
+            origin: UnitOrigin::desde("/home/lorenzo/.config/containers/systemd/prueba.container"),
         }
     }
 
     /// Escenario «Hay quadlets instaladas»: el listado trae cada quadlet por su
     /// nombre. Lo que no es una quadlet se queda fuera aunque systemd lo llame
-    /// `generated`.
+    /// `generated` —o aunque sea una unidad transitoria con `SourcePath` vacío—.
     #[tokio::test]
     async fn el_doble_lista_las_quadlets_y_solo_las_quadlets() {
         let cliente = FakeSystemd::con([
@@ -709,6 +830,25 @@ mod tests {
                     "app-opendeck@autostart.service",
                     ActiveState::Inactive,
                     "dead",
+                )
+            },
+            // Transitoria de sesión: `SourcePath` vacío, no es una quadlet.
+            UnitStatus {
+                unit_file_state: UnitFileState::from_dbus("transient"),
+                origin: UnitOrigin::desconocido(),
+                ..unidad(
+                    "app-ghostty-surface-transient-13530.scope",
+                    ActiveState::Active,
+                    "running",
+                )
+            },
+            // Generada pero sin fichero: tampoco.
+            UnitStatus {
+                origin: UnitOrigin::desconocido(),
+                ..unidad(
+                    "14757e563eb9460c713735ab904e0b59f1aac91762104efc23554b7c68ee54da.timer",
+                    ActiveState::Active,
+                    "running",
                 )
             },
             // Una unidad normal: ni siquiera la generó nadie.
