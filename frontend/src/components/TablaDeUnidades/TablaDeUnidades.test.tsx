@@ -145,14 +145,34 @@ describe('TablaDeUnidades', () => {
     expect(onBorrar).not.toHaveBeenCalled()
   })
 
-  it('la confirmación nombra el fichero que se va a borrar, no solo la unidad', async () => {
+  it('la confirmación nombra el fichero publicado por la API, no solo la unidad', async () => {
     const usuario = userEvent.setup()
-    tabla([unidad({ name: 'web-data-volume.service' })])
+    tabla([unidad({ name: 'web-volume.service', file_name: 'web-volume.container' })])
 
-    await usuario.click(screen.getByRole('button', { name: 'Borrar web-data-volume.service' }))
+    await usuario.click(screen.getByRole('button', { name: 'Borrar web-volume.service' }))
 
-    // La identidad no es inyectiva: el nombre de fichero se deduce del de unidad
-    // y la acción destructiva tiene que enseñarlo antes de ejecutarse.
-    expect(await screen.findByText(/«web-data\.volume»/)).toBeInTheDocument()
+    // El fichero que se va a borrar es el que publica la API, no el deducido del
+    // nombre de unidad (que aquí resolvería al volumen `web.volume`).
+    expect(await screen.findByText(/«web-volume\.container»/)).toBeInTheDocument()
+  })
+
+  it('distingue dos quadlets con el mismo nombre de unidad por su file_name', async () => {
+    const usuario = userEvent.setup()
+    // Un contenedor `web-volume` y un volumen `web` colisionan en la unidad
+    // `web-volume.service`: solo el `file_name` publicado las distingue.
+    tabla([
+      unidad({ name: 'web-volume.service', file_name: 'web-volume.container' }),
+      unidad({ name: 'web-volume.service', file_name: 'web.volume' }),
+    ])
+
+    const botones = screen.getAllByRole('button', { name: 'Borrar web-volume.service' })
+    expect(botones).toHaveLength(2)
+
+    await usuario.click(botones[0]!)
+    expect(await screen.findByText(/«web-volume\.container»/)).toBeInTheDocument()
+    await usuario.click(screen.getByRole('button', { name: 'Cancelar' }))
+
+    await usuario.click(botones[1]!)
+    expect(await screen.findByText(/«web\.volume»/)).toBeInTheDocument()
   })
 })

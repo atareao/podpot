@@ -211,10 +211,14 @@ describe('edición de quadlets desde el panel', () => {
     expect(screen.getByLabelText('Imagen')).toHaveValue('docker.io/library/nginx')
   })
 
-  it('precarga el tipo que devuelve la definición, no el deducido del nombre', async () => {
+  it('precarga el tipo que devuelve la definición', async () => {
     const usuario = userEvent.setup()
     vi.mocked(listarUnidades).mockResolvedValue([
-      unidad({ name: 'web-data-volume.service', unit_file_state: 'generated' }),
+      unidad({
+        name: 'web-data-volume.service',
+        file_name: 'web-data.volume',
+        unit_file_state: 'generated',
+      }),
     ])
     // Un volumen no pide imagen: si el formulario la pidiera, no vendría del GET.
     vi.mocked(obtenerQuadlet).mockResolvedValue({ name: 'web-data', kind: 'volume' })
@@ -223,8 +227,10 @@ describe('edición de quadlets desde el panel', () => {
 
     await usuario.click(await screen.findByRole('button', { name: 'Editar web-data-volume.service' }))
 
-    // La precarga sale de la definición leída, no del nombre de la unidad.
-    await waitFor(() => expect(vi.mocked(obtenerQuadlet)).toHaveBeenCalledWith('web-data.volume', expect.anything()))
+    // El tipo sale de la definición leída y el fichero, de la API.
+    await waitFor(() =>
+      expect(vi.mocked(obtenerQuadlet)).toHaveBeenCalledWith('web-data.volume', expect.anything()),
+    )
     expect(await screen.findByLabelText('Nombre')).toHaveValue('web-data')
     expect(screen.queryByLabelText('Imagen')).not.toBeInTheDocument()
     expect(screen.getByLabelText('Tipo de quadlet')).toBeDisabled()
@@ -407,37 +413,109 @@ describe('edición de quadlets desde el panel', () => {
   })
 })
 
-describe('unidad sin identidad deducible', () => {
-  it('no abre la edición y avisa de que no se pudo identificar el fichero', async () => {
+describe('identidad publicada por la API', () => {
+  it('edita usando el file_name publicado, sin invertir el nombre de unidad', async () => {
     const usuario = userEvent.setup()
-    vi.mocked(listarUnidades).mockResolvedValue([unidad({ name: 'sin-sufijo' })])
+    // `web-volume.service` no permite reconstruir el fichero: la inversa
+    // resolvería al volumen `web.volume`, pero el fichero real es otro.
+    vi.mocked(listarUnidades).mockResolvedValue([
+      unidad({
+        name: 'web-volume.service',
+        file_name: 'web-volume.container',
+        unit_file_state: 'generated',
+      }),
+    ])
+    vi.mocked(obtenerQuadlet).mockResolvedValue({
+      name: 'web-volume',
+      kind: 'container',
+      image: 'nginx',
+    })
 
     montar()
 
-    await usuario.click(await screen.findByRole('button', { name: 'Editar sin-sufijo' }))
+    await usuario.click(await screen.findByRole('button', { name: 'Editar web-volume.service' }))
 
-    expect(
-      await screen.findByText('No se pudo identificar el fichero de «sin-sufijo».'),
-    ).toBeInTheDocument()
-    // Sin fichero no hay nada que leer ni formulario que abrir.
-    expect(vi.mocked(obtenerQuadlet)).not.toHaveBeenCalled()
-    expect(screen.queryByRole('button', { name: 'Guardar' })).not.toBeInTheDocument()
+    // La definición se lee por el fichero que publicó la API.
+    await waitFor(() =>
+      expect(vi.mocked(obtenerQuadlet)).toHaveBeenCalledWith(
+        'web-volume.container',
+        expect.anything(),
+      ),
+    )
   })
 
-  it('no borra y avisa de que no se pudo identificar el fichero', async () => {
+  it('borra usando el file_name publicado, sin invertir el nombre de unidad', async () => {
     const usuario = userEvent.setup()
-    vi.mocked(listarUnidades).mockResolvedValue([unidad({ name: 'sin-sufijo' })])
+    vi.mocked(listarUnidades)
+      .mockResolvedValueOnce([
+        unidad({
+          name: 'web-volume.service',
+          file_name: 'web-volume.container',
+          unit_file_state: 'generated',
+        }),
+      ])
+      .mockResolvedValueOnce([])
+    vi.mocked(obtenerQuadlet).mockResolvedValue({
+      name: 'web-volume',
+      kind: 'container',
+      image: 'nginx',
+    })
+    vi.mocked(borrarQuadlet).mockResolvedValue({
+      file_name: 'web-volume.container',
+      unit_name: 'web-volume.service',
+      kind: 'container',
+    })
 
     montar()
 
-    await usuario.click(await screen.findByRole('button', { name: 'Borrar sin-sufijo' }))
+    await usuario.click(await screen.findByRole('button', { name: 'Borrar web-volume.service' }))
     await usuario.click(await screen.findByRole('button', { name: 'Sí, borrar' }))
 
-    expect(
-      await screen.findByText('No se pudo identificar el fichero de «sin-sufijo».'),
-    ).toBeInTheDocument()
-    expect(vi.mocked(obtenerQuadlet)).not.toHaveBeenCalled()
-    expect(vi.mocked(borrarQuadlet)).not.toHaveBeenCalled()
+    expect(await screen.findByText(/«web-volume.service» borrada/i)).toBeInTheDocument()
+    expect(vi.mocked(obtenerQuadlet)).toHaveBeenCalledWith(
+      'web-volume.container',
+      expect.anything(),
+    )
+    expect(vi.mocked(borrarQuadlet)).toHaveBeenCalledWith('web-volume.container')
+  })
+})
+
+describe('dos quadlets con el mismo nombre de unidad', () => {
+  it('edita el file_name correcto de cada una', async () => {
+    const usuario = userEvent.setup()
+    // Un contenedor `web-volume` y un volumen `web` comparten la unidad
+    // `web-volume.service`; el panel debe operar sobre el fichero de cada fila.
+    vi.mocked(listarUnidades).mockResolvedValue([
+      unidad({
+        name: 'web-volume.service',
+        file_name: 'web-volume.container',
+        unit_file_state: 'generated',
+      }),
+      unidad({ name: 'web-volume.service', file_name: 'web.volume', unit_file_state: 'generated' }),
+    ])
+    vi.mocked(obtenerQuadlet).mockResolvedValue({ name: 'x', kind: 'container', image: 'nginx' })
+
+    montar()
+
+    const botonesEditar = await screen.findAllByRole('button', {
+      name: 'Editar web-volume.service',
+    })
+    expect(botonesEditar).toHaveLength(2)
+
+    await usuario.click(botonesEditar[0]!)
+    await waitFor(() =>
+      expect(vi.mocked(obtenerQuadlet)).toHaveBeenCalledWith(
+        'web-volume.container',
+        expect.anything(),
+      ),
+    )
+
+    // Se cierra la edición y se abre la de la otra fila: cada una por su fichero.
+    await usuario.click(await screen.findByRole('button', { name: 'Cancelar' }))
+    await usuario.click(botonesEditar[1]!)
+    await waitFor(() =>
+      expect(vi.mocked(obtenerQuadlet)).toHaveBeenCalledWith('web.volume', expect.anything()),
+    )
   })
 })
 
@@ -491,11 +569,15 @@ describe('borrado de quadlets desde el panel', () => {
   it('si la verificación falla no envía el DELETE y muestra el error', async () => {
     const usuario = userEvent.setup()
     vi.mocked(listarUnidades).mockResolvedValue([
-      unidad({ name: 'web-volume.service', unit_file_state: 'generated' }),
+      unidad({
+        name: 'web-volume.service',
+        file_name: 'web-volume.container',
+        unit_file_state: 'generated',
+      }),
     ])
-    // La identidad deducida (`web.volume`) no existe: el borrado no debe salir.
+    // El fichero publicado no existe (se borró fuera del panel): el DELETE no sale.
     vi.mocked(obtenerQuadlet).mockRejectedValue(
-      new ErrorDeApi(404, 'not_found', 'no existe la quadlet «web.volume»'),
+      new ErrorDeApi(404, 'not_found', 'no existe la quadlet «web-volume.container»'),
     )
 
     montar()
@@ -503,7 +585,9 @@ describe('borrado de quadlets desde el panel', () => {
     await usuario.click(await screen.findByRole('button', { name: 'Borrar web-volume.service' }))
     await usuario.click(await screen.findByRole('button', { name: 'Sí, borrar' }))
 
-    expect(await screen.findByText('no existe la quadlet «web.volume»')).toBeInTheDocument()
+    expect(
+      await screen.findByText('no existe la quadlet «web-volume.container»'),
+    ).toBeInTheDocument()
     expect(vi.mocked(borrarQuadlet)).not.toHaveBeenCalled()
     expect(vi.mocked(listarUnidades)).toHaveBeenCalledTimes(1)
   })

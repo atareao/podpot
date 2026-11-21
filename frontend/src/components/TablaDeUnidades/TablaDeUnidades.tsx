@@ -1,7 +1,6 @@
 import { Button, Empty, Popconfirm, Space, Table } from 'antd'
 import type { TableProps } from 'antd'
 import { EstadoDeUnidad } from '../EstadoDeUnidad/EstadoDeUnidad'
-import { identidadDeUnidad } from '../../quadlets/identidad'
 import type { AccionDeUnidad, QuadletUnit } from '../../types/api'
 
 export interface TablaDeUnidadesProps {
@@ -74,9 +73,6 @@ export function TablaDeUnidades({
       key: 'acciones',
       render: (_valor, unidad) => {
         const bloqueada = enCurso === unidad.name
-        // La identidad no es inyectiva (se deduce del nombre de unidad), así que
-        // la acción destructiva nombra el fichero exacto que se va a borrar.
-        const identidad = identidadDeUnidad(unidad.name)
         return (
           <Space size="small" wrap>
             <Button
@@ -112,14 +108,12 @@ export function TablaDeUnidades({
               Editar
             </Button>
             {/* El borrado es destructivo: la confirmación vive aquí y solo al
-                confirmarla se emite `onBorrar`; cancelar no sale de la fila. */}
+                confirmarla se emite `onBorrar`; cancelar no sale de la fila.
+                La confirmación nombra el fichero real (identidad publicada por
+                la API): el nombre de unidad no basta para identificarlo. */}
             <Popconfirm
               title={`¿Borrar la quadlet «${unidad.name}»?`}
-              description={
-                identidad === null
-                  ? 'No se pudo identificar su fichero. No se puede deshacer.'
-                  : `Se borrará el fichero «${identidad.file_name}». No se puede deshacer.`
-              }
+              description={`Se borrará el fichero «${unidad.file_name}». No se puede deshacer.`}
               okText="Sí, borrar"
               cancelText="Cancelar"
               okButtonProps={{ danger: true }}
@@ -145,7 +139,9 @@ export function TablaDeUnidades({
   return (
     <Table<QuadletUnit>
       aria-label="Quadlets"
-      rowKey="name"
+      // El `file_name` es la identidad única de la quadlet: dos filas pueden
+      // compartir nombre de unidad (colisión no inyectiva), pero nunca fichero.
+      rowKey="file_name"
       columns={columnas}
       dataSource={unidades}
       loading={cargando}

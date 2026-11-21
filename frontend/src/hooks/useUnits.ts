@@ -95,15 +95,16 @@ export function useBorrarQuadlet() {
 }
 
 /**
- * Verificación de una identidad deducida antes de una operación destructiva.
+ * Verificación de la existencia del fichero antes de una operación destructiva.
  *
- * La identidad de `DELETE`/`PATCH` (nombre de fichero) se deduce del nombre de
- * unidad y la regla inversa **no es inyectiva** (un contenedor llamado
- * `web-volume` y el volumen `web` dan el mismo `web-volume.service`). Antes de
- * borrar se pide la definición del fichero deducido: si no existe, la lectura da
- * `404` y el borrado no llega a enviarse. Se hace con `fetchQuery` —no con un
- * `useQuery` montado— porque es una comprobación imperativa, puntual, y así
- * comparte caché con la lectura de la edición (`claves.quadlet`).
+ * La identidad de `DELETE`/`PATCH` es el nombre de fichero que publica la API
+ * (`unit.file_name`), así que ya no hay deducción que desambiguar. Aun así, el
+ * listado es una foto: entre pintarlo y borrar, el fichero pudo desaparecer o
+ * cambiar fuera del panel. Antes de borrar se pide la definición del fichero: si
+ * no existe, la lectura da `404` y el borrado no llega a enviarse. Se hace con
+ * `fetchQuery` —no con un `useQuery` montado— porque es una comprobación
+ * imperativa, puntual, y así comparte caché con la lectura de la edición
+ * (`claves.quadlet`).
  */
 export function useVerificarQuadlet() {
   const cliente = useQueryClient()
