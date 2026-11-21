@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { accionDeUnidad, listarUnidades } from '../api/units'
-import type { AccionDeUnidad } from '../types/api'
+import { crearQuadlet } from '../api/quadlets'
+import type { AccionDeUnidad, PeticionDeCreacion, QuadletCreada } from '../types/api'
 
 /**
  * Claves de caché de React Query. Viven en un solo sitio para que invalidar sea
@@ -28,6 +29,19 @@ export function useAccionDeUnidad() {
   return useMutation({
     mutationFn: ({ name, accion }: { name: string; accion: AccionDeUnidad }) =>
       accionDeUnidad(name, accion),
+    onSuccess: () => cliente.invalidateQueries({ queryKey: claves.units }),
+  })
+}
+
+/**
+ * Creación de una quadlet. Al terminar con éxito, el listado se vuelve a pedir:
+ * la quadlet recién creada solo aparece cuando systemd la conoce tras la
+ * recarga, así que la respuesta de la creación no basta para pintar la tabla.
+ */
+export function useCrearQuadlet() {
+  const cliente = useQueryClient()
+  return useMutation({
+    mutationFn: (datos: PeticionDeCreacion): Promise<QuadletCreada> => crearQuadlet(datos),
     onSuccess: () => cliente.invalidateQueries({ queryKey: claves.units }),
   })
 }

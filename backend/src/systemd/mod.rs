@@ -94,6 +94,18 @@ pub enum SystemdError {
         unit: String,
     },
 
+    /// El gestor no pudo recargar su configuración.
+    ///
+    /// No es un fallo de transporte ni de la petición: el bus contestó y fue el
+    /// gestor el que dijo que no podía recargar —o la recarga falló—, así que se
+    /// traduce como un `502`, igual que una unidad rechazada.
+    #[error("el gestor de systemd no pudo recargar su configuración: {causa}")]
+    ReloadFailed {
+        /// La negativa, tal y como la informó el gestor.
+        #[source]
+        causa: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     /// No se pudo hablar con el gestor de systemd.
     ///
     /// La causa va detrás de un `Box<dyn Error>` —y no de un tipo de `zbus`— para
@@ -585,6 +597,18 @@ pub trait SystemdClient: Send + Sync + fmt::Debug {
     /// el job terminó, no que se haya pedido.
     async fn action(&self, unit: &UnitName, action: UnitAction)
     -> Result<UnitStatus, SystemdError>;
+
+    /// Pide al gestor una recarga de su configuración (`daemon-reload`).
+    ///
+    /// Es lo que hace visible una quadlet recién escrita: el generador lee los
+    /// ficheros cuando el gestor recarga, y hasta entonces la unidad de esa
+    /// quadlet no existe. Se pide por D-Bus y no con `systemctl` por la misma
+    /// razón que todo lo demás: el binario no está en la imagen y el estado es
+    /// mejor hablarlo que parsearlo.
+    ///
+    /// Cubre también el ciclo de vida de la configuración del propio gestor
+    /// —volver a leer todas las unidades—, no sólo las quadlets.
+    async fn reload(&self) -> Result<(), SystemdError>;
 }
 
 #[cfg(test)]

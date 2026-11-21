@@ -5,12 +5,17 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { unidad } from '../../tests/fixtures'
 import { ErrorDeApi } from '../api/envelope'
 import { accionDeUnidad, listarUnidades } from '../api/units'
+import { crearQuadlet } from '../api/quadlets'
 import Unidades from './unidades'
 
 // La capa de red se dobla entera: las pruebas de pantalla no hablan con la API.
 vi.mock('../api/units', () => ({
   listarUnidades: vi.fn(),
   accionDeUnidad: vi.fn(),
+}))
+
+vi.mock('../api/quadlets', () => ({
+  crearQuadlet: vi.fn(),
 }))
 
 function montar() {
@@ -114,6 +119,56 @@ describe('pantalla de quadlets', () => {
     expect(await screen.findByText('la unidad está en transición')).toBeInTheDocument()
     // Sin refresco: la tabla sigue enseñando el estado real de la unidad.
     expect(screen.getByText('Parada')).toBeInTheDocument()
+    expect(vi.mocked(listarUnidades)).toHaveBeenCalledTimes(1)
+  })
+
+  it('crea una quadlet desde el formulario, avisa y refresca el listado', async () => {
+    const usuario = userEvent.setup()
+    vi.mocked(listarUnidades)
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([unidad({ name: 'web.service' })])
+    vi.mocked(crearQuadlet).mockResolvedValue({
+      file_name: 'web.container',
+      unit_name: 'web.service',
+      kind: 'container',
+    })
+
+    montar()
+
+    expect(await screen.findByText('No hay quadlets')).toBeInTheDocument()
+
+    await usuario.type(screen.getByLabelText('Nombre'), 'web')
+    await usuario.type(screen.getByLabelText('Imagen'), 'docker.io/library/nginx')
+    await usuario.click(screen.getByRole('button', { name: 'Crear' }))
+
+    expect(await screen.findByText(/«web.service» creada/i)).toBeInTheDocument()
+    expect(vi.mocked(crearQuadlet)).toHaveBeenCalledWith({
+      name: 'web',
+      kind: 'container',
+      image: 'docker.io/library/nginx',
+    })
+    // El refresco vuelve a pedir la lista y termina mostrando la quadlet nueva.
+    expect(await screen.findByText('web.service')).toBeInTheDocument()
+    await waitFor(() => expect(vi.mocked(listarUnidades)).toHaveBeenCalledTimes(2))
+  })
+
+  it('un error de creación (colisión) muestra el mensaje y no refresca el listado', async () => {
+    const usuario = userEvent.setup()
+    vi.mocked(listarUnidades).mockResolvedValue([])
+    vi.mocked(crearQuadlet).mockRejectedValue(
+      new ErrorDeApi(409, 'duplicate', 'ya existe una quadlet «web»'),
+    )
+
+    montar()
+
+    expect(await screen.findByText('No hay quadlets')).toBeInTheDocument()
+
+    await usuario.type(screen.getByLabelText('Nombre'), 'web')
+    await usuario.type(screen.getByLabelText('Imagen'), 'nginx')
+    await usuario.click(screen.getByRole('button', { name: 'Crear' }))
+
+    expect(await screen.findByText('ya existe una quadlet «web»')).toBeInTheDocument()
+    // Sin refresco como si hubiera tenido éxito.
     expect(vi.mocked(listarUnidades)).toHaveBeenCalledTimes(1)
   })
 })

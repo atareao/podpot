@@ -279,6 +279,19 @@ impl SystemdClient for DbusSystemdClient {
 
         self.status(unit).await
     }
+
+    async fn reload(&self) -> Result<(), SystemdError> {
+        let manager = self.manager().await?;
+
+        // `Reload` es el `daemon-reload` de `systemctl`: no lleva unidad y no
+        // devuelve nada. Un error del gestor aquí **no** es «eso no existe»
+        // —no hay unidad que pueda faltar—, así que se traduce como una recarga
+        // fallida y no como una ausencia.
+        manager
+            .call::<_, _, ()>("Reload", &())
+            .await
+            .map_err(|error| recarga(clase(&error), error))
+    }
 }
 
 /// Espera a que terminen el job indicado y devuelve su resultado.
@@ -346,6 +359,21 @@ fn traducir(unit: &UnitName, error: zbus::Error) -> SystemdError {
     }
 }
 
+/// Traduce el fallo de una recarga de la configuración del gestor.
+///
+/// No hay unidad de la que hablar: la recarga es del gestor entero, así que lo
+/// único que se distingue es si hubo respuesta —el gestor dijo que no, y eso es
+/// una recarga fallida, un `502`— o si no la hubo, que es un transporte y de ahí
+/// a un `503`.
+fn recarga(clase: Clase, error: zbus::Error) -> SystemdError {
+    match clase {
+        Clase::Transporte => transporte(error),
+        Clase::Ausencia | Clase::Rechazo => SystemdError::ReloadFailed {
+            causa: Box::new(error),
+        },
+    }
+}
+
 /// A qué desenlace corresponde un fallo de D-Bus.
 ///
 /// Aislar la decisión en un enumerado —y no resolverla con dos `if` sobre
@@ -400,8 +428,9 @@ mod tests {
 
     use super::{
         Clase, ERROR_FILE_NOT_FOUND, ERROR_NO_SUCH_UNIT, ERROR_UNKNOWN_PROPERTY, clase,
-        clase_del_nombre,
+        clase_del_nombre, recarga,
     };
+    use crate::systemd::SystemdError;
 
     /// Unidad que no está: los tres códigos que systemd usa para decirlo caen en
     /// la misma clase, que es lo que permite dar un solo `404`.
@@ -454,5 +483,31 @@ mod tests {
         let error = zbus::Error::InputOutput(Arc::new(std::io::Error::other("sin bus")));
 
         assert_eq!(clase(&error), Clase::Transporte);
+    }
+
+    /// Una recarga que el gestor rechaza no es un transporte: hubo respuesta, y
+    /// el desenlace es una recarga fallida —un `502`—, no un bus caído.
+    #[test]
+    fn una_recarga_que_el_gestor_rechaza_no_es_un_transporte() {
+        let error = zbus::Error::InputOutput(Arc::new(std::io::Error::other("el gestor dijo no")));
+
+        assert!(
+            matches!(
+                recarga(Clase::Rechazo, error),
+                SystemdError::ReloadFailed { .. }
+            ),
+            "el gestor contestó que no: no puede tratarse como un bus caído"
+        );
+    }
+
+    /// Y una recarga sin respuesta sigue siendo un transporte.
+    #[test]
+    fn una_recarga_sin_respuesta_es_un_transporte() {
+        let error = zbus::Error::InputOutput(Arc::new(std::io::Error::other("sin bus")));
+
+        assert!(matches!(
+            recarga(Clase::Transporte, error),
+            SystemdError::Transport { .. }
+        ));
     }
 }

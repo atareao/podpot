@@ -9,6 +9,7 @@
 //! cliente—. Sin panel, lo que no es de la API es un `404` con la envoltura.
 
 pub mod health;
+pub mod quadlets;
 pub mod response;
 pub mod units;
 
@@ -48,6 +49,7 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health::health))
         .route("/units", get(units::listar))
         .route("/units/{name}/{action}", post(units::accionar))
+        .route("/quadlets", post(quadlets::crear))
         .fallback(ruta_inexistente)
         .method_not_allowed_fallback(metodo_no_permitido);
 

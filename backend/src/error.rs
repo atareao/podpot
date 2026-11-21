@@ -15,6 +15,7 @@ use thiserror::Error;
 
 use crate::api::response::ErrorResponse;
 use crate::config::ConfigError;
+use crate::quadlet::QuadletError;
 use crate::systemd::SystemdError;
 
 /// El mensaje con el que el cliente recibe un fallo interno.
@@ -54,6 +55,24 @@ const CODE_SYSTEMD_TIMEOUT: &str = "systemd_timeout";
 /// El código de un gestor de systemd que no contesta.
 const CODE_SYSTEMD_UNAVAILABLE: &str = "systemd_unavailable";
 
+/// El código de una recarga de systemd que el gestor no pudo hacer.
+const CODE_SYSTEMD_RELOAD_FAILED: &str = "systemd_reload_failed";
+
+/// El código de una quadlet que ya existe con ese nombre.
+const CODE_DUPLICATE: &str = "duplicate";
+
+/// El código de un nombre de quadlet que no se puede usar.
+const CODE_INVALID_NAME: &str = "invalid_name";
+
+/// El código de un tipo de quadlet que no se puede crear.
+const CODE_INVALID_KIND: &str = "invalid_kind";
+
+/// El código de un valor de campo que no se puede aceptar.
+const CODE_INVALID_VALUE: &str = "invalid_value";
+
+/// El código de una quadlet que no se pudo escribir.
+const CODE_WRITE_FAILED: &str = "write_failed";
+
 /// El código de un fallo del propio servidor.
 const CODE_INTERNAL: &str = "internal";
 
@@ -75,6 +94,10 @@ pub enum AppError {
     /// La capa de systemd falló. Cada variante suya tiene su propia traducción.
     #[error(transparent)]
     Systemd(#[from] SystemdError),
+
+    /// La creación de una quadlet falló. Cada variante tiene su traducción.
+    #[error(transparent)]
+    Quadlet(#[from] QuadletError),
 
     /// La configuración no permite atender la petición.
     ///
@@ -106,6 +129,7 @@ impl IntoResponse for AppError {
                 motivo,
             ),
             Self::Systemd(causa) => traducir_systemd(causa),
+            Self::Quadlet(causa) => traducir_quadlet(causa),
             Self::Config(causa) => {
                 tracing::error!(error = %causa, "error de configuración al atender la petición");
                 (
@@ -197,6 +221,18 @@ fn traducir_systemd(causa: SystemdError) -> (StatusCode, &'static str, String) {
                 format!("la operación sobre la unidad `{unit}` no terminó a tiempo"),
             )
         }
+        SystemdError::ReloadFailed { causa } => {
+            tracing::error!(
+                error = %causa,
+                "el gestor de systemd no pudo recargar su configuración"
+            );
+
+            (
+                StatusCode::BAD_GATEWAY,
+                CODE_SYSTEMD_RELOAD_FAILED,
+                "el gestor de systemd no pudo recargar su configuración".to_owned(),
+            )
+        }
         SystemdError::Transport { causa } => {
             tracing::error!(error = %causa, "no se pudo hablar con el gestor de systemd del usuario");
 
@@ -209,6 +245,85 @@ fn traducir_systemd(causa: SystemdError) -> (StatusCode, &'static str, String) {
     }
 }
 
+/// Traduce un fallo de la creación de una quadlet.
+///
+/// La frontera es la misma que en systemd: lo que quien llama puede arreglar
+/// —un nombre que ya está en uso, un nombre o un tipo que no valen— sale con su
+/// `4xx` y **sin** repetir el valor que llegó; lo que falla del lado del servidor
+/// —la escritura, el registro— sale con el mensaje genérico del `500` y el
+/// detalle se queda en el registro —la ruta del fichero no se publica—. Los
+/// fallos de systemd se delegan en [`traducir_systemd`], que ya los clasifica.
+fn traducir_quadlet(causa: QuadletError) -> (StatusCode, &'static str, String) {
+    match causa {
+        QuadletError::Duplicate { file_name } => {
+            tracing::debug!(fichero = %file_name, "la quadlet ya existe");
+
+            (
+                StatusCode::CONFLICT,
+                CODE_DUPLICATE,
+                "ya existe una quadlet con ese nombre en el directorio de quadlets".to_owned(),
+            )
+        }
+        QuadletError::InvalidName { stem } => {
+            tracing::debug!(nombre = %stem, "nombre de quadlet rechazado");
+
+            (
+                StatusCode::BAD_REQUEST,
+                CODE_INVALID_NAME,
+                "el nombre de la quadlet no es válido".to_owned(),
+            )
+        }
+        QuadletError::InvalidKind { kind } => {
+            tracing::debug!(tipo = %kind, "tipo de quadlet rechazado");
+
+            (
+                StatusCode::BAD_REQUEST,
+                CODE_INVALID_KIND,
+                "el tipo de quadlet no es de los que se pueden crear: se espera \
+                 `container`, `volume`, `network` o `pod`"
+                    .to_owned(),
+            )
+        }
+        QuadletError::MissingField { kind, field } => (
+            StatusCode::BAD_REQUEST,
+            CODE_BAD_REQUEST,
+            format!("el tipo `{kind}` exige el campo `{field}`"),
+        ),
+        QuadletError::InvalidValue { field } => {
+            tracing::debug!(campo = field, "valor de campo rechazado");
+
+            (
+                StatusCode::BAD_REQUEST,
+                CODE_INVALID_VALUE,
+                format!("el campo `{field}` tiene un valor no válido"),
+            )
+        }
+        QuadletError::WriteFailed { file_name, causa } => {
+            tracing::error!(fichero = %file_name, error = %causa, "no se pudo escribir la quadlet");
+
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                CODE_WRITE_FAILED,
+                INTERNAL_MESSAGE.to_owned(),
+            )
+        }
+        QuadletError::Persistencia { file_name, causa } => {
+            tracing::error!(
+                fichero = %file_name,
+                error = %causa,
+                "no se pudo registrar la creación de la quadlet"
+            );
+
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                CODE_INTERNAL,
+                INTERNAL_MESSAGE.to_owned(),
+            )
+        }
+        QuadletError::Systemd(causa) => traducir_systemd(causa),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use axum::http::StatusCode;
@@ -217,6 +332,7 @@ mod tests {
     use crate::test_support::body_json;
 
     use super::{AppError, INTERNAL_MESSAGE, SYSTEMD_UNAVAILABLE_MESSAGE, SystemdError};
+    use crate::quadlet::QuadletError;
 
     /// Requisito «Envoltura JSON única»: un rechazo de la petición explica su
     /// motivo y viaja con la envoltura de error.
@@ -435,6 +551,105 @@ mod tests {
                 .unwrap_or_default()
                 .contains("lenta.service"),
             "el error tiene que nombrar la unidad: {cuerpo}"
+        );
+    }
+
+    /// Una recarga que el gestor no pudo hacer es un `502` sin publicar la causa.
+    #[tokio::test]
+    async fn una_recarga_fallida_da_502_sin_filtrar_la_causa() {
+        let respuesta = AppError::Systemd(SystemdError::ReloadFailed {
+            causa: Box::new(std::io::Error::other(
+                "org.freedesktop.systemd1.TooManyJobs: no hay sitio para el job",
+            )),
+        })
+        .into_response();
+
+        assert_eq!(respuesta.status(), StatusCode::BAD_GATEWAY);
+
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(cuerpo["error"]["code"], "systemd_reload_failed");
+        assert!(
+            !cuerpo.to_string().contains("TooManyJobs"),
+            "el 502 no puede publicar la causa del gestor: {cuerpo}"
+        );
+    }
+
+    /// Escenario «Fallo de escritura»: `500` con el mensaje genérico y **sin**
+    /// publicar la ruta del fichero.
+    #[tokio::test]
+    async fn un_fallo_de_escritura_da_500_sin_publicar_la_ruta() {
+        let respuesta = AppError::Quadlet(QuadletError::WriteFailed {
+            file_name: "web.container".to_owned(),
+            causa: std::io::Error::other("permiso denegado en /home/tester/.config"),
+        })
+        .into_response();
+
+        assert_eq!(respuesta.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(cuerpo["error"]["code"], "write_failed");
+        assert_eq!(cuerpo["error"]["message"], INTERNAL_MESSAGE);
+        assert!(
+            !cuerpo.to_string().contains("/home/tester"),
+            "el 500 no puede publicar la ruta del fichero: {cuerpo}"
+        );
+    }
+
+    /// Un nombre de quadlet inválido es un `400` que no repite el valor.
+    #[tokio::test]
+    async fn un_nombre_de_quadlet_invalido_da_400_sin_repetir_el_valor() {
+        let respuesta = AppError::Quadlet(QuadletError::InvalidName {
+            stem: "../escape".to_owned(),
+        })
+        .into_response();
+
+        assert_eq!(respuesta.status(), StatusCode::BAD_REQUEST);
+
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(cuerpo["error"]["code"], "invalid_name");
+        assert!(
+            !cuerpo.to_string().contains("escape"),
+            "el 400 repitió el valor que llegó: {cuerpo}"
+        );
+    }
+
+    /// Escenario «Nombre duplicado»: un `409`.
+    #[tokio::test]
+    async fn un_nombre_duplicado_da_409() {
+        let respuesta = AppError::Quadlet(QuadletError::Duplicate {
+            file_name: "web.container".to_owned(),
+        })
+        .into_response();
+
+        assert_eq!(respuesta.status(), StatusCode::CONFLICT);
+
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(cuerpo["error"]["code"], "duplicate");
+    }
+
+    /// Escenario «Valor con estructura»: un valor de campo con caracteres de
+    /// control es un `400` con `invalid_value`, que **nombra el campo** y no el
+    /// valor.
+    #[tokio::test]
+    async fn un_valor_de_campo_invalido_da_400_nombrando_el_campo() {
+        let respuesta =
+            AppError::Quadlet(QuadletError::InvalidValue { field: "image" }).into_response();
+
+        assert_eq!(respuesta.status(), StatusCode::BAD_REQUEST);
+
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(cuerpo["error"]["code"], "invalid_value");
+        assert!(
+            cuerpo["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("image"),
+            "el 400 tiene que nombrar el campo: {cuerpo}"
         );
     }
 }
