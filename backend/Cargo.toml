@@ -54,6 +54,35 @@ zbus = { version = "5.14.0", default-features = false, features = ["tokio"] }
 # nombre.
 futures-util = "0.3.34"
 
+# ── Autenticación OIDC (change `autenticacion-oidc`) ─────────────────────────
+#
+# El flujo OIDC se escribe a mano —patrón de kesto— y no con `openidconnect` ni
+# `tower-sessions`: ninguna de las dos está en la caché de Cargo de esta máquina
+# y este repositorio tiene que poder compilarse sin conexión. Cada versión de
+# abajo es la que ya está en la caché (`~/.cargo/registry`), resuelta contra
+# ella y no por reputación.
+#
+# `zeroize`: el secreto de firma de la sesión y el `client_secret` del proveedor
+# viven en un `SecretString` que se borra de memoria al caer y no se imprime.
+zeroize = "1.9.1"
+# `jsonwebtoken`: firma y verifica la sesión (`HS256`) y verifica el ID token del
+# proveedor (`RS256` contra el JWKS). `default-features = false` lo deja sin
+# backend criptográfico propio; en la línea 11.x el backend se elige por feature
+# y `rust_crypto` es el backend RustCrypto puro (deja fuera `aws-lc-rs`);
+# `use_pem` es lo que lee las claves del JWKS del proveedor.
+jsonwebtoken = { version = "11.1.0", default-features = false, features = ["rust_crypto", "use_pem"] }
+# `reqwest`: descubrimiento, canje del código y JWKS. `rustls-tls` (y no el TLS
+# por defecto) deja `native-tls`/OpenSSL fuera del build; `json` es lo que
+# deserializa los tres documentos.
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "json"] }
+# `axum-extra` con la feature `cookie`: `CookieJar` para leer la cookie de sesión
+# en el *gate* y para emitir/borrar la del flujo de entrada.
+axum-extra = { version = "0.10.3", features = ["cookie"] }
+# `state` y `nonce` del flujo: 32 caracteres aleatorios por intento de entrada.
+rand = "0.8.8"
+# Codificación de los parámetros de la URL de autorización.
+urlencoding = "2.1.3"
+
 [dev-dependencies]
 # `ServiceExt::oneshot` es lo que permite llamar al router sin abrir un puerto.
 tower = { version = "0.5.3", features = ["util"] }
@@ -71,3 +100,18 @@ libc = "0.2"
 # verdad —y sin que la prueba dependa de lo que tarde la máquina—. No añade
 # ninguna caja nueva: la feature sólo enciende `rt`, `sync` y `time`.
 tokio = { version = "1.50.0", features = ["test-util"] }
+# Proveedor OIDC falso local para las pruebas del flujo de entrada: un servidor
+# HTTP de verdad en `127.0.0.1` con un puerto efímero, así que **ninguna prueba
+# sale a internet**. Es el mismo arnés que usa kesto.
+wiremock = "0.6.5"
+# Un par RSA **real** para firmar el ID token `RS256` de verdad: lo que el
+# callback verifica es la misma matemática que en producción, no una firma
+# fingida. `pem` (que ya viene en los defaults de `rsa`) es lo que permite
+# publicar la clave pública como JWK.
+rsa = { version = "0.9.10", features = ["pem"] }
+# Codificación base64url sin relleno del ID token `alg: none` que
+# `test_support::proveedor_falso::token_con_alg_none` fabrica a mano (RFC 7515):
+# `jsonwebtoken` no tiene esa variante en `Algorithm`, así que las tres partes se
+# codifican aquí. Pinned a 0.22 porque es la única major que ya está en el árbol
+# —la arrastran `jsonwebtoken` y `wiremock`—.
+base64 = "0.22.1"

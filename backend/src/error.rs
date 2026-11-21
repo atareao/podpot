@@ -79,6 +79,23 @@ const CODE_READ_FAILED: &str = "read_failed";
 /// El código de un fallo del propio servidor.
 const CODE_INTERNAL: &str = "internal";
 
+/// El código de una petición sin sesión válida.
+///
+/// Es el que el *gate* de la superficie de negocio devuelve, y el que el panel
+/// mira para distinguir «sin sesión» de cualquier otro fallo y volver a la
+/// portada.
+const CODE_UNAUTHORIZED: &str = "unauthorized";
+
+/// El código de un fallo de un servicio de terceros (el proveedor de identidad).
+const CODE_BAD_GATEWAY: &str = "bad_gateway";
+
+/// El mensaje con el que el cliente recibe un fallo del proveedor de identidad.
+///
+/// Es genérico por la misma razón que el interno: la causa —el `Display` de
+/// `reqwest`, una URL, un estado HTTP ajeno— es cosa del operador y acaba en el
+/// registro, no en el cuerpo de la respuesta.
+pub const BAD_GATEWAY_MESSAGE: &str = "el proveedor de identidad no está disponible";
+
 /// El error de la aplicación, con el código HTTP que le corresponde.
 #[derive(Debug, Error)]
 pub enum AppError {
@@ -93,6 +110,24 @@ pub enum AppError {
     /// El método HTTP no está declarado para esta ruta.
     #[error("{0}")]
     MethodNotAllowed(String),
+
+    /// No hay sesión válida para esta ruta.
+    ///
+    /// El motivo se explica —«hace falta una sesión válida»— pero **no** se
+    /// distingue «no hay cookie» de «la cookie no vale»: decir cuál de las dos es
+    /// contaría a quien no ha entrado si su sesión caducó o si la firma no
+    /// cuadra. El detalle se queda en el registro.
+    #[error("{0}")]
+    Unauthorized(String),
+
+    /// Un servicio de terceros —el proveedor de identidad— falló.
+    ///
+    /// Es el desenlace del descubrimiento, del canje del código o del JWKS: la
+    /// petición de podpot está bien y lo que no responde o responde mal es el
+    /// proveedor. La causa viaja en el error y acaba en el registro, nunca en el
+    /// cuerpo.
+    #[error("{0}")]
+    BadGateway(String),
 
     /// La capa de systemd falló. Cada variante suya tiene su propia traducción.
     #[error(transparent)]
@@ -131,6 +166,22 @@ impl IntoResponse for AppError {
                 CODE_METHOD_NOT_ALLOWED,
                 motivo,
             ),
+            // El 401 explica que hace falta sesión, no por qué la que llegó no
+            // vale: el detalle se queda en el registro de `session::verify`.
+            Self::Unauthorized(motivo) => {
+                tracing::debug!(motivo = %motivo, "petición sin sesión válida");
+                (StatusCode::UNAUTHORIZED, CODE_UNAUTHORIZED, motivo)
+            }
+            // El 502 no publica la causa del proveedor: es del operador y va al
+            // registro.
+            Self::BadGateway(causa) => {
+                tracing::error!(error = %causa, "el proveedor de identidad falló");
+                (
+                    StatusCode::BAD_GATEWAY,
+                    CODE_BAD_GATEWAY,
+                    BAD_GATEWAY_MESSAGE.to_owned(),
+                )
+            }
             Self::Systemd(causa) => traducir_systemd(causa),
             Self::Quadlet(causa) => traducir_quadlet(causa),
             Self::Config(causa) => {

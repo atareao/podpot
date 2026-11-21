@@ -40,6 +40,21 @@ export class ErrorDeProtocolo extends Error {
   }
 }
 
+/** Código con el que la API dice «no hay sesión». */
+export const SIN_SESION = 401
+
+/**
+ * ¿El error es un `401` de la API? Es la señal de «sin sesión»: la guarda y la
+ * reacción global del cliente de consultas la usan para volver a la portada.
+ *
+ * Solo cuenta un `ErrorDeApi`: un `401` de la API siempre llega con la envoltura
+ * `{error}` (nunca HTML ni redirección), así que un `ErrorDeProtocolo` con el
+ * mismo código HTTP no es la señal de sesión.
+ */
+export function esErrorDeSesion(error: unknown): boolean {
+  return error instanceof ErrorDeApi && error.status === SIN_SESION
+}
+
 function esObjeto(valor: unknown): valor is Record<string, unknown> {
   return typeof valor === 'object' && valor !== null && !Array.isArray(valor)
 }

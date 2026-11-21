@@ -125,3 +125,26 @@ export interface ResultadoDeAccion {
   name: string
   active_state: ActiveState
 }
+
+// ─── Autenticación ───────────────────────────────────────────────────────────
+
+/**
+ * Modo de autenticación activo. `disabled` (dev en loopback) no exige sesión;
+ * `oidc` protege la superficie de negocio y exige entrar.
+ */
+export type ModoDeAutenticacion = 'disabled' | 'oidc'
+
+/** `GET /api/v1/health` (público) — versión y modo de autenticación. */
+export interface Health {
+  version: string
+  auth_mode: ModoDeAutenticacion
+}
+
+/**
+ * `GET /api/v1/auth/session` (protegida). En modo `disabled` esa ruta **no
+ * existe** —contesta `404`—, así que el panel no la llama.
+ */
+export interface Sesion {
+  sub: string
+  email: string
+}
