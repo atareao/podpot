@@ -57,7 +57,7 @@ podman run --rm --userns=keep-id \
 ```text
 backend/     Rust + Axum (D-Bus, SQLite, API REST + SSE)
 frontend/    React + TS + Antd (Vite, pnpm, Vitest)
-migrations/  esquema SQLite (sqlx embebido)
+backend/migrations/  esquema SQLite (sqlx embebido, resuelto por `sqlx::migrate!`)
 docs/        un documento por feature
 plans/       planes de implementación
 ```
