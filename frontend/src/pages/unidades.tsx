@@ -13,8 +13,6 @@ import {
   useVerificarQuadlet,
 } from '../hooks/useUnits'
 import { mensajeDeError } from '../api/errores'
-import { identidadDeUnidad } from '../quadlets/identidad'
-import type { IdentidadDeQuadlet } from '../quadlets/identidad'
 import type {
   AccionDeUnidad,
   PeticionDeCreacion,
@@ -26,12 +24,6 @@ const VERBOS: Record<AccionDeUnidad, string> = {
   start: 'arrancada',
   stop: 'parada',
   restart: 'reiniciada',
-}
-
-/** La quadlet en edición y la identidad con la que se accionará su fichero. */
-interface Edicion {
-  unidad: QuadletUnit
-  identidad: IdentidadDeQuadlet
 }
 
 /** Valores de arranque del formulario: los que expone, tal cual se leyeron. */
@@ -78,11 +70,12 @@ function completarConDefinicion(
  * muestra el `error.message` de la API (colisión incluida) y **no** se refresca.
  *
  * La edición lee primero la definición (`GET`), precarga el formulario con ese
- * tipo y esos campos y guarda con `PATCH` sobre el nombre de **fichero**; si la
+ * tipo y esos campos y guarda con `PATCH` sobre el **nombre de fichero** que
+ * publica la API (`unit.file_name`, la identidad real de la quadlet); si la
  * lectura falla se explica y **no** se abre el formulario con valores
  * inventados. El borrado exige confirmación en la propia fila y, antes de enviar
- * el `DELETE` destructivo, verifica con un `GET` que el fichero deducido existe
- * (la identidad se deduce del nombre de unidad y no es inyectiva). Los
+ * el `DELETE` destructivo, verifica con un `GET` que el fichero existe (el
+ * listado es una foto y el fichero pudo desaparecer fuera del panel). Los
  * desenlaces avisan igual que la creación: `error.message` al fallar, refresco
  * al acertar.
  *
@@ -99,13 +92,13 @@ export default function Unidades() {
   const edicion = useEditarQuadlet()
   const verificacion = useVerificarQuadlet()
   const borrado = useBorrarQuadlet()
-  const [enEdicion, setEnEdicion] = useState<Edicion | null>(null)
-  // Unidad con un borrado en vuelo (verificación o `DELETE`): la identidad va
-  // por nombre de fichero, pero la fila a deshabilitar se identifica por unidad.
+  const [enEdicion, setEnEdicion] = useState<QuadletUnit | null>(null)
+  // Unidad con un borrado en vuelo (verificación o `DELETE`): la operación va por
+  // nombre de fichero, pero la fila a deshabilitar se identifica por unidad.
   const [enBorrado, setEnBorrado] = useState<QuadletUnit | null>(null)
   // La definición se pide al entrar en edición; hasta que llegue, no hay
   // formulario: precargarlo a medias sería enseñar valores que no son.
-  const lectura = useDetalleDeQuadlet(enEdicion?.identidad.file_name ?? null)
+  const lectura = useDetalleDeQuadlet(enEdicion?.file_name ?? null)
 
   /**
    * Unidad con alguna operación en vuelo, si la hay. Se deriva —nunca se
@@ -121,7 +114,7 @@ export default function Unidades() {
     if (accion.isPending) return accion.variables?.name ?? null
     if (verificacion.isPending || borrado.isPending) return enBorrado?.name ?? null
     if (enEdicion !== null && (lectura.isPending || edicion.isPending)) {
-      return enEdicion.unidad.name
+      return enEdicion.name
     }
     return null
   })()
@@ -146,24 +139,19 @@ export default function Unidades() {
     }
   }
 
-  /** Entra en edición; sin identidad deducible no hay fichero que leer. */
+  /** Entra en edición: el fichero a leer es la identidad publicada por la API. */
   const alEditar = (unidad: QuadletUnit) => {
-    const identidad = identidadDeUnidad(unidad.name)
-    if (identidad === null) {
-      message.error(`No se pudo identificar el fichero de «${unidad.name}».`)
-      return
-    }
-    setEnEdicion({ unidad, identidad })
+    setEnEdicion(unidad)
   }
 
   const alGuardarEdicion = async (peticion: PeticionDeCreacion): Promise<boolean> => {
     if (enEdicion === null || lectura.data === undefined) return false
     try {
       await edicion.mutateAsync({
-        nombre: enEdicion.identidad.file_name,
+        nombre: enEdicion.file_name,
         datos: completarConDefinicion(peticion, lectura.data),
       })
-      message.success(`Quadlet «${enEdicion.unidad.name}» editada.`)
+      message.success(`Quadlet «${enEdicion.name}» editada.`)
       setEnEdicion(null)
       return true
     } catch (error) {
@@ -174,27 +162,22 @@ export default function Unidades() {
   }
 
   const alBorrar = async (unidad: QuadletUnit) => {
-    const identidad = identidadDeUnidad(unidad.name)
-    if (identidad === null) {
-      message.error(`No se pudo identificar el fichero de «${unidad.name}».`)
-      return
-    }
     setEnBorrado(unidad)
     try {
-      // Antes de un borrado destructivo se confirma que el fichero deducido
-      // existe: la regla nombre de unidad → fichero no es inyectiva y un `DELETE`
-      // a ciegas podría borrar la quadlet equivocada. Un `404` aquí aborta.
-      await verificacion.mutateAsync(identidad.file_name)
+      // Antes de un borrado destructivo se confirma que el fichero existe: el
+      // listado es una foto y el fichero pudo desaparecer o cambiar fuera del
+      // panel. Un `404` aquí aborta el `DELETE`.
+      await verificacion.mutateAsync(unidad.file_name)
     } catch (error) {
       message.error(mensajeDeError(error))
       setEnBorrado(null)
       return
     }
     try {
-      await borrado.mutateAsync(identidad.file_name)
+      await borrado.mutateAsync(unidad.file_name)
       message.success(`Quadlet «${unidad.name}» borrada.`)
       // Si se estaba editando esa misma quadlet, el formulario ya no tiene sentido.
-      setEnEdicion((actual) => (actual?.unidad.name === unidad.name ? null : actual))
+      setEnEdicion((actual) => (actual?.file_name === unidad.file_name ? null : actual))
     } catch (error) {
       message.error(mensajeDeError(error))
     } finally {
@@ -229,7 +212,7 @@ export default function Unidades() {
         </Card>
       ) : (
         <Card
-          title={`Editar quadlet «${enEdicion.unidad.name}»`}
+          title={`Editar quadlet «${enEdicion.name}»`}
           size="small"
           style={{ marginBottom: 16 }}
         >
@@ -237,7 +220,7 @@ export default function Unidades() {
             <FormularioDeCreacion
               // El remontaje por fichero es lo que recarga los valores iniciales al
               // cambiar de quadlet editada: `initialValues` solo se lee al montar.
-              key={enEdicion.identidad.file_name}
+              key={enEdicion.file_name}
               valoresIniciales={valoresDeEdicion(lectura.data)}
               etiquetaDeEnvio="Guardar"
               identidadFija

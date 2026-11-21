@@ -25,6 +25,19 @@ export type ActiveState =
 /** Una quadlet descubierta, con el estado que reporta `systemd --user`. */
 export interface QuadletUnit {
   name: string
+  /**
+   * Nombre de fichero real de la quadlet (`web.container`): su **identidad**,
+   * la clave de `PATCH`/`DELETE`. Lo publica la API (basename de la
+   * procedencia que informa systemd), así que el panel **no** lo deduce del
+   * nombre de unidad —esa regla inversa no es inyectiva—.
+   */
+  file_name: string
+  /**
+   * Tipo derivado de la extensión del fichero. `null` cuando la extensión no
+   * corresponde a un tipo creable (systemd puede listar quadlets de tipos que
+   * el panel no conoce); el panel no lo necesita para operar.
+   */
+  kind: TipoDeQuadlet | null
   active_state: ActiveState
   sub_state: string
   unit_file_state: string

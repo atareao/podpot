@@ -15,6 +15,7 @@ use serde::Serialize;
 
 use crate::api::response::ApiResponse;
 use crate::error::AppError;
+use crate::quadlet::QuadletKind;
 use crate::state::AppState;
 use crate::systemd::{ActiveState, UnitAction, UnitFileState, UnitName, UnitStatus};
 
@@ -31,16 +32,44 @@ pub struct UnitSummary {
     sub_state: String,
     /// De dónde viene: `generated` para una quadlet.
     unit_file_state: UnitFileState,
+    /// El **nombre de fichero** de la quadlet (`web.container`): la identidad con
+    /// la que operan `PATCH`/`DELETE /api/v1/quadlets/{name}`. Es el basename de
+    /// la procedencia; la ruta completa **no** se publica.
+    file_name: String,
+    /// El tipo derivado de la extensión del fichero, o `null` si la extensión no
+    /// corresponde a un tipo que podpot sepa crear.
+    kind: Option<QuadletKind>,
 }
 
 impl From<UnitStatus> for UnitSummary {
     /// Recorta el estado del dominio a lo que se publica.
     fn from(estado: UnitStatus) -> Self {
+        // Invariante: el listado sólo emite quadlets —`is_quadlet()` exige
+        // fichero de origen—, así que aquí **siempre** hay nombre de fichero. El
+        // `debug_assert!` lo documenta y lo comprueba en pruebas y desarrollo; en
+        // release se compila fuera y el valor por defecto no cambia nada.
+        debug_assert!(
+            estado.file_name().is_some(),
+            "una unidad sin fichero de origen llegó al listado: {}",
+            estado.name
+        );
+        let file_name = estado.file_name().unwrap_or_default().to_owned();
+
+        // El tipo sale de la extensión del nombre de fichero, y sólo de ella: una
+        // extensión que podpot no sepa crear (`.kube`, `.quadlet`, …) deja el
+        // `kind` en `null` sin descartar la unidad del listado.
+        let kind = std::path::Path::new(&file_name)
+            .extension()
+            .and_then(std::ffi::OsStr::to_str)
+            .and_then(|extension| QuadletKind::from_extension(extension).ok());
+
         Self {
             name: estado.name,
             active_state: estado.active_state,
             sub_state: estado.sub_state,
             unit_file_state: estado.unit_file_state,
+            file_name,
+            kind,
         }
     }
 }
@@ -113,11 +142,14 @@ mod tests {
 
     use axum::http::{Method, StatusCode};
 
-    use crate::systemd::{SystemdClient, SystemdError, UnitAction, UnitName, fake::FakeSystemd};
+    use crate::systemd::{
+        ActiveState, SystemdClient, SystemdError, UnitAction, UnitFileState, UnitName, UnitOrigin,
+        UnitStatus, fake::FakeSystemd,
+    };
     use crate::test_support::{DobleQueFalla, entorno, entorno_con, peticion};
 
     /// Escenario «Hay quadlets instaladas»: el listado trae cada quadlet con sus
-    /// cuatro campos y **sin** la procedencia, que no se publica.
+    /// campos y **sin** la procedencia, que no se publica.
     #[tokio::test]
     async fn el_listado_trae_las_quadlets_con_su_estado() {
         let entorno = entorno().await;
@@ -139,20 +171,124 @@ mod tests {
         assert_eq!(unidades[0]["active_state"], "active");
         assert_eq!(unidades[0]["sub_state"], "running");
         assert_eq!(unidades[0]["unit_file_state"], "generated");
+        assert_eq!(unidades[0]["file_name"], "podpot-demo-db.container");
+        assert_eq!(unidades[0]["kind"], "container");
 
         assert_eq!(
             unidades[0]
                 .as_object()
                 .expect("una unidad es un objeto")
                 .len(),
-            4,
-            "el listado publica cuatro campos y ninguno más: {}",
+            6,
+            "el listado publica seis campos y ninguno más: {}",
             unidades[0]
         );
         assert!(
             unidades[0].get("origin").is_none(),
             "la procedencia no se publica: {}",
             unidades[0]
+        );
+    }
+
+    /// Escenario «Listado con la identidad real de cada quadlet»: cada unidad
+    /// publica su `file_name` —la identidad con la que operan `PATCH`/`DELETE`— y
+    /// su `kind` derivado de la extensión.
+    #[tokio::test]
+    async fn el_listado_publica_la_identidad_de_cada_quadlet() {
+        let entorno = entorno().await;
+
+        let (_, cuerpo) = peticion(&entorno.app(), Method::GET, "/api/v1/units").await;
+
+        let unidades = cuerpo["data"]
+            .as_array()
+            .expect("el listado es un array de unidades");
+
+        assert_eq!(unidades[0]["file_name"], "podpot-demo-db.container");
+        assert_eq!(unidades[0]["kind"], "container");
+        assert_eq!(unidades[1]["file_name"], "podpot-demo-web.container");
+        assert_eq!(unidades[1]["kind"], "container");
+    }
+
+    /// Escenario «La ruta no se publica»: el listado lleva el nombre de fichero
+    /// —un basename— pero nunca la ruta de la que systemd la generó.
+    #[tokio::test]
+    async fn el_listado_no_publica_la_ruta_del_sistema_de_ficheros() {
+        let entorno = entorno().await;
+
+        let (_, cuerpo) = peticion(&entorno.app(), Method::GET, "/api/v1/units").await;
+
+        let unidades = cuerpo["data"]
+            .as_array()
+            .expect("el listado es un array de unidades");
+
+        for unidad in unidades {
+            assert!(
+                unidad.get("origin").is_none(),
+                "la unidad publicó su procedencia: {unidad}"
+            );
+
+            let file_name = unidad["file_name"]
+                .as_str()
+                .expect("cada quadlet publica su nombre de fichero");
+            assert!(
+                !file_name.contains('/'),
+                "el `file_name` tiene que ser un basename, no una ruta: {file_name}"
+            );
+        }
+
+        let texto = cuerpo.to_string();
+        assert!(
+            !texto.contains("/home/") && !texto.contains("containers/systemd"),
+            "el listado publicó una ruta del sistema de ficheros: {texto}"
+        );
+    }
+
+    /// Una quadlet con una extensión que podpot **no** sabe crear se lista igual,
+    /// con su `file_name`, pero sin `kind`: la extensión no es un tipo conocido.
+    #[tokio::test]
+    async fn una_quadlet_con_extension_desconocida_no_tiene_kind() {
+        let entorno = entorno_con(Arc::new(FakeSystemd::con([UnitStatus {
+            name: UnitName::sin_validar("algo.service"),
+            active_state: ActiveState::Active,
+            sub_state: "running".to_owned(),
+            unit_file_state: UnitFileState::Generated,
+            origin: UnitOrigin::desde("/home/lorenzo/.config/containers/systemd/algo.quadlet"),
+        }])))
+        .await;
+
+        let (_, cuerpo) = peticion(&entorno.app(), Method::GET, "/api/v1/units").await;
+
+        let unidades = cuerpo["data"]
+            .as_array()
+            .expect("el listado es un array de unidades");
+
+        assert_eq!(unidades[0]["file_name"], "algo.quadlet");
+        assert!(
+            unidades[0]["kind"].is_null(),
+            "una extensión desconocida no tiene tipo: {}",
+            unidades[0]
+        );
+    }
+
+    /// Escenario «El doble sigue construyendo quadlets con origen»: las quadlets
+    /// de muestra se exponen con el `file_name` de su fichero.
+    #[tokio::test]
+    async fn las_quadlets_del_doble_se_exponen_con_su_file_name() {
+        let cliente: Arc<dyn SystemdClient> = Arc::new(FakeSystemd::demo());
+
+        let listado = cliente.quadlets().await.expect("el doble no falla");
+
+        let identidades: Vec<(&str, Option<&str>)> = listado
+            .iter()
+            .map(|unidad| (unidad.name.as_str(), unidad.file_name()))
+            .collect();
+
+        assert_eq!(
+            identidades,
+            [
+                ("podpot-demo-db.service", Some("podpot-demo-db.container")),
+                ("podpot-demo-web.service", Some("podpot-demo-web.container")),
+            ]
         );
     }
 

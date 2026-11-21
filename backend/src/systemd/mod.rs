@@ -415,6 +415,23 @@ impl UnitOrigin {
         &self.0
     }
 
+    /// El nombre de fichero de la quadlet: el **basename** de la procedencia.
+    ///
+    /// Es la identidad con la que operan `PATCH`/`DELETE /api/v1/quadlets/{name}`
+    /// —el fichero `<stem>.<kind>`, p. ej. `web.container`—. Se publica **sólo**
+    /// este último componente y nunca la ruta entera, que es una ruta del sistema
+    /// de ficheros del usuario. Devuelve `None` cuando la procedencia es
+    /// desconocida: una unidad transitoria no tiene fichero.
+    pub fn file_name(&self) -> Option<&str> {
+        if self.es_desconocido() {
+            return None;
+        }
+
+        std::path::Path::new(&self.0)
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+    }
+
     /// ¿No se pudo leer la procedencia?
     pub fn es_desconocido(&self) -> bool {
         self.0.is_empty()
@@ -486,6 +503,16 @@ impl UnitStatus {
     /// unidad; aquello enseñaba las transitorias como si fueran contenedores.
     pub fn is_quadlet(&self) -> bool {
         self.is_generated() && self.origin.es_fuente_de_quadlet()
+    }
+
+    /// El nombre de fichero de la quadlet, derivado de su procedencia.
+    ///
+    /// Delega en [`UnitOrigin::file_name`]: el basename del `SourcePath` es la
+    /// identidad real de la quadlet (`web.container`), y el dato vive aquí —en el
+    /// dominio— para poder probarlo con el doble y no recalcularlo en la capa API.
+    /// Devuelve `None` cuando la procedencia es desconocida.
+    pub fn file_name(&self) -> Option<&str> {
+        self.origin.file_name()
     }
 }
 
@@ -885,6 +912,84 @@ mod tests {
         ] {
             assert!(!es_origen_de_quadlet(otra), "{otra} no es una quadlet");
         }
+    }
+
+    /// Escenarios «Quadlet con fichero» y «Procedencia desconocida»: el nombre de
+    /// fichero es el **basename** de la procedencia —no la ruta entera—, y sólo
+    /// los bordes de `Path::file_name()` deciden cuándo no hay nombre.
+    ///
+    /// La tabla fija los bordes de la regla: una ruta normal, una sin separador,
+    /// una terminada en `/` —que `Path::file_name()` resuelve al último
+    /// componente, no a vacío— y los orígenes que **no** tienen basename: el
+    /// vacío (`desconocido()`), la raíz y el directorio padre.
+    #[test]
+    fn el_nombre_de_fichero_es_el_basename_de_la_procedencia() {
+        let casos: [(&str, Option<&str>); 6] = [
+            // Escenario «Quadlet con fichero»: ruta normal.
+            (
+                "/home/lorenzo/.config/containers/systemd/web.container",
+                Some("web.container"),
+            ),
+            // Una procedencia relativa también tiene basename.
+            ("web.container", Some("web.container")),
+            // El `/` final lo ignora `Path`: el último componente sigue siendo
+            // `systemd`. Se documenta tal cual porque systemd siempre informa un
+            // fichero, no un directorio.
+            ("/home/lorenzo/.config/containers/systemd/", Some("systemd")),
+            // Escenario «Procedencia desconocida»: sin fichero no hay nombre.
+            ("", None),
+            // La raíz y el padre no tienen componente final.
+            ("/", None),
+            ("..", None),
+        ];
+
+        for (origen, esperado) in casos {
+            assert_eq!(
+                UnitOrigin::desde(origen).file_name(),
+                esperado,
+                "procedencia {origen:?}"
+            );
+        }
+
+        // `desconocido()` es el vacío, y no tiene nombre de fichero.
+        assert_eq!(UnitOrigin::desconocido().file_name(), None);
+    }
+
+    /// Y el estado lo expone delegando en su procedencia.
+    #[test]
+    fn el_estado_expone_el_nombre_de_fichero_de_su_procedencia() {
+        let estado = UnitStatus {
+            origin: UnitOrigin::desde(
+                "/home/lorenzo/.config/containers/systemd/centinela-db.container",
+            ),
+            ..unidad("centinela-db.service", ActiveState::Active, "running")
+        };
+
+        assert_eq!(estado.file_name(), Some("centinela-db.container"));
+    }
+
+    /// La serialización del estado **no** publica la ruta de la que salió la
+    /// unidad —la procedencia sigue omitida—, pero el accesor del dominio sí da
+    /// su nombre de fichero.
+    #[test]
+    fn la_serializacion_del_estado_no_publica_la_ruta_pero_el_accesor_da_el_nombre() {
+        let estado = unidad("centinela-db.service", ActiveState::Active, "running");
+
+        let json = serde_json::to_value(&estado).expect("el estado se serializa");
+
+        assert!(
+            json.get("origin").is_none(),
+            "la procedencia no se publica: {json}"
+        );
+        assert!(
+            !json.to_string().contains("/home/lorenzo"),
+            "la ruta del sistema de ficheros no puede viajar: {json}"
+        );
+        assert_eq!(
+            estado.file_name(),
+            Some("prueba.container"),
+            "el accesor sí da el basename, aunque la ruta no se publique"
+        );
     }
 
     /// Una unidad de prueba: una quadlet —generada y con fichero de origen—. Las
