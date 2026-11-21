@@ -13,6 +13,11 @@ publish = false
 # máquina (~/.cargo/registry): el repositorio tiene que poder compilarse sin
 # conexión, así que se resuelven contra la caché y no por reputación.
 [dependencies]
+# El SSE no necesita feature: `axum::response::sse` (`Sse`, `Event`, `KeepAlive`)
+# es parte del crate en 0.8.9 —`pub mod sse` sin `cfg`— y lo único que pedía la
+# feature `tokio` (que ya está) es el `KeepAliveStream` de los latidos. Tampoco se
+# añade ninguna caja de streams: el flujo se compone con `futures-util`, que ya
+# está por el `StreamExt` del cliente de D-Bus.
 axum = { version = "0.8.9", features = ["macros", "json", "tokio"] }
 tokio = { version = "1.50.0", features = ["full"] }
 tracing = "0.1.44"
@@ -61,3 +66,8 @@ tempfile = "3"
 # prueba de arranque: `Child::kill` sólo manda `SIGKILL`, y con `SIGKILL` no se
 # puede medir un apagado ordenado.
 libc = "0.2"
+# `test-util` es lo que trae `#[tokio::test(start_paused = true)]`: con el reloj
+# parado, el *debounce* del vigilante se mide sin esperar los milisegundos de
+# verdad —y sin que la prueba dependa de lo que tarde la máquina—. No añade
+# ninguna caja nueva: la feature sólo enciende `rt`, `sync` y `time`.
+tokio = { version = "1.50.0", features = ["test-util"] }

@@ -11,6 +11,7 @@
 pub mod health;
 pub mod quadlets;
 pub mod response;
+pub mod stream;
 pub mod units;
 
 use std::path::Path;
@@ -48,6 +49,11 @@ pub fn router(state: AppState) -> Router {
     let api = Router::new()
         .route("/health", get(health::health))
         .route("/units", get(units::listar))
+        // La ruta del canal en vivo va **antes** que la de la acción —dos
+        // segmentos frente a tres— para que `stream` no se confunda con un nombre
+        // de unidad: el router resuelve por forma, no por orden, pero leerlo así
+        // deja claro que son dos recursos distintos.
+        .route("/units/stream", get(stream::stream))
         .route("/units/{name}/{action}", post(units::accionar))
         .route("/quadlets", post(quadlets::crear))
         .route(

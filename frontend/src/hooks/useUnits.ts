@@ -1,6 +1,8 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { accionDeUnidad, listarUnidades } from '../api/units'
 import { borrarQuadlet, crearQuadlet, editarQuadlet, obtenerQuadlet } from '../api/quadlets'
+import { claves } from './claves'
+import { useUnidadesEnVivo } from './useUnidadesEnVivo'
 import type {
   AccionDeUnidad,
   PeticionDeCreacion,
@@ -10,17 +12,14 @@ import type {
 } from '../types/api'
 
 /**
- * Claves de caché de React Query. Viven en un solo sitio para que invalidar sea
- * una operación deliberada y no una cadena escrita a mano en cada mutación.
+ * Listado de quadlets con su estado.
+ *
+ * Además de la consulta, engancha el canal SSE: cada instantánea que llega
+ * reemplaza la caché de `['units']`, de modo que el panel refleja los cambios de
+ * systemd sin refetch manual (ver `useUnidadesEnVivo`).
  */
-export const claves = {
-  units: ['units'] as const,
-  /** Definición de una quadlet concreta, por nombre de fichero. */
-  quadlet: (fileName: string) => ['quadlet', fileName] as const,
-}
-
-/** Listado de quadlets con su estado. */
 export function useUnits() {
+  useUnidadesEnVivo()
   return useQuery({
     queryKey: claves.units,
     queryFn: ({ signal }) => listarUnidades(signal),
