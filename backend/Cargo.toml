@@ -51,3 +51,7 @@ http-body-util = "0.1"
 # Base de datos temporal por prueba: el arranque no crea directorios, así que las
 # pruebas le dan uno que ya existe y que se limpia al soltarlo.
 tempfile = "3"
+# `libc::kill` es lo que permite mandar `SIGTERM` al proceso de verdad en la
+# prueba de arranque: `Child::kill` sólo manda `SIGKILL`, y con `SIGKILL` no se
+# puede medir un apagado ordenado.
+libc = "0.2"
