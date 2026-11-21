@@ -221,27 +221,15 @@ pub enum QuadletError {
         causa: std::io::Error,
     },
 
-    /// La creación se completó, pero no se pudo registrar.
+    /// La operación se completó, pero no se pudo registrar en la base de datos.
     ///
-    /// Es un fallo del propio podpot, no de la petición: se traduce a un `500`
-    /// genérico y el detalle se queda en el registro.
-    #[error("no se pudo registrar la creación de `{file_name}`: {causa}")]
-    Persistencia {
-        /// El nombre de fichero de la quadlet creada.
-        file_name: String,
-        /// El motivo, tal y como lo informó SQLite.
-        #[source]
-        causa: Box<sqlx::Error>,
-    },
-
-    /// La operación se completó, pero no se pudo registrar.
-    ///
-    /// Es el mismo desenlace que [`QuadletError::Persistencia`] para las
-    /// operaciones de edición y borrado: un fallo del propio podpot que se
-    /// traduce a un `500` genérico, con el detalle en el registro. El hecho
-    /// ocurrido —el fichero reescrito o borrado— **no** se deshace.
+    /// Única variante para el fallo de persistencia: cubre tanto la **creación**
+    /// como la **edición** y el **borrado**. Es un fallo del propio podpot, no de
+    /// la petición: se traduce a un `500` genérico y el detalle se queda en el
+    /// registro. El hecho ocurrido —el fichero creado, reescrito o borrado—
+    /// **no** se deshace.
     #[error("no se pudo registrar la operación sobre `{file_name}`: {causa}")]
-    Registro {
+    Persistencia {
         /// El nombre de fichero afectado.
         file_name: String,
         /// El motivo, tal y como lo informó SQLite.
