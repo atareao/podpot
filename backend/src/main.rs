@@ -1,14 +1,19 @@
 //! El binario de podpot: sólo la composición.
 //!
-//! Aquí no hay lógica: se lee la configuración, se levanta el registro, se
-//! compone el estado y se escucha hasta que llega una señal de terminación. Todo
-//! lo demás vive en la biblioteca, donde las pruebas lo alcanzan.
+//! Aquí no hay lógica: se lee la configuración, se levanta el registro, se abre
+//! la base, se elige el cliente de systemd, se compone el estado y se escucha
+//! hasta que llega una señal de terminación. Todo lo demás vive en la
+//! biblioteca, donde las pruebas lo alcanzan.
 
 use std::process::ExitCode;
+use std::sync::Arc;
 
-use podpot::config::{Config, DEFAULT_LOG_FILTER};
-use podpot::server;
+use podpot::config::{Config, DEFAULT_LOG_FILTER, SystemdBackend};
 use podpot::state::AppState;
+use podpot::systemd::dbus::DbusSystemdClient;
+use podpot::systemd::fake::FakeSystemd;
+use podpot::systemd::{SystemdClient, SystemdError};
+use podpot::{db, server};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -30,14 +35,38 @@ async fn main() -> ExitCode {
     init_tracing(&config.log_filter);
     tracing::info!(config = %config.describe(), "configuración efectiva al arrancar");
 
-    // 3. Escucha y apagado: el estado se compone desde la configuración ya resuelta.
-    let estado = AppState::new(config);
+    // 3. La base, ya migrada: cuando `preparar` vuelve, el esquema está al día.
+    let pool = match db::preparar(&config.database_url).await {
+        Ok(pool) => pool,
+        Err(error) => {
+            eprintln!("podpot no puede arrancar: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    tracing::info!(systemd = %config.systemd_backend, "base lista");
+
+    // 4. El cliente de systemd. La elección se toma aquí y en ningún otro sitio:
+    //    el estado se queda con el objeto que se le dé, así que ninguna ruta tiene
+    //    que saber si por debajo hay bus o doble.
+    let systemd = match cliente_de_systemd(config.systemd_backend).await {
+        Ok(systemd) => systemd,
+        Err(error) => {
+            eprintln!("podpot no puede arrancar: {error}");
+            pool.close().await;
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // 5. Escucha y apagado: el estado se compone con las tres piezas ya resueltas.
+    let estado = AppState::new(config, pool.clone(), systemd);
     let direccion = estado.bind_address();
 
     let listener = match tokio::net::TcpListener::bind(direccion).await {
         Ok(listener) => listener,
         Err(error) => {
             eprintln!("podpot no puede arrancar: no se puede escuchar en {direccion}: {error}");
+            pool.close().await;
             return ExitCode::FAILURE;
         }
     };
@@ -45,6 +74,10 @@ async fn main() -> ExitCode {
     tracing::info!(%direccion, "escuchando");
 
     let resultado = server::serve(estado, listener, server::shutdown_signal()).await;
+
+    // La escucha ha terminado sin nadie atendiendo: el pool se cierra antes de
+    // salir, que es la mitad de «liberar los recursos» del apagado ordenado.
+    pool.close().await;
 
     match resultado {
         Ok(()) => {
@@ -57,6 +90,21 @@ async fn main() -> ExitCode {
             eprintln!("el servidor se detuvo con error: {error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// El cliente de systemd que pide la configuración.
+///
+/// El doble de desarrollo no conecta con nada —sus unidades son de muestra— y el
+/// modo de verdad es el bus de **usuario**: si no hay bus, el proceso no arranca,
+/// porque un panel que enseñara el doble creyendo que enseña la máquina sería
+/// peor que un panel que no arranca.
+async fn cliente_de_systemd(
+    backend: SystemdBackend,
+) -> Result<Arc<dyn SystemdClient>, SystemdError> {
+    match backend {
+        SystemdBackend::Fake => Ok(Arc::new(FakeSystemd::demo())),
+        SystemdBackend::Dbus => Ok(Arc::new(DbusSystemdClient::connect_user().await?)),
     }
 }
 

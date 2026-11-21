@@ -5,9 +5,10 @@
 
 pub mod health;
 pub mod response;
+pub mod units;
 
 use axum::Router;
-use axum::routing::get;
+use axum::routing::{get, post};
 
 use crate::error::AppError;
 use crate::state::AppState;
@@ -18,9 +19,16 @@ use crate::state::AppState;
 /// una ruta que no existe y un método que no está declarado contestan por
 /// defecto con un cuerpo vacío, y el contrato del §1 exige la envoltura **también
 /// ahí**, así que las dos se sustituyen por manejadores propios.
+///
+/// La acción de una unidad va en la ruta —`…/{name}/{action}`— porque es lo que
+/// la identifica: `start` sobre una unidad y `stop` sobre la misma unidad son
+/// dos recursos distintos, y con la acción en el cuerpo cada petición tendría que
+/// llevar uno para decir qué quiere.
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/v1/health", get(health::health))
+        .route("/api/v1/units", get(units::listar))
+        .route("/api/v1/units/{name}/{action}", post(units::accionar))
         .fallback(ruta_inexistente)
         .method_not_allowed_fallback(metodo_no_permitido)
         .with_state(state)
