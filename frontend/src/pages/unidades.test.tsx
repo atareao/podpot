@@ -107,7 +107,7 @@ describe('pantalla de quadlets', () => {
 
     expect(await screen.findByText('Parada')).toBeInTheDocument()
 
-    await usuario.click(screen.getByRole('button', { name: 'Arrancar web.service' }))
+    await usuario.click(screen.getByRole('button', { name: 'Arrancar web.container' }))
 
     expect(await screen.findByText(/«web.service» arrancada/i)).toBeInTheDocument()
     expect(vi.mocked(accionDeUnidad)).toHaveBeenCalledWith('web.service', 'start')
@@ -129,7 +129,7 @@ describe('pantalla de quadlets', () => {
 
     expect(await screen.findByText('Parada')).toBeInTheDocument()
 
-    await usuario.click(screen.getByRole('button', { name: 'Arrancar web.service' }))
+    await usuario.click(screen.getByRole('button', { name: 'Arrancar web.container' }))
 
     expect(await screen.findByText('la unidad está en transición')).toBeInTheDocument()
     // Sin refresco: la tabla sigue enseñando el estado real de la unidad.
@@ -204,7 +204,7 @@ describe('edición de quadlets desde el panel', () => {
 
     montar()
 
-    await usuario.click(await screen.findByRole('button', { name: 'Editar web.service' }))
+    await usuario.click(await screen.findByRole('button', { name: 'Editar web.container' }))
 
     // La definición se pide por nombre de fichero, no por nombre de unidad.
     await waitFor(() => expect(vi.mocked(obtenerQuadlet)).toHaveBeenCalledWith('web.container', expect.anything()))
@@ -227,7 +227,7 @@ describe('edición de quadlets desde el panel', () => {
 
     montar()
 
-    await usuario.click(await screen.findByRole('button', { name: 'Editar web-data-volume.service' }))
+    await usuario.click(await screen.findByRole('button', { name: 'Editar web-data.volume' }))
 
     // El tipo sale de la definición leída y el fichero, de la API.
     await waitFor(() =>
@@ -248,7 +248,7 @@ describe('edición de quadlets desde el panel', () => {
 
     montar()
 
-    await usuario.click(await screen.findByRole('button', { name: 'Editar web.service' }))
+    await usuario.click(await screen.findByRole('button', { name: 'Editar web.container' }))
 
     expect(await screen.findByText(/cargando la quadlet/i)).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Guardar' })).not.toBeInTheDocument()
@@ -269,7 +269,7 @@ describe('edición de quadlets desde el panel', () => {
 
     montar()
 
-    await usuario.click(await screen.findByRole('button', { name: 'Editar web.service' }))
+    await usuario.click(await screen.findByRole('button', { name: 'Editar web.container' }))
 
     expect(await screen.findByText('no existe la quadlet «web.container»')).toBeInTheDocument()
     // Sin formulario con valores inventados: ni Guardar ni campos.
@@ -292,7 +292,7 @@ describe('edición de quadlets desde el panel', () => {
 
     montar()
 
-    await usuario.click(await screen.findByRole('button', { name: 'Editar web.service' }))
+    await usuario.click(await screen.findByRole('button', { name: 'Editar web.container' }))
     await usuario.click(await screen.findByRole('button', { name: 'Guardar' }))
 
     expect(await screen.findByText(/«web.service» editada/i)).toBeInTheDocument()
@@ -325,7 +325,7 @@ describe('edición de quadlets desde el panel', () => {
 
     montar()
 
-    await usuario.click(await screen.findByRole('button', { name: 'Editar web.service' }))
+    await usuario.click(await screen.findByRole('button', { name: 'Editar web.container' }))
     await usuario.click(await screen.findByRole('button', { name: 'Guardar' }))
 
     // El PATCH reemplaza el struct entero: lo que el formulario no muestra se
@@ -355,7 +355,7 @@ describe('edición de quadlets desde el panel', () => {
 
     montar()
 
-    await usuario.click(await screen.findByRole('button', { name: 'Editar web.service' }))
+    await usuario.click(await screen.findByRole('button', { name: 'Editar web.container' }))
     await usuario.click(await screen.findByRole('button', { name: 'Guardar' }))
 
     expect(await screen.findByText('la imagen no admite saltos de línea')).toBeInTheDocument()
@@ -373,7 +373,7 @@ describe('edición de quadlets desde el panel', () => {
 
     montar()
 
-    await usuario.click(await screen.findByRole('button', { name: 'Editar web.service' }))
+    await usuario.click(await screen.findByRole('button', { name: 'Editar web.container' }))
     await usuario.click(await screen.findByRole('button', { name: 'Cancelar' }))
 
     expect(await screen.findByRole('button', { name: 'Crear' })).toBeInTheDocument()
@@ -397,18 +397,18 @@ describe('edición de quadlets desde el panel', () => {
 
     montar()
 
-    await usuario.click(await screen.findByRole('button', { name: 'Editar web.service' }))
+    await usuario.click(await screen.findByRole('button', { name: 'Editar web.container' }))
 
     // Con una lectura en vuelo no se encadenan operaciones sobre esa fila.
-    expect(screen.getByRole('button', { name: 'Arrancar web.service' })).toBeDisabled()
-    expect(screen.getByRole('button', { name: 'Editar web.service' })).toBeDisabled()
-    expect(screen.getByRole('button', { name: 'Borrar web.service' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Arrancar web.container' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Editar web.container' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Borrar web.container' })).toBeDisabled()
 
     definicion.resolver(contenedor)
     await usuario.click(await screen.findByRole('button', { name: 'Guardar' }))
 
     // Y con un guardado en vuelo, tampoco.
-    expect(screen.getByRole('button', { name: 'Borrar web.service' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Borrar web.container' })).toBeDisabled()
 
     guardado.resolver({ file_name: 'web.container', unit_name: 'web.service', kind: 'container' })
     expect(await screen.findByText(/«web.service» editada/i)).toBeInTheDocument()
@@ -435,7 +435,7 @@ describe('identidad publicada por la API', () => {
 
     montar()
 
-    await usuario.click(await screen.findByRole('button', { name: 'Editar web-volume.service' }))
+    await usuario.click(await screen.findByRole('button', { name: 'Editar web-volume.container' }))
 
     // La definición se lee por el fichero que publicó la API.
     await waitFor(() =>
@@ -470,7 +470,7 @@ describe('identidad publicada por la API', () => {
 
     montar()
 
-    await usuario.click(await screen.findByRole('button', { name: 'Borrar web-volume.service' }))
+    await usuario.click(await screen.findByRole('button', { name: 'Borrar web-volume.container' }))
     await usuario.click(await screen.findByRole('button', { name: 'Sí, borrar' }))
 
     expect(await screen.findByText(/«web-volume.service» borrada/i)).toBeInTheDocument()
@@ -499,12 +499,14 @@ describe('dos quadlets con el mismo nombre de unidad', () => {
 
     montar()
 
-    const botonesEditar = await screen.findAllByRole('button', {
-      name: 'Editar web-volume.service',
+    // Cada fila lleva su `file_name` en el nombre accesible del botón: ya no
+    // comparten «Editar web-volume.service».
+    const botonContenedor = await screen.findByRole('button', {
+      name: 'Editar web-volume.container',
     })
-    expect(botonesEditar).toHaveLength(2)
+    const botonVolumen = await screen.findByRole('button', { name: 'Editar web.volume' })
 
-    await usuario.click(botonesEditar[0]!)
+    await usuario.click(botonContenedor)
     await waitFor(() =>
       expect(vi.mocked(obtenerQuadlet)).toHaveBeenCalledWith(
         'web-volume.container',
@@ -514,7 +516,7 @@ describe('dos quadlets con el mismo nombre de unidad', () => {
 
     // Se cierra la edición y se abre la de la otra fila: cada una por su fichero.
     await usuario.click(await screen.findByRole('button', { name: 'Cancelar' }))
-    await usuario.click(botonesEditar[1]!)
+    await usuario.click(botonVolumen)
     await waitFor(() =>
       expect(vi.mocked(obtenerQuadlet)).toHaveBeenCalledWith('web.volume', expect.anything()),
     )
@@ -530,7 +532,7 @@ describe('borrado de quadlets desde el panel', () => {
 
     montar()
 
-    await usuario.click(await screen.findByRole('button', { name: 'Borrar web.service' }))
+    await usuario.click(await screen.findByRole('button', { name: 'Borrar web.container' }))
 
     expect(await screen.findByText('¿Borrar la quadlet «web.service»?')).toBeInTheDocument()
 
@@ -556,7 +558,7 @@ describe('borrado de quadlets desde el panel', () => {
 
     montar()
 
-    await usuario.click(await screen.findByRole('button', { name: 'Borrar web.service' }))
+    await usuario.click(await screen.findByRole('button', { name: 'Borrar web.container' }))
     await usuario.click(await screen.findByRole('button', { name: 'Sí, borrar' }))
 
     expect(await screen.findByText(/«web.service» borrada/i)).toBeInTheDocument()
@@ -584,7 +586,7 @@ describe('borrado de quadlets desde el panel', () => {
 
     montar()
 
-    await usuario.click(await screen.findByRole('button', { name: 'Borrar web-volume.service' }))
+    await usuario.click(await screen.findByRole('button', { name: 'Borrar web-volume.container' }))
     await usuario.click(await screen.findByRole('button', { name: 'Sí, borrar' }))
 
     expect(
@@ -608,7 +610,7 @@ describe('borrado de quadlets desde el panel', () => {
 
     montar()
 
-    await usuario.click(await screen.findByRole('button', { name: 'Borrar web.service' }))
+    await usuario.click(await screen.findByRole('button', { name: 'Borrar web.container' }))
     await usuario.click(await screen.findByRole('button', { name: 'Sí, borrar' }))
 
     expect(await screen.findByText(/«web.service» borrada/i)).toBeInTheDocument()
@@ -631,10 +633,10 @@ describe('borrado de quadlets desde el panel', () => {
 
     montar()
 
-    await usuario.click(await screen.findByRole('button', { name: 'Editar web.service' }))
+    await usuario.click(await screen.findByRole('button', { name: 'Editar web.container' }))
     expect(await screen.findByRole('button', { name: 'Guardar' })).toBeInTheDocument()
 
-    await usuario.click(screen.getByRole('button', { name: 'Borrar web.service' }))
+    await usuario.click(screen.getByRole('button', { name: 'Borrar web.container' }))
     await usuario.click(await screen.findByRole('button', { name: 'Sí, borrar' }))
 
     // El formulario que editaba esa quadlet ya no tiene nada que editar.
@@ -654,7 +656,7 @@ describe('borrado de quadlets desde el panel', () => {
 
     montar()
 
-    await usuario.click(await screen.findByRole('button', { name: 'Borrar web.service' }))
+    await usuario.click(await screen.findByRole('button', { name: 'Borrar web.container' }))
     await usuario.click(await screen.findByRole('button', { name: 'Sí, borrar' }))
 
     expect(await screen.findByText('no existe la quadlet «web.container»')).toBeInTheDocument()
@@ -669,7 +671,7 @@ describe('visor de logs desde el panel', () => {
 
     montar()
 
-    await usuario.click(await screen.findByRole('button', { name: 'Logs web.service' }))
+    await usuario.click(await screen.findByRole('button', { name: 'Logs web.container' }))
 
     expect(await screen.findByText('Registros de web.service')).toBeInTheDocument()
     // El canal de logs usa el nombre de unidad; la última suscripción es la suya
