@@ -105,7 +105,7 @@ El panel SHALL ofrecer la acción de editar una quadlet existente, reutilizando 
 
 ### Requirement: Borrado de quadlets desde el panel
 
-El panel SHALL ofrecer la acción de borrar una quadlet existente, solicitando confirmación antes de ejecutarla (acción destructiva). La confirmación SHALL identificar la quadlet con la misma identidad que la fila y los nombres accesibles, es decir, el `file_name` publicado por la API. Al confirmar con éxito SHALL refrescar el listado; al fallar SHALL mostrar el `error.message` devuelto por la API.
+El panel SHALL ofrecer la acción de borrar una quadlet existente, solicitando confirmación antes de ejecutarla (acción destructiva). La confirmación y el aviso de éxito SHALL identificar la quadlet con la misma identidad que la fila y los nombres accesibles, es decir, el `file_name` publicado por la API. Al confirmar con éxito SHALL refrescar el listado; al fallar SHALL mostrar el `error.message` devuelto por la API.
 
 #### Scenario: Confirmación antes de borrar
 
@@ -118,6 +118,12 @@ El panel SHALL ofrecer la acción de borrar una quadlet existente, solicitando c
 - **THEN** el título y la descripción SHALL identificar la quadlet por su `file_name`
 - **AND** NO SHALL usar el nombre de unidad como identidad principal cuando el `file_name` esté disponible
 
+#### Scenario: Aviso de borrado con la identidad publicada
+
+- **WHEN** el borrado se completa con éxito
+- **THEN** el aviso SHALL identificar la quadlet por su `file_name`
+- **AND** NO SHALL usar el nombre de unidad como identidad principal cuando el `file_name` esté disponible
+
 #### Scenario: Borrado confirmado
 
 - **WHEN** el usuario confirma el borrado y la API responde con éxito
@@ -127,6 +133,12 @@ El panel SHALL ofrecer la acción de borrar una quadlet existente, solicitando c
 
 - **WHEN** el usuario cancela la confirmación
 - **THEN** NO SHALL enviarse petición alguna de borrado
+
+#### Scenario: Fallback defensivo ante identidad vacía
+
+- **WHEN** una quadlet llega con `file_name` vacío
+- **THEN** la confirmación y el aviso SHALL usar el nombre de unidad como identidad
+- **AND** NO SHALL renderizar el literal `null`
 
 ### Requirement: Identidad de quadlet para las acciones
 
