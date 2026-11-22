@@ -446,6 +446,28 @@ describe('identidad publicada por la API', () => {
     )
   })
 
+  it('el título de la tarjeta de edición usa el file_name publicado', async () => {
+    const usuario = userEvent.setup()
+    vi.mocked(listarUnidades).mockResolvedValue([
+      unidad({ name: 'web.service', file_name: 'web.container', unit_file_state: 'generated' }),
+    ])
+    vi.mocked(obtenerQuadlet).mockResolvedValue({
+      name: 'web',
+      kind: 'container',
+      image: 'docker.io/library/nginx',
+    })
+
+    montar()
+
+    await usuario.click(await screen.findByRole('button', { name: 'Editar web.container' }))
+
+    // La identidad visible es el fichero, no el nombre de unidad.
+    const titulo = await screen.findByText('Editar quadlet «web.container»')
+    expect(titulo).toBeInTheDocument()
+    expect(titulo).not.toHaveTextContent('web.service')
+    expect(screen.queryByText('Editar quadlet «web.service»')).not.toBeInTheDocument()
+  })
+
   it('borra usando el file_name publicado, sin invertir el nombre de unidad', async () => {
     const usuario = userEvent.setup()
     vi.mocked(listarUnidades)
