@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { Alert, App, Button, Card, Space, Spin, Typography } from 'antd'
 import { TablaDeUnidades } from '../components/TablaDeUnidades/TablaDeUnidades'
+import { identidadDe } from '../identidad'
 import { VisorDeRegistros } from '../components/VisorDeRegistros/VisorDeRegistros'
 import { FormularioDeCreacion } from '../components/FormularioDeCreacion/FormularioDeCreacion'
 import type { ValoresDeFormulario } from '../components/FormularioDeCreacion/FormularioDeCreacion'
@@ -184,7 +185,7 @@ export default function Unidades() {
     }
     try {
       await borrado.mutateAsync(unidad.file_name)
-      message.success(`Quadlet «${unidad.name}» borrada.`)
+      message.success(`Quadlet «${identidadDe(unidad)}» borrada.`)
       // Si se estaba editando esa misma quadlet, el formulario ya no tiene sentido.
       setEnEdicion((actual) => (actual?.file_name === unidad.file_name ? null : actual))
     } catch (error) {

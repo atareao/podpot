@@ -473,7 +473,7 @@ describe('identidad publicada por la API', () => {
     await usuario.click(await screen.findByRole('button', { name: 'Borrar web-volume.container' }))
     await usuario.click(await screen.findByRole('button', { name: 'Sí, borrar' }))
 
-    expect(await screen.findByText(/«web-volume.service» borrada/i)).toBeInTheDocument()
+    expect(await screen.findByText(/«web-volume.container» borrada/i)).toBeInTheDocument()
     expect(vi.mocked(obtenerQuadlet)).toHaveBeenCalledWith(
       'web-volume.container',
       expect.anything(),
@@ -561,7 +561,7 @@ describe('borrado de quadlets desde el panel', () => {
     await usuario.click(await screen.findByRole('button', { name: 'Borrar web.container' }))
     await usuario.click(await screen.findByRole('button', { name: 'Sí, borrar' }))
 
-    expect(await screen.findByText(/«web.service» borrada/i)).toBeInTheDocument()
+    expect(await screen.findByText(/«web.container» borrada/i)).toBeInTheDocument()
     expect(vi.mocked(obtenerQuadlet)).toHaveBeenCalledWith('web.container', expect.anything())
     expect(vi.mocked(borrarQuadlet)).toHaveBeenCalledWith('web.container')
     // Primero la verificación, después el borrado: nunca al revés.
@@ -613,7 +613,7 @@ describe('borrado de quadlets desde el panel', () => {
     await usuario.click(await screen.findByRole('button', { name: 'Borrar web.container' }))
     await usuario.click(await screen.findByRole('button', { name: 'Sí, borrar' }))
 
-    expect(await screen.findByText(/«web.service» borrada/i)).toBeInTheDocument()
+    expect(await screen.findByText(/«web.container» borrada/i)).toBeInTheDocument()
     expect(vi.mocked(borrarQuadlet)).toHaveBeenCalledWith('web.container')
     await waitFor(() => expect(vi.mocked(listarUnidades)).toHaveBeenCalledTimes(2))
     expect(await screen.findByText('No hay quadlets')).toBeInTheDocument()
@@ -661,6 +661,32 @@ describe('borrado de quadlets desde el panel', () => {
 
     expect(await screen.findByText('no existe la quadlet «web.container»')).toBeInTheDocument()
     expect(vi.mocked(listarUnidades)).toHaveBeenCalledTimes(1)
+  })
+
+  it('si el file_name llega vacío, el aviso de borrado usa el nombre de unidad', async () => {
+    const usuario = userEvent.setup()
+    // Prueba defensiva de UI: el contrato publica `file_name` no nulo, pero si
+    // llega vacío la identidad cae al nombre de unidad y el aviso no muestra
+    // el literal `null`.
+    vi.mocked(listarUnidades)
+      .mockResolvedValueOnce([unidad({ name: 'web.service', file_name: '' })])
+      .mockResolvedValueOnce([])
+    vi.mocked(obtenerQuadlet).mockResolvedValue({ name: 'web', kind: 'container' })
+    vi.mocked(borrarQuadlet).mockResolvedValue({
+      file_name: '',
+      unit_name: 'web.service',
+      kind: 'container',
+    })
+
+    montar()
+
+    await usuario.click(await screen.findByRole('button', { name: 'Borrar web.service' }))
+    await usuario.click(await screen.findByRole('button', { name: 'Sí, borrar' }))
+
+    expect(await screen.findByText('Quadlet «web.service» borrada.')).toBeInTheDocument()
+    expect(screen.queryAllByText(/null/i)).toHaveLength(0)
+    expect(vi.mocked(obtenerQuadlet)).toHaveBeenCalledWith('', expect.anything())
+    expect(vi.mocked(borrarQuadlet)).toHaveBeenCalledWith('')
   })
 })
 
