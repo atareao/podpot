@@ -797,6 +797,14 @@ pub mod proveedor_falso {
         /// Es el escenario del proveedor que no responde al refrescar el conjunto,
         /// y se enciende a voluntad para que la prueba decida **cuándo** se cae.
         caido: Arc<AtomicBool>,
+        /// Si el **descubrimiento** está caído: desde aquí, sus lecturas contestan
+        /// `500`.
+        ///
+        /// Es el escenario del proveedor que deja de servir el documento del que
+        /// sale el `jwks_uri`. Se enciende a voluntad para que la prueba decida
+        /// **cuándo** se cae el descubrimiento, sin tocar el JWKS ni el conjunto ya
+        /// cacheado.
+        caido_descubrimiento: Arc<AtomicBool>,
         /// Lecturas del `jwks_uri` que el proveedor ha atendido.
         ///
         /// Lo cuenta el propio doble —y no `received_requests`— porque lo que las
@@ -834,9 +842,16 @@ pub mod proveedor_falso {
                 "jwks_uri": format!("{issuer}{RUTA_JWKS}"),
             });
 
+            // El documento se sirve sano por defecto; la bandera permite tumbarlo a
+            // voluntad para reproducir al proveedor que no responde al descubrimiento.
+            let caido_descubrimiento = Arc::new(AtomicBool::new(false));
+
             Mock::given(method("GET"))
                 .and(path(RUTA_DESCUBRIMIENTO))
-                .respond_with(ResponseTemplate::new(200).set_body_json(documento))
+                .respond_with(lector_del_descubrimiento(
+                    Arc::clone(&caido_descubrimiento),
+                    documento,
+                ))
                 .mount(&server)
                 .await;
 
@@ -869,6 +884,7 @@ pub mod proveedor_falso {
                 clave_confusa: EncodingKey::from_secret(&publica),
                 publicadas,
                 caido,
+                caido_descubrimiento,
                 peticiones_al_jwks,
                 retardo_jwks,
             }
@@ -976,6 +992,15 @@ pub mod proveedor_falso {
         /// flujo tenía cacheado sigue valiendo, y lo que no llega es el nuevo.
         pub fn tumbar_el_jwks(&self) {
             self.caido.store(true, Ordering::SeqCst);
+        }
+
+        /// Tumba el **descubrimiento**: desde aquí, sus lecturas contestan `500`.
+        ///
+        /// Es el escenario del proveedor que deja de servir el documento del que
+        /// sale el `jwks_uri`: el refresco del conjunto no llega ni a saber a dónde
+        /// ir, mientras que el conjunto que el flujo tenía cacheado sigue valiendo.
+        pub fn tumbar_el_descubrimiento(&self) {
+            self.caido_descubrimiento.store(true, Ordering::SeqCst);
         }
 
         /// Retrasa la respuesta del `jwks_uri` el número de milisegundos dado.
@@ -1130,6 +1155,25 @@ pub mod proveedor_falso {
 
             ResponseTemplate::new(200)
                 .set_body_json(serde_json::to_value(conjunto).expect("el JWKS debe serializarse"))
+        }
+    }
+
+    /// El lector del descubrimiento: sirve el documento sano, o un `500` si está caído.
+    ///
+    /// Es el complemento de [`lector_del_jwks`] para el documento del que sale el
+    /// `jwks_uri`: por defecto devuelve el documento tal cual, sin contar lecturas
+    /// —de eso se encarga `peticiones_de_descubrimiento`—, y con la bandera puesta
+    /// contesta un error para reproducir al proveedor que ha dejado de responder.
+    fn lector_del_descubrimiento(
+        caido: Arc<AtomicBool>,
+        documento: serde_json::Value,
+    ) -> impl Fn(&Request) -> ResponseTemplate + Send + Sync + 'static {
+        move |_peticion| {
+            if caido.load(Ordering::SeqCst) {
+                return ResponseTemplate::new(500);
+            }
+
+            ResponseTemplate::new(200).set_body_json(documento.clone())
         }
     }
 

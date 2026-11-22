@@ -50,5 +50,4 @@ Es el follow-up registrado en `docs/autenticacion-oidc.md` y en `HANDOFF.md` («
 
 ## Follow-ups
 
-- **`discovery_cached` fallando dentro del refresco.** Si el descubrimiento falla justo cuando `refrescar_jwks` lo necesita, el error se propaga y no se cachea nada, pero ese camino concreto (refresco del JWKS que falla *por el descubrimiento*, no por el `jwks_uri`) no tiene test propio. Candidato a cubrir.
 - (Heredados) autorización por rol; logout con cookie inválida; refresh de tokens; chunk de antd >500 kB.

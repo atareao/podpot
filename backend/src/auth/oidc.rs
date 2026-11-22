@@ -1715,4 +1715,82 @@ mod tests {
             "el conjunto anterior sigue en la caché: verificar no vuelve al jwks_uri"
         );
     }
+
+    /// Escenario «Descubrimiento caído al refrescar el JWKS»: el `jwks_uri` está
+    /// sano, pero el documento del descubrimiento —de donde sale su URL— deja de
+    /// responder justo cuando hay que refrescar el conjunto.
+    ///
+    /// El desenlace es el `502` de la casa —la envoltura de siempre, y **sin** la
+    /// causa del proveedor— y no hay identidad que emitir: no hay sesión. El fallo
+    /// **no** envenena la caché: el conjunto anterior sigue sirviendo sin volver a
+    /// pedir el `jwks_uri`.
+    #[tokio::test]
+    async fn un_descubrimiento_caido_al_refrescar_el_jwks_da_un_502_sin_envenenar_la_cache() {
+        let proveedor = ProveedorFalso::servir().await;
+        let estado = auth(&proveedor);
+
+        cachear_el_jwks(&estado, &proveedor).await;
+
+        // Se vacía la caché del descubrimiento para que el refresco tenga que
+        // volver a pedirlo: es la única forma de que el escenario hable del
+        // descubrimiento y no del conjunto ya cacheado.
+        *estado.discovery.write().await = None;
+
+        proveedor.tumbar_el_descubrimiento();
+
+        let rotada = proveedor.rotar_clave();
+        let token_rotado = proveedor.firmar_con_rotada(
+            &rotada,
+            &IdToken::valido(&proveedor.issuer, OIDC_CLIENT_ID, "nonce-esperado"),
+        );
+
+        let error = verificar_id_token(&estado, &token_rotado, "nonce-esperado")
+            .await
+            .expect_err("sin descubrimiento no hay jwks_uri al que ir");
+
+        assert!(
+            matches!(error, AppError::BadGateway(_)),
+            "un descubrimiento que no responde es un 502 tipado: {error}"
+        );
+
+        let (estado_http, cuerpo) = respuesta_de(error).await;
+
+        assert_eq!(
+            proveedor.peticiones_de_descubrimiento().await,
+            2,
+            "el refresco vuelve a pedir el documento caído antes de rendirse"
+        );
+
+        assert_eq!(
+            estado_http,
+            StatusCode::BAD_GATEWAY,
+            "el refresco que falla desenlaza en 502: {cuerpo}"
+        );
+        assert_eq!(cuerpo["error"]["code"], "bad_gateway");
+        assert_eq!(
+            cuerpo["error"]["message"], BAD_GATEWAY_MESSAGE,
+            "el cuerpo no puede publicar la causa del proveedor: {cuerpo}"
+        );
+        assert!(
+            !cuerpo.to_string().contains("descubrimiento"),
+            "la causa del descubrimiento no puede acabar en el cuerpo: {cuerpo}"
+        );
+
+        // El fallo no envenena la caché: el conjunto anterior sigue sirviendo y el
+        // token con el `kid` original verifica sin volver a ir al `jwks_uri`.
+        let token_original = proveedor.firmar(&IdToken::valido(
+            &proveedor.issuer,
+            OIDC_CLIENT_ID,
+            "nonce-esperado",
+        ));
+        verificar_id_token(&estado, &token_original, "nonce-esperado")
+            .await
+            .expect("el conjunto anterior sigue sirviendo tras el fallo del descubrimiento");
+
+        assert_eq!(
+            proveedor.peticiones_al_jwks(),
+            1,
+            "el conjunto anterior sigue en la caché: verificar no vuelve al jwks_uri"
+        );
+    }
 }
