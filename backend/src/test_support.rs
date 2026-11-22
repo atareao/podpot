@@ -572,6 +572,46 @@ pub fn cookie_de_sesion() -> String {
     format!("{}={}", crate::auth::session::SESSION_COOKIE_NAME, token)
 }
 
+/// El instante actual en segundos desde la época.
+///
+/// Es el mismo reloj que usa `jsonwebtoken` para validar `exp`, así que las
+/// pruebas pueden fabricar caducidades relativas a «ahora» sin comparar contra
+/// una fecha fija.
+pub fn ahora_en_segundos() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("el reloj del sistema no puede estar antes de la época")
+        .as_secs()
+}
+
+/// Una cookie de sesión válida con la caducidad indicada, firmada con el secreto
+/// de las pruebas.
+///
+/// Es la puerta de los escenarios de renovación: permite colocar la sesión a
+/// punto de caducar, recién emitida o ya caducada sin esperar ocho horas.
+pub fn cookie_de_sesion_con_caducidad(exp: u64) -> String {
+    let token = crate::auth::session::issue_con_caducidad(
+        &SecretString::new(SECRETO.to_owned()),
+        SUB.to_owned(),
+        EMAIL.to_owned(),
+        exp,
+    )
+    .expect("la sesión de prueba con caducidad tiene que poder emitirse");
+
+    format!("{}={}", crate::auth::session::SESSION_COOKIE_NAME, token)
+}
+
+/// El valor de una cookie dentro de una cabecera `Set-Cookie`.
+///
+/// Parte por `;` —los atributos (`Path`, `Max-Age`, …) van ahí— y busca el par
+/// `nombre=valor`; devuelve sólo el valor, sin los atributos ni el nombre.
+pub fn valor_de_cookie(set_cookie: &str, nombre: &str) -> Option<String> {
+    set_cookie.split(';').find_map(|par| {
+        let (clave, valor) = par.trim().split_once('=')?;
+        (clave == nombre).then(|| valor.to_owned())
+    })
+}
+
 /// Lanza una petición con una cookie contra el router y devuelve el código y el
 /// cuerpo JSON.
 pub async fn peticion_con_cookie(
