@@ -50,7 +50,7 @@ En modo `oidc`, la aplicación SHALL exponer `GET /api/v1/auth/login`, que SHALL
 
 ### Requirement: Sesión en cookie
 
-La sesión SHALL ser un JWT firmado con un secreto de la configuración, transportado en una cookie `HttpOnly` y `SameSite=Strict`, con `Secure` únicamente cuando el redirect sea https. Cada token de sesión SHALL caducar; la sesión puede renovarse de forma deslizante sin tope absoluto de vida. `GET /api/v1/auth/session` SHALL devolver la identidad autenticada de la sesión actual. `POST /api/v1/auth/logout` SHALL borrar la cookie de sesión siempre, con independencia de que la cookie presentada verifique o no. En modo `oidc`, el *gate* SHALL renovar la sesión de forma deslizante cuando a un token válido le queden la ventana de renovación o menos. SHALL emitir una cookie nueva con la misma identidad (`sub` y `email`), con `iat` y `exp` nuevos y con la vida completa. Un token fuera de la ventana NO SHALL renovarse. La renovación NO SHALL cambiar el cuerpo ni el código de la respuesta.
+La sesión SHALL ser un JWT firmado con un secreto de la configuración, transportado en una cookie `HttpOnly` y `SameSite=Strict`, con `Secure` únicamente cuando el redirect sea https. Cada token de sesión SHALL caducar; la sesión puede renovarse de forma deslizante sin tope absoluto de vida. `GET /api/v1/auth/session` SHALL devolver la identidad autenticada de la sesión actual. `POST /api/v1/auth/logout` SHALL borrar la cookie de sesión siempre, con independencia de que la cookie presentada verifique o no. En modo `oidc`, el *gate* SHALL renovar la sesión de forma deslizante cuando a un token válido le queden la ventana de renovación o menos. SHALL emitir una cookie nueva con la misma identidad (`sub` y `email`), con `iat` y `exp` nuevos y con la vida completa. Un token fuera de la ventana NO SHALL renovarse. Salvo en el caso de refresh rechazado por el proveedor descrito en el requisito «Refresco del ID token del proveedor», la renovación NO SHALL cambiar el cuerpo ni el código de la respuesta.
 
 #### Scenario: Identidad de la sesión
 
@@ -92,6 +92,11 @@ La sesión SHALL ser un JWT firmado con un secreto de la configuración, transpo
 
 - **WHEN** un cliente pide una ruta de negocio con una cookie caducada o con firma inválida
 - **THEN** SHALL recibir `401` con la envoltura y NO SHALL recibir una `Set-Cookie` de renovación
+
+#### Scenario: Sesión revocada por el proveedor
+
+- **WHEN** el proveedor rechaza el `refresh_token` durante la renovación
+- **THEN** SHALL recibir `401` con la envoltura y SHALL borrarse la cookie de sesión
 
 #### Scenario: Modo deshabilitado
 
@@ -170,3 +175,38 @@ En modo `oidc`, el conjunto de claves públicas del proveedor (`JWKS`) SHALL alm
 - **AND** la causa subyacente NO SHALL exponerse en el cuerpo
 - **AND** NO SHALL emitirse sesión
 - **AND** la caché anterior del JWKS NO SHALL modificarse
+
+### Requirement: Refresco del ID token del proveedor
+
+En modo `oidc`, cuando el canje del código devuelve un `refresh_token`, la aplicación SHALL asociarlo a la sesión emitida mediante un identificador `jti` y conservarlo **solo en memoria**. El `refresh_token` NO SHALL exponerse al cliente ni persistirse en disco; se pierde al reiniciar el proceso. Durante la renovación deslizante, si la sesión tiene `jti` y hay `refresh_token` asociado, la aplicación SHALL solicitar un ID token nuevo al `token_endpoint` con `grant_type=refresh_token` antes de emitir la cookie. El ID token nuevo SHALL verificarse con la misma exigencia que el del callback, salvo el `nonce`, que puede no venir en un refresh. Si el proveedor devuelve un `refresh_token` nuevo, SHALL sustituir al anterior. Si el proveedor responde `invalid_grant`, la aplicación SHALL descartar el `refresh_token` y considerar la sesión sin sesión. Si el refresh falla por red o por un error del proveedor distinto de `invalid_grant`, la aplicación SHALL mantener la sesión local y renovarla como hasta ahora. Sin `refresh_token`, la renovación local NO SHALL cambiar.
+
+#### Scenario: Captura del refresh_token en el callback
+
+- **WHEN** el canje del código devuelve un `refresh_token`
+- **THEN** la sesión emitida SHALL llevar un `jti` y el `refresh_token` SHALL quedar asociado a ese `jti`
+
+#### Scenario: Renovación con refresh_token válido
+
+- **WHEN** una sesión con `jti` y `refresh_token` entra en la ventana de renovación
+- **THEN** SHALL realizarse una petición al `token_endpoint` con `grant_type=refresh_token`
+- **AND** el ID token nuevo SHALL verificarse y SHALL emitirse una cookie nueva con la misma identidad
+
+#### Scenario: Rotación del refresh_token
+
+- **WHEN** el proveedor devuelve un `refresh_token` nuevo en el refresh
+- **THEN** SHALL sustituirse el anterior asociado al mismo `jti`
+
+#### Scenario: Refresh rechazado por el proveedor
+
+- **WHEN** el proveedor responde `invalid_grant` al refresh
+- **THEN** SHALL descartarse el `refresh_token` y la petición SHALL recibir `401` con la cookie de sesión borrada
+
+#### Scenario: Proveedor no disponible durante el refresh
+
+- **WHEN** el refresh falla por red o por un error del proveedor distinto de `invalid_grant`
+- **THEN** SHALL mantenerse la sesión local y renovarse como hasta ahora
+
+#### Scenario: Sesión sin refresh_token
+
+- **WHEN** la sesión no tiene `refresh_token` asociado
+- **THEN** la renovación local SHALL comportarse como hasta ahora
