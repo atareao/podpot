@@ -28,6 +28,14 @@ pub const SESSION_COOKIE_NAME: &str = "podpot_session";
 /// rehacer el flujo de entrada. Ocho horas cubren una jornada de trabajo.
 pub const SESSION_LIFETIME: std::time::Duration = std::time::Duration::from_secs(8 * 60 * 60);
 
+/// Ventana de renovación deslizante: 2 horas.
+///
+/// Cuando a la sesión le quedan dos horas o menos de sus ocho de vida, el *gate*
+/// la reemite con una vida nueva. Es un margen amplio a propósito: cubre una
+/// jornada de trabajo sin que el operador vuelva a entrar, y deja tiempo de sobra
+/// para que la renovación llegue antes de que el `exp` caduque.
+pub const RENEWAL_WINDOW: std::time::Duration = std::time::Duration::from_secs(2 * 60 * 60);
+
 /// Identidad de la sesión: exactamente `sub`, `email`, `iat` y `exp`.
 ///
 /// La estructura es la que sella la superficie: con esos cuatro campos y
@@ -63,6 +71,59 @@ pub fn issue(secret: &SecretString, sub: String, email: String) -> Result<String
     let cabecera = Header::new(Algorithm::HS256);
     // La clave entra por el tipo que redacta y solo sale por `expose`, en el
     // único sitio donde hace falta: firmar.
+    let clave = EncodingKey::from_secret(secret.expose().as_bytes());
+
+    encode(&cabecera, &claims, &clave).map_err(|error| {
+        tracing::error!(%error, "no se pudo firmar el JWT de sesión");
+        AppError::Internal("no se pudo emitir la sesión".to_owned())
+    })
+}
+
+/// ¿Toca renovar la sesión?
+///
+/// Solo tiene sentido con `claims` **válidos**: un token ya caducado no se
+/// renueva, porque no hay sesión que alargar —el *gate* lo rechaza antes con
+/// `401`— y reemitirlo sería resucitar una sesión muerta. Devuelve `true`
+/// cuando a `claims` le quedan [`RENEWAL_WINDOW`] o menos de vida y todavía no
+/// ha llegado su `exp`. Se compara con `<=` para que el borde —exactamente dos
+/// horas— también renueve: llegar justo al umbral no es un caso que convenga
+/// dejar fuera.
+pub fn should_renew(claims: &Claims, ahora: u64) -> bool {
+    claims.exp > ahora && claims.exp <= ahora.saturating_add(RENEWAL_WINDOW.as_secs())
+}
+
+/// Reemite la sesión con la misma identidad y una vida nueva.
+///
+/// Conserva `sub` y `email` —la renovación no cambia quién es el operador— y
+/// vuelve a firmar con `issue`, así que el token nuevo tiene el `iat` y el `exp`
+/// de una emisión recién hecha. No toca la cookie: quien la envuelva decide si
+/// además la manda en `Set-Cookie`.
+pub fn renew(secret: &SecretString, claims: &Claims) -> Result<String, AppError> {
+    issue(secret, claims.sub.clone(), claims.email.clone())
+}
+
+/// Emite un JWT de sesión con una caducidad dada, para las pruebas.
+///
+/// `issue` fija la vida de la sesión a [`SESSION_LIFETIME`]; este atajo permite
+/// fabricar tokens con el `exp` que cada escenario necesita —recién emitido, a
+/// punto de caducar o ya caducado— sin tocar la constante ni depender del reloj.
+/// Firma con `HS256` y el mismo secreto que `issue`, así que `verify` lo acepta
+/// igual que un token de producción.
+#[cfg(test)]
+pub(crate) fn issue_con_caducidad(
+    secret: &SecretString,
+    sub: String,
+    email: String,
+    exp: u64,
+) -> Result<String, AppError> {
+    let claims = Claims {
+        sub,
+        email,
+        iat: get_current_timestamp(),
+        exp,
+    };
+
+    let cabecera = Header::new(Algorithm::HS256);
     let clave = EncodingKey::from_secret(secret.expose().as_bytes());
 
     encode(&cabecera, &claims, &clave).map_err(|error| {
@@ -146,7 +207,10 @@ mod tests {
     use axum_extra::extract::cookie::SameSite;
     use jsonwebtoken::{Algorithm, EncodingKey, Header};
 
-    use super::{Claims, SESSION_COOKIE_NAME, SESSION_LIFETIME, issue, session_cookie, verify};
+    use super::{
+        Claims, RENEWAL_WINDOW, SESSION_COOKIE_NAME, SESSION_LIFETIME, issue, renew,
+        session_cookie, should_renew, verify,
+    };
     use crate::error::AppError;
     use crate::secret::SecretString;
 
@@ -439,6 +503,104 @@ mod tests {
         assert!(
             matches!(error, AppError::Unauthorized(_)),
             "el rechazo debe ser un 401 tipado: {error}"
+        );
+    }
+
+    /// Claims con la caducidad indicada, para probar la ventana de renovación.
+    fn claims_con_caducidad(exp: u64) -> Claims {
+        Claims {
+            sub: SUB.to_owned(),
+            email: EMAIL.to_owned(),
+            iat: exp.saturating_sub(SESSION_LIFETIME.as_secs()),
+            exp,
+        }
+    }
+
+    /// Escenario «Fuera de la ventana»: con más de dos horas de vida no se renueva.
+    #[test]
+    fn fuera_de_la_ventana_no_se_renueva() {
+        let ahora = 1_000_000;
+        let claims = claims_con_caducidad(ahora + RENEWAL_WINDOW.as_secs() + 1);
+
+        assert!(
+            !should_renew(&claims, ahora),
+            "una sesión con más de dos horas de vida no se renueva"
+        );
+    }
+
+    /// Escenario «Borde de la ventana»: exactamente dos horas de vida sí renueva.
+    #[test]
+    fn en_el_borde_de_la_ventana_se_renueva() {
+        let ahora = 1_000_000;
+        let claims = claims_con_caducidad(ahora + RENEWAL_WINDOW.as_secs());
+
+        assert!(
+            should_renew(&claims, ahora),
+            "el borde de la ventana también renueva"
+        );
+    }
+
+    /// Escenario «Dentro de la ventana»: con menos de dos horas de vida se renueva.
+    #[test]
+    fn dentro_de_la_ventana_se_renueva() {
+        let ahora = 1_000_000;
+        let claims = claims_con_caducidad(ahora + RENEWAL_WINDOW.as_secs() - 1);
+
+        assert!(
+            should_renew(&claims, ahora),
+            "una sesión a menos de dos horas de caducar se renueva"
+        );
+    }
+
+    /// Escenario «Token caducado»: un `exp` ya pasado no se renueva, aunque caiga
+    /// dentro de la ventana aritmética.
+    #[test]
+    fn un_token_caducado_no_se_renueva() {
+        let ahora = 1_000_000;
+        let claims = claims_con_caducidad(ahora - 1);
+
+        assert!(
+            !should_renew(&claims, ahora),
+            "un token caducado no se renueva: no hay sesión que alargar"
+        );
+    }
+
+    /// Escenario «Cookie renovada sobre `https`»: el token reemitido se envuelve
+    /// con el esquema del retorno y la cookie resultante viaja `Secure`.
+    #[test]
+    fn la_cookie_renovada_respeta_el_esquema_https() {
+        let ahora = 1_000_000;
+        let token = renew(&secret(), &claims_con_caducidad(ahora + 60))
+            .expect("la renovación no puede fallar");
+
+        let cookie = session_cookie(token, REDIRECT_HTTPS).expect("la cookie se construye");
+
+        assert_eq!(
+            cookie.secure(),
+            Some(true),
+            "con retorno https la cookie renovada debe ir Secure"
+        );
+    }
+
+    /// Escenario «Renovación»: conserva `sub` y `email` y alarga el `exp`.
+    #[test]
+    fn la_renovacion_conserva_la_identidad_y_alarga_la_vida() {
+        let ahora = jsonwebtoken::get_current_timestamp();
+        let original = claims_con_caducidad(ahora + 60);
+
+        let token = renew(&secret(), &original).expect("la renovación no puede fallar");
+        let renovada = verify(&secret(), &token).expect("el JWT renovado debe verificarse");
+
+        assert_eq!(renovada.sub, original.sub, "la renovación conserva el sub");
+        assert_eq!(
+            renovada.email, original.email,
+            "la renovación conserva el email"
+        );
+        assert!(
+            renovada.exp > original.exp,
+            "la renovación tiene que alargar la vida: {} no es mayor que {}",
+            renovada.exp,
+            original.exp
         );
     }
 }

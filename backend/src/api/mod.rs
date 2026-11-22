@@ -187,9 +187,10 @@ mod tests {
 
     use crate::test_support::proveedor_falso::ProveedorFalso;
     use crate::test_support::{
-        body_json, cookie_de_sesion, entorno, entorno_con_panel, entorno_oidc,
+        EMAIL, SECRETO, SUB, ahora_en_segundos, body_json, cookie_de_sesion,
+        cookie_de_sesion_con_caducidad, entorno, entorno_con_panel, entorno_oidc,
         entorno_oidc_con_emisor, header_texto, peticion, peticion_con_cookie, peticion_cruda,
-        peticion_cruda_con_cookie, peticion_texto,
+        peticion_cruda_con_cookie, peticion_texto, valor_de_cookie,
     };
 
     /// Un directorio de panel con un `index.html` reconocible, para las pruebas
@@ -537,6 +538,32 @@ mod tests {
         );
     }
 
+    /// Escenario «Stream con sesión próxima a caducar»: el flujo se abre igual y
+    /// la respuesta reemite la sesión en `Set-Cookie`.
+    #[tokio::test]
+    async fn el_stream_con_sesion_proxima_a_caducar_se_renueva() {
+        let entorno = entorno_oidc().await;
+
+        let respuesta = peticion_cruda_con_cookie(
+            &entorno.app(),
+            Method::GET,
+            "/api/v1/units/stream",
+            &cookie_de_sesion_con_caducidad(ahora_en_segundos() + 3600),
+        )
+        .await;
+
+        assert_eq!(respuesta.status(), StatusCode::OK);
+        assert!(
+            header_texto(&respuesta, header::CONTENT_TYPE)
+                .is_some_and(|tipo| tipo.starts_with("text/event-stream")),
+            "con sesión el flujo debe abrirse"
+        );
+        assert!(
+            header_texto(&respuesta, header::SET_COOKIE).is_some(),
+            "una sesión próxima a caducar tiene que renovarse también en el stream"
+        );
+    }
+
     /// Y en `disabled` el flujo sigue abierto sin sesión: no hay capa que lo
     /// cierre.
     #[tokio::test]
@@ -550,5 +577,177 @@ mod tests {
             header_texto(&respuesta, header::CONTENT_TYPE)
                 .is_some_and(|tipo| tipo.starts_with("text/event-stream"))
         );
+    }
+
+    // --- La renovación deslizante de la sesión --------------------------------
+
+    /// Una sesión con poco tiempo por delante se reemite en la misma respuesta:
+    /// `200`, con `Set-Cookie` de la misma identidad y una vida nueva.
+    #[tokio::test]
+    async fn la_sesion_proxima_a_caducar_se_renueva() {
+        let entorno = entorno_oidc().await;
+        let exp_original = ahora_en_segundos() + 3600;
+        let cookie = cookie_de_sesion_con_caducidad(exp_original);
+
+        let respuesta =
+            peticion_cruda_con_cookie(&entorno.app(), Method::GET, "/api/v1/units", &cookie).await;
+
+        assert_eq!(
+            respuesta.status(),
+            StatusCode::OK,
+            "una sesión todavía vigente tiene que dejar pasar la petición"
+        );
+
+        let set_cookie = header_texto(&respuesta, header::SET_COOKIE)
+            .expect("una sesión próxima a caducar tiene que renovarse con Set-Cookie");
+
+        let token = valor_de_cookie(&set_cookie, crate::auth::session::SESSION_COOKIE_NAME)
+            .expect("la Set-Cookie de la renovación tiene que traer el token");
+
+        let claims = crate::auth::session::verify(
+            &crate::secret::SecretString::new(SECRETO.to_owned()),
+            &token,
+        )
+        .expect("el token renovado tiene que verificar con el secreto de la sesión");
+
+        assert_eq!(claims.sub, SUB, "la renovación conserva la identidad");
+        assert_eq!(claims.email, EMAIL, "la renovación conserva la identidad");
+        assert!(
+            claims.exp > exp_original,
+            "la renovación tiene que alargar la vida: {} no es mayor que {exp_original}",
+            claims.exp
+        );
+
+        for atributo in ["Max-Age=28800", "Path=/", "HttpOnly", "SameSite=Strict"] {
+            assert!(
+                set_cookie.contains(atributo),
+                "la Set-Cookie renovada no trae {atributo}: {set_cookie}"
+            );
+        }
+
+        let cuerpo = body_json(respuesta).await;
+        assert!(
+            cuerpo["data"].is_array(),
+            "la renovación no puede cambiar el cuerpo: sigue siendo la envoltura con data: {cuerpo}"
+        );
+    }
+
+    /// Una cookie con firma inválida no se renueva y da `401`: el *gate* la
+    /// rechaza antes de que la renovación llegue a mirarla.
+    #[tokio::test]
+    async fn una_cookie_con_firma_invalida_no_se_renueva_y_da_401() {
+        let entorno = entorno_oidc().await;
+        let token = crate::auth::session::issue(
+            &crate::secret::SecretString::new(
+                "otro-secreto-de-pruebas-con-longitud-suficiente".to_owned(),
+            ),
+            SUB.to_owned(),
+            EMAIL.to_owned(),
+        )
+        .expect("la emisión con otro secreto no puede fallar");
+        let cookie = format!("{}={token}", crate::auth::session::SESSION_COOKIE_NAME);
+
+        let respuesta =
+            peticion_cruda_con_cookie(&entorno.app(), Method::GET, "/api/v1/units", &cookie).await;
+
+        assert_eq!(respuesta.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            header_texto(&respuesta, header::SET_COOKIE).is_none(),
+            "una firma inválida no puede renovarse"
+        );
+
+        let cuerpo = body_json(respuesta).await;
+        assert_eq!(cuerpo["error"]["code"], "unauthorized");
+    }
+
+    /// La cookie que devuelve la renovación sirve para la petición siguiente: la
+    /// sesión no se interrumpe al renovarse.
+    #[tokio::test]
+    async fn la_sesion_renovada_sirve_para_la_siguiente_peticion() {
+        let entorno = entorno_oidc().await;
+        let cookie = cookie_de_sesion_con_caducidad(ahora_en_segundos() + 3600);
+
+        let primera =
+            peticion_cruda_con_cookie(&entorno.app(), Method::GET, "/api/v1/units", &cookie).await;
+
+        assert_eq!(primera.status(), StatusCode::OK);
+
+        let set_cookie = header_texto(&primera, header::SET_COOKIE)
+            .expect("la primera petición tiene que renovar la sesión");
+        let token = valor_de_cookie(&set_cookie, crate::auth::session::SESSION_COOKIE_NAME)
+            .expect("la Set-Cookie de la renovación tiene que traer el token");
+        let cookie_renovada = format!("{}={token}", crate::auth::session::SESSION_COOKIE_NAME);
+
+        let (status, _) = peticion_con_cookie(
+            &entorno.app(),
+            Method::GET,
+            "/api/v1/units",
+            &cookie_renovada,
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "la cookie renovada tiene que valer para la siguiente petición"
+        );
+    }
+
+    /// Una sesión recién emitida no se renueva: no hay nada que alargar.
+    #[tokio::test]
+    async fn la_sesion_reciente_no_se_renueva() {
+        let entorno = entorno_oidc().await;
+        let cookie = cookie_de_sesion_con_caducidad(ahora_en_segundos() + 28800);
+
+        let respuesta =
+            peticion_cruda_con_cookie(&entorno.app(), Method::GET, "/api/v1/units", &cookie).await;
+
+        assert_eq!(respuesta.status(), StatusCode::OK);
+        assert!(
+            header_texto(&respuesta, header::SET_COOKIE).is_none(),
+            "una sesión con toda su vida por delante no se renueva"
+        );
+    }
+
+    /// Una sesión caducada no se renueva: el *gate* la rechaza con `401` y sin
+    /// `Set-Cookie`.
+    #[tokio::test]
+    async fn la_sesion_caducada_no_se_renueva_y_da_401() {
+        let entorno = entorno_oidc().await;
+        let cookie = cookie_de_sesion_con_caducidad(ahora_en_segundos() - 1);
+
+        let respuesta =
+            peticion_cruda_con_cookie(&entorno.app(), Method::GET, "/api/v1/units", &cookie).await;
+
+        assert_eq!(respuesta.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            header_texto(&respuesta, header::SET_COOKIE).is_none(),
+            "una sesión caducada no puede renovarse"
+        );
+
+        let cuerpo = body_json(respuesta).await;
+        assert_eq!(cuerpo["error"]["code"], "unauthorized");
+    }
+
+    /// La ruta de sesión también renueva: contesta la identidad y, si la sesión
+    /// está dentro de la ventana, la reemite en `Set-Cookie`.
+    #[tokio::test]
+    async fn la_ruta_de_sesion_tambien_se_renueva() {
+        let entorno = entorno_oidc().await;
+        let cookie = cookie_de_sesion_con_caducidad(ahora_en_segundos() + 3600);
+
+        let respuesta =
+            peticion_cruda_con_cookie(&entorno.app(), Method::GET, "/api/v1/auth/session", &cookie)
+                .await;
+
+        assert_eq!(respuesta.status(), StatusCode::OK);
+        assert!(
+            header_texto(&respuesta, header::SET_COOKIE).is_some(),
+            "la ruta de sesión tiene que renovar una sesión próxima a caducar"
+        );
+
+        let cuerpo = body_json(respuesta).await;
+        assert_eq!(cuerpo["data"]["sub"], SUB);
+        assert_eq!(cuerpo["data"]["email"], EMAIL);
     }
 }

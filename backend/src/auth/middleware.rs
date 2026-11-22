@@ -9,11 +9,21 @@
 //! —no hay nada que una máquina tenga que accionar sin un navegador—, así que el
 //! camino es uno: leer la cookie, verificar el JWT y dejar la identidad en las
 //! *extensions* de la petición.
+//!
+//! La sesión se renueva de forma **deslizante**: cuando al token válido le quedan
+//! dos horas o menos de vida, el *gate* lo reemite y lo añade a la respuesta en
+//! `Set-Cookie`. Así el operador no vuelve a entrar en mitad de una jornada. La
+//! renovación no cambia el cuerpo ni el código de la respuesta: sólo añade la
+//! cabecera. No hay tope absoluto de vida —cada renovación vuelve a empezar las
+//! ocho horas— y varias peticiones simultáneas pueden emitir varias cookies: la
+//! última en llegar gana en el navegador.
 
 use axum::extract::{Request, State};
+use axum::http::{HeaderValue, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum_extra::extract::cookie::CookieJar;
+use axum_extra::extract::cookie::{Cookie, CookieJar};
+use jsonwebtoken::get_current_timestamp;
 
 use crate::auth::session::{self, SESSION_COOKIE_NAME};
 use crate::error::AppError;
@@ -52,14 +62,20 @@ const SIN_SESION: &str = "hace falta una sesión válida para esta ruta";
 /// *extensions* y pasa al manejador. Sin cookie o con una que no verifique,
 /// contesta `401` con la envoltura `{error}` —nunca con el cuerpo vacío, nunca
 /// con HTML y nunca con una redirección—.
+///
+/// Si la sesión está dentro de la ventana de renovación, añade la cookie nueva a
+/// la respuesta del manejador con `Set-Cookie`. El código y el cuerpo no cambian:
+/// la renovación es invisible para el cliente salvo por la cabecera. Un fallo al
+/// renovar no convierte la petición en un `500`: se registra y se sigue con la
+/// sesión actual, que sigue siendo válida.
 pub async fn gate(
     State(estado): State<AppState>,
     jar: CookieJar,
     mut request: Request,
     next: Next,
 ) -> Response {
-    let identidad = match con_cookie(&estado, &jar) {
-        Ok(identidad) => identidad,
+    let (identidad, renovada) = match con_cookie(&estado, &jar) {
+        Ok(par) => par,
         Err(rechazo) => return rechazo.into_response(),
     };
 
@@ -67,11 +83,31 @@ pub async fn gate(
     // vuelve a tocar la cookie.
     request.extensions_mut().insert(identidad);
 
-    next.run(request).await
+    let mut respuesta = next.run(request).await;
+
+    if let Some(cookie) = renovada {
+        match HeaderValue::from_str(&cookie.to_string()) {
+            Ok(valor) => {
+                respuesta.headers_mut().append(header::SET_COOKIE, valor);
+            }
+            Err(error) => {
+                tracing::error!(%error, "la Set-Cookie de la renovación no es una cabecera válida");
+            }
+        }
+    }
+
+    respuesta
 }
 
 /// Resuelve la identidad por el camino de la cookie de sesión.
-fn con_cookie(estado: &AppState, jar: &CookieJar) -> Result<SessionIdentity, AppError> {
+///
+/// Devuelve también la cookie renovada, si toca. Un fallo al renovar no invalida
+/// la sesión: se registra y se devuelve `None`, porque la petición puede seguir
+/// con el token actual hasta que caduque.
+fn con_cookie(
+    estado: &AppState,
+    jar: &CookieJar,
+) -> Result<(SessionIdentity, Option<Cookie<'static>>), AppError> {
     // Por construcción el *gate* sólo se monta donde hay proveedor, así que un
     // `None` aquí es un fallo de invariante: se rechaza la petición en vez de
     // abrirla.
@@ -86,8 +122,25 @@ fn con_cookie(estado: &AppState, jar: &CookieJar) -> Result<SessionIdentity, App
 
     let claims = session::verify(&auth.secret, cookie.value())?;
 
-    Ok(SessionIdentity {
-        sub: claims.sub,
-        email: claims.email,
-    })
+    let renovada = if session::should_renew(&claims, get_current_timestamp()) {
+        match session::renew(&auth.secret, &claims)
+            .and_then(|token| session::session_cookie(token, &auth.settings.redirect_url))
+        {
+            Ok(cookie) => Some(cookie),
+            Err(error) => {
+                tracing::error!(%error, "no se pudo renovar la sesión; se mantiene la actual");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    Ok((
+        SessionIdentity {
+            sub: claims.sub,
+            email: claims.email,
+        },
+        renovada,
+    ))
 }
