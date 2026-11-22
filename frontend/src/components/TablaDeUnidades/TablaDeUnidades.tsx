@@ -1,4 +1,4 @@
-import { Button, Empty, Popconfirm, Space, Spin, Table, Tag } from 'antd'
+import { Button, Empty, Popconfirm, Space, Spin, Table, Tag, Typography } from 'antd'
 import type { TableProps } from 'antd'
 import { EstadoDeUnidad } from '../EstadoDeUnidad/EstadoDeUnidad'
 import { etiquetaDeAccionEnCurso } from '../../acciones'
@@ -44,12 +44,25 @@ const EN_MARCHA: ReadonlySet<string> = new Set(['active', 'activating', 'reloadi
 const PARADA: ReadonlySet<string> = new Set(['inactive', 'deactivating'])
 
 /**
+ * Identidad con la que se muestra y se nombra una quadlet: su `file_name`
+ * publicado por la API (la clave real de `PATCH`/`DELETE`), no el nombre de
+ * unidad systemd. Si la API no lo publica —nulo o vacío—, cae al nombre de
+ * unidad para no dejar la fila sin identificar ni los botones sin nombre
+ * accesible.
+ */
+function identidadDe(unidad: QuadletUnit): string {
+  return unidad.file_name || unidad.name
+}
+
+/**
  * Listado de quadlets: una fila por unidad, con su estado y las acciones de
  * control. Presentacional: no habla con la API ni con React Query —quien la usa
  * (`pages/unidades.tsx`) es el que conecta—.
  *
- * Cada botón lleva un `aria-label` con el nombre de la unidad: hay uno por fila
- * y, sin él, todos los «Arrancar» comparten nombre accesible.
+ * La fila se identifica por el `file_name` publicado por la API (su identidad
+ * real), con el nombre de unidad systemd como dato secundario. Cada botón lleva
+ * un `aria-label` con esa identidad: hay uno por fila y, sin él, todos los
+ * «Arrancar» comparten nombre accesible.
  */
 export function TablaDeUnidades({
   unidades,
@@ -64,8 +77,15 @@ export function TablaDeUnidades({
   const columnas: TableProps<QuadletUnit>['columns'] = [
     {
       title: 'Unidad',
-      dataIndex: 'name',
       key: 'unidad',
+      render: (_valor, unidad) => (
+        <Space direction="vertical" size={0}>
+          {/* El `file_name` es la identidad primaria de la fila… */}
+          <span>{identidadDe(unidad)}</span>
+          {/* …y el nombre de unidad systemd, el dato secundario. */}
+          <Typography.Text type="secondary">{unidad.name}</Typography.Text>
+        </Space>
+      ),
     },
     {
       title: 'Estado',
@@ -87,7 +107,7 @@ export function TablaDeUnidades({
         return (
           <div
             role="status"
-            aria-label={`Acción en curso en ${unidad.name}: ${etiquetas.join(', ')}`}
+            aria-label={`Acción en curso en ${identidadDe(unidad)}: ${etiquetas.join(', ')}`}
           >
             <Space size="small" wrap>
               <Spin size="small" aria-hidden="true" />
@@ -115,12 +135,16 @@ export function TablaDeUnidades({
       title: 'Acciones',
       key: 'acciones',
       render: (_valor, unidad) => {
+        // Las claves internas siguen por **nombre de unidad**: es lo que viaja en
+        // la acción HTTP (`{ name }`) y en el campo `unit` del SSE de jobs. El
+        // `aria-label`, en cambio, usa la identidad mostrada (`file_name`).
         const bloqueada = enCurso === unidad.name
+        const identidad = identidadDe(unidad)
         return (
           <Space size="small" wrap>
             <Button
               size="small"
-              aria-label={`Arrancar ${unidad.name}`}
+              aria-label={`Arrancar ${identidad}`}
               disabled={bloqueada || EN_MARCHA.has(unidad.active_state)}
               onClick={() => onAccion(unidad, 'start')}
             >
@@ -128,7 +152,7 @@ export function TablaDeUnidades({
             </Button>
             <Button
               size="small"
-              aria-label={`Parar ${unidad.name}`}
+              aria-label={`Parar ${identidad}`}
               disabled={bloqueada || PARADA.has(unidad.active_state)}
               onClick={() => onAccion(unidad, 'stop')}
             >
@@ -136,7 +160,7 @@ export function TablaDeUnidades({
             </Button>
             <Button
               size="small"
-              aria-label={`Reiniciar ${unidad.name}`}
+              aria-label={`Reiniciar ${identidad}`}
               disabled={bloqueada}
               onClick={() => onAccion(unidad, 'restart')}
             >
@@ -144,7 +168,7 @@ export function TablaDeUnidades({
             </Button>
             <Button
               size="small"
-              aria-label={`Editar ${unidad.name}`}
+              aria-label={`Editar ${identidad}`}
               disabled={bloqueada}
               onClick={() => onEditar(unidad)}
             >
@@ -154,7 +178,7 @@ export function TablaDeUnidades({
                 sobre la fila (no encadenan nada destructivo). */}
             <Button
               size="small"
-              aria-label={`Logs ${unidad.name}`}
+              aria-label={`Logs ${identidad}`}
               onClick={() => onVerRegistros(unidad)}
             >
               Logs
@@ -174,7 +198,7 @@ export function TablaDeUnidades({
               <Button
                 size="small"
                 danger
-                aria-label={`Borrar ${unidad.name}`}
+                aria-label={`Borrar ${identidad}`}
                 disabled={bloqueada}
               >
                 Borrar
