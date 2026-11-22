@@ -18,7 +18,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::response::ApiResponse;
 use crate::auth::middleware::SessionIdentity;
-use crate::auth::session::SESSION_COOKIE_NAME;
 use crate::auth::{oidc, session};
 use crate::error::AppError;
 use crate::state::AppState;
@@ -160,20 +159,31 @@ pub async fn callback(
         Err(error) => return error.into_response(),
     };
 
-    let id_token = match oidc::canjear_codigo(auth.settings.as_ref(), &discovery, code).await {
-        Ok(id_token) => id_token,
+    let canje = match oidc::canjear_codigo(auth.settings.as_ref(), &discovery, code).await {
+        Ok(canje) => canje,
         Err(error) => return error.into_response(),
     };
 
-    let identidad = match oidc::verificar_id_token(auth, &id_token, &pendiente.nonce).await {
+    let identidad = match oidc::verificar_id_token(auth, &canje.id_token, &pendiente.nonce).await {
         Ok(identidad) => identidad,
         Err(error) => return error.into_response(),
     };
 
-    let token = match session::issue(&auth.secret, identidad.sub, identidad.email) {
-        Ok(token) => token,
-        Err(error) => return error.into_response(),
-    };
+    // Toda sesión emitida lleva `jti`: es el identificador con el que se ata el
+    // `refresh_token` del proveedor —si lo emite— a la sesión. Sin `refresh_token`
+    // el `jti` viaja igualmente, así que toda sesión tiene con qué identificarse y
+    // la renovación no depende de que exista el refresco.
+    let jti = session::nuevo_jti();
+
+    if let Some(refresh_token) = canje.refresh_token.as_deref() {
+        auth.guardar_refresh_token(&jti, refresh_token).await;
+    }
+
+    let token =
+        match session::issue_con_jti(&auth.secret, identidad.sub, identidad.email, Some(jti)) {
+            Ok(token) => token,
+            Err(error) => return error.into_response(),
+        };
 
     let cookie = match session::session_cookie(token, &auth.settings.redirect_url) {
         Ok(cookie) => cookie,
@@ -239,8 +249,10 @@ pub struct IdentidadDeSesion {
 /// imagen.
 pub async fn logout(jar: CookieJar) -> (CookieJar, ApiResponse<AcuseDeCierre>) {
     // La `Set-Cookie` de borrado viaja por el propio frasco de la petición: es lo
-    // que hace que la respuesta lleve la cabecera y la envoltura a la vez.
-    let jar = jar.add(cookie_de_borrado());
+    // que hace que la respuesta lleve la cabecera y la envoltura a la vez. La
+    // cookie la define [`session::cookie_de_borrado`], la misma que manda el `401`
+    // por revocación del proveedor: un solo borrado para los dos casos.
+    let jar = jar.add(session::cookie_de_borrado());
 
     (jar, ApiResponse::new(AcuseDeCierre { status: "ok" }))
 }
@@ -259,18 +271,6 @@ pub async fn session(
         sub: identidad.sub,
         email: identidad.email,
     })
-}
-
-/// Cookie de borrado: la misma cookie, mismo `Path` y `Max-Age=0`.
-///
-/// Se construye con `make_removal` en vez de con `CookieJar::remove` a propósito:
-/// `remove` solo emite la `Set-Cookie` si la petición traía esa cookie, y el
-/// borrado no puede depender de que la cookie esté —el `logout` responde igual
-/// aunque el cliente la haya perdido por el camino—.
-fn cookie_de_borrado() -> Cookie<'static> {
-    let mut cookie = Cookie::build((SESSION_COOKIE_NAME, "")).path("/").build();
-    cookie.make_removal();
-    cookie
 }
 
 #[cfg(test)]

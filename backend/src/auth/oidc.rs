@@ -234,13 +234,40 @@ pub const INTERCAMBIO_TIMEOUT: Duration = Duration::from_secs(10);
 /// Respuesta del `token_endpoint`, con lo que de verdad se usa.
 ///
 /// Sin `Debug` a propósito: el `id_token` es una credencial del proveedor y un
-/// `?respuesta` en un `debug!` la publicaría. Solo se lee el campo que hace
-/// falta; el `access_token` y el resto del cuerpo se ignoran —y, al no tocarlos,
-/// no hay forma de que acaben en el registro—.
+/// `?respuesta` en un `debug!` la publicaría. Solo se leen el ID token y, si
+/// viene, el `refresh_token`; el `access_token` y el resto del cuerpo se ignoran
+/// —y, al no tocarlos, no hay forma de que acaben en el registro—.
 #[derive(Deserialize)]
 struct TokenResponse {
     /// ID token firmado que hay que verificar antes de emitir sesión.
     id_token: String,
+    /// Refresh token opcional que el proveedor emite junto al ID token.
+    refresh_token: Option<String>,
+}
+
+/// Cuerpo de error del `token_endpoint`: solo interesa su `error`.
+///
+/// El estándar OAuth 2.0 publica `{"error":"…"}` en los rechazos; el valor que
+/// manda es `invalid_grant`, que durante un refresh significa que el
+/// `refresh_token` ya no vale y la sesión debe cerrarse. El resto de errores del
+/// proveedor no cierran la sesión: se tratan como una caída y se mantiene la
+/// sesión local.
+#[derive(Deserialize)]
+struct ErrorTokenEndpoint {
+    /// Código de error del proveedor.
+    error: String,
+}
+
+/// Lo que devuelve el canje del código de autorización.
+///
+/// El ID token sale **sin verificar**: verificar es el paso siguiente. El
+/// `refresh_token`, si el proveedor lo emite, es lo que el callback asocia a la
+/// sesión para poder renovarla después contra el proveedor.
+pub struct Canje {
+    /// ID token firmado, sin verificar todavía.
+    pub id_token: String,
+    /// `refresh_token` opcional del proveedor.
+    pub refresh_token: Option<String>,
 }
 
 /// Claims del ID token que se releen después de que [`Validation`] compruebe
@@ -260,7 +287,12 @@ struct IdTokenClaims {
     /// Correo.
     email: String,
     /// `nonce` devuelto, que se compara con el emitido en el login.
-    nonce: String,
+    ///
+    /// Es opcional porque en un refresh el proveedor puede no reenviarlo: la
+    /// verificación del ID token de refresh no lo exige. En el canje del código
+    /// sí: un ID token sin `nonce` se rechaza al compararlo con el emitido en el
+    /// login.
+    nonce: Option<String>,
     /// Emisión, en segundos desde la época.
     iat: u64,
 }
@@ -282,15 +314,16 @@ const ID_TOKEN_INVALIDO: &str = "el ID token no es válido";
 
 /// Canjea el código de autorización en el `token_endpoint`.
 ///
-/// Devuelve el ID token **sin verificar**: verificar es el paso siguiente y no
-/// se mezcla con el canje. El `client_secret` viaja en el **cuerpo** del POST
+/// Devuelve el [`Canje`] —el ID token **sin verificar** y, si el proveedor lo
+/// emite, el `refresh_token`—: verificar es el paso siguiente y no se mezcla con
+/// el canje. El `client_secret` viaja en el **cuerpo** del POST
 /// —`application/x-www-form-urlencoded`—, nunca en la cadena de consulta, y no
 /// se interpola en ningún registro.
 pub async fn canjear_codigo(
     settings: &OidcSettings,
     discovery: &Discovery,
     code: &str,
-) -> Result<String, AppError> {
+) -> Result<Canje, AppError> {
     let cliente = reqwest::Client::builder()
         .timeout(INTERCAMBIO_TIMEOUT)
         .build()
@@ -327,10 +360,125 @@ pub async fn canjear_codigo(
     respuesta
         .json::<TokenResponse>()
         .await
-        .map(|datos| datos.id_token)
+        .map(|datos| Canje {
+            id_token: datos.id_token,
+            refresh_token: datos.refresh_token,
+        })
         .map_err(|error| {
             AppError::BadGateway(format!("la respuesta del canje no es válida: {error}"))
         })
+}
+
+/// El desenlace de pedir un ID token nuevo al proveedor con el `refresh_token`.
+///
+/// Son tres y no dos a propósito: el `invalid_grant` —el proveedor rechaza el
+/// `refresh_token`— obliga a **cerrar** la sesión, mientras que un fallo de red o
+/// un error del proveedor distinto de ese no: la sesión local sigue siendo válida
+/// y se renueva como siempre. Confundirlos convertiría una caída del IdP en un
+/// cierre de sesión en masa.
+pub enum RefreshProveedor {
+    /// El proveedor emitió un ID token nuevo; si además rota el `refresh_token`,
+    /// viaja aquí para sustituir al anterior.
+    Nuevo {
+        /// ID token nuevo, todavía sin verificar.
+        id_token: String,
+        /// `refresh_token` nuevo, si el proveedor lo rota.
+        refresh_token: Option<String>,
+    },
+    /// El proveedor rechazó el `refresh_token` (`invalid_grant`): ya no vale.
+    InvalidGrant,
+    /// El proveedor no respondió o contestó un error que no es un rechazo.
+    ///
+    /// La causa viaja en el [`AppError`] para que acabe en el registro; el
+    /// desenlace es mantener la sesión local y renovarla como hasta ahora.
+    Fallo(AppError),
+}
+
+/// Pide un ID token nuevo al `token_endpoint` con `grant_type=refresh_token`.
+///
+/// Devuelve siempre un [`RefreshProveedor`] y nunca un `Result`: el fallo no es
+/// una excepción del flujo sino un desenlace más —mantener la sesión local—, y
+/// distinguirlo de un rechazo del token es justo lo que el tipo declara. El
+/// `client_secret` viaja en el cuerpo, igual que en el canje.
+pub async fn refrescar_id_token(
+    settings: &OidcSettings,
+    discovery: &Discovery,
+    refresh_token: &str,
+) -> RefreshProveedor {
+    let cliente = match reqwest::Client::builder()
+        .timeout(INTERCAMBIO_TIMEOUT)
+        .build()
+    {
+        Ok(cliente) => cliente,
+        Err(error) => {
+            return RefreshProveedor::Fallo(AppError::BadGateway(format!(
+                "no se pudo preparar el cliente del refresh: {error}"
+            )));
+        }
+    };
+
+    let formulario = [
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh_token),
+        ("client_id", settings.client_id.as_str()),
+        ("client_secret", settings.client_secret.expose()),
+    ];
+
+    let respuesta = match cliente
+        .post(&discovery.token_endpoint)
+        .form(&formulario)
+        .send()
+        .await
+    {
+        Ok(respuesta) => respuesta,
+        Err(error) => {
+            return RefreshProveedor::Fallo(AppError::BadGateway(format!(
+                "el proveedor de identidad no respondió al refresh: {error}"
+            )));
+        }
+    };
+
+    if !respuesta.status().is_success() {
+        // El rechazo del token llega como `invalid_grant`. Cualquier otro error
+        // del proveedor —`500`, `503`, un cuerpo que no se puede leer— no cierra
+        // la sesión: se trata como caída. El código y el estado se registran aquí,
+        // donde se conocen; al cliente le llega el cuerpo genérico de siempre.
+        let estado = respuesta.status();
+        let rechazo = respuesta.json::<ErrorTokenEndpoint>().await;
+        return match rechazo {
+            Ok(error) if error.error == "invalid_grant" => RefreshProveedor::InvalidGrant,
+            Ok(error) => {
+                tracing::warn!(
+                    %estado,
+                    codigo = %error.error,
+                    "el proveedor rechazó el refresh con un error distinto de invalid_grant; se mantiene la sesión local"
+                );
+                RefreshProveedor::Fallo(AppError::BadGateway(
+                    "el proveedor de identidad contestó un error al refresh".to_owned(),
+                ))
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %estado,
+                    %error,
+                    "el proveedor contestó un error al refresh sin cuerpo legible; se mantiene la sesión local"
+                );
+                RefreshProveedor::Fallo(AppError::BadGateway(
+                    "el proveedor de identidad contestó un error al refresh".to_owned(),
+                ))
+            }
+        };
+    }
+
+    match respuesta.json::<TokenResponse>().await {
+        Ok(datos) => RefreshProveedor::Nuevo {
+            id_token: datos.id_token,
+            refresh_token: datos.refresh_token,
+        },
+        Err(error) => RefreshProveedor::Fallo(AppError::BadGateway(format!(
+            "la respuesta del refresh no es válida: {error}"
+        ))),
+    }
 }
 
 /// Frescura máxima del JWKS cacheado: 10 minutos.
@@ -608,12 +756,13 @@ fn rechazar_id_token(causa: &str) -> AppError {
     AppError::Unauthorized(ID_TOKEN_INVALIDO.to_owned())
 }
 
-/// Verifica el ID token y devuelve la identidad que lleva dentro.
+/// Verifica el ID token del **login** y devuelve la identidad que lleva dentro.
 ///
 /// Cinco comprobaciones: firma `RS256` contra las claves del `jwks_uri`, `iss`,
 /// `aud`, vigencia de `exp` e `iat`, y `nonce` igual al emitido en el login.
 /// Cualquier fallo rechaza con [`AppError::Unauthorized`]: no hay sesión que
-/// emitir.
+/// emitir. Un ID token **sin** `nonce` también se rechaza aquí: en el login el
+/// `nonce` es obligatorio.
 ///
 /// El conjunto de claves se resuelve por [`jwks_cached_con_marca`] a partir del estado
 /// —y no por el descubrimiento que el llamador tenga en la mano— porque el JWKS se
@@ -630,6 +779,33 @@ pub async fn verificar_id_token(
     auth: &AuthState,
     id_token: &str,
     nonce_esperado: &str,
+) -> Result<IdentidadVerificada, AppError> {
+    verificar_id_token_con(auth, id_token, Some(nonce_esperado)).await
+}
+
+/// Verifica el ID token nuevo de un **refresh** del proveedor.
+///
+/// Idéntica a [`verificar_id_token`] salvo el `nonce`: en un refresh el proveedor
+/// puede no reenviarlo —no hay una petición de autorización nueva con la que
+/// casarlo—, así que aquí no se exige. El resto de exigencias —firma, `iss`,
+/// `aud`, `exp` e `iat`— son las mismas que en el canje: un ID token de refresh
+/// vale exactamente lo que vale uno de login.
+pub async fn verificar_id_token_renovado(
+    auth: &AuthState,
+    id_token: &str,
+) -> Result<IdentidadVerificada, AppError> {
+    verificar_id_token_con(auth, id_token, None).await
+}
+
+/// El tronco de la verificación del ID token, con el `nonce` opcional.
+///
+/// `nonce_esperado` en `Some` es el camino del login —se compara y un token sin
+/// `nonce` se rechaza—; en `None` es el del refresh, donde el `nonce` no se
+/// exige. Todo lo demás es común.
+async fn verificar_id_token_con(
+    auth: &AuthState,
+    id_token: &str,
+    nonce_esperado: Option<&str>,
 ) -> Result<IdentidadVerificada, AppError> {
     let (jwks, visto_en) = jwks_cached_con_marca(auth, Instant::now()).await?;
 
@@ -702,8 +878,13 @@ pub async fn verificar_id_token(
     };
 
     // El `nonce` ata este ID token al login que lo pidió y cierra la repetición.
-    // `jsonwebtoken` no lo valida, así que se compara aquí.
-    if datos.claims.nonce != nonce_esperado {
+    // `jsonwebtoken` no lo valida, así que se compara aquí. En el refresh no hay
+    // `nonce` que casar —no hay petición de autorización nueva—, así que solo se
+    // exige cuando el llamador lo pide: en el login, además, un ID token sin
+    // `nonce` se rechaza, porque el emitido siempre lo lleva.
+    if let Some(nonce_esperado) = nonce_esperado
+        && datos.claims.nonce.as_deref() != Some(nonce_esperado)
+    {
         return Err(rechazar_id_token(
             "el nonce del ID token no es el emitido en el login",
         ));
@@ -732,14 +913,16 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use axum::http::StatusCode;
+    use axum::http::{Method, StatusCode, header};
     use axum::response::IntoResponse;
 
     use super::{
         AuthorizationRequest, Discovery, JWKS_TTL, JwksCacheado, MARGEN_DE_RELOJ, SCOPE,
         TOKEN_LENGTH, build_authorization_url, canjear_codigo, discovery_cached, discovery_url,
         jwks_cached_en, refrescar_jwks_si_obsoleto, verificar_id_token,
+        verificar_id_token_renovado,
     };
+    use crate::auth::session::{self, Claims, SESSION_COOKIE_NAME};
     use crate::auth::state::AuthState;
     use crate::config::OidcSettings;
     use crate::error::{AppError, BAD_GATEWAY_MESSAGE};
@@ -748,7 +931,9 @@ mod tests {
         IdToken, KID_ROTADO, ProveedorFalso, token_con_alg_none,
     };
     use crate::test_support::{
-        EMAIL, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, SECRETO, SUB, body_json, capturar_log,
+        EMAIL, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, SECRETO, SUB, ahora_en_segundos, body_json,
+        capturar_log, cookie_de_sesion_con_jti, entorno_oidc_con_emisor, header_texto,
+        peticion_cruda, peticion_cruda_con_cookie, valor_de_cookie,
     };
     use tokio::sync::Barrier;
     use tokio::task::JoinSet;
@@ -926,11 +1111,14 @@ mod tests {
             )))
             .await;
 
-        let id_token = canjear_codigo(&config, &documento, "codigo-de-prueba")
+        let canje = canjear_codigo(&config, &documento, "codigo-de-prueba")
             .await
             .expect("el canje debe devolver el ID token");
 
-        assert!(!id_token.is_empty(), "el ID token no puede venir vacío");
+        assert!(
+            !canje.id_token.is_empty(),
+            "el ID token no puede venir vacío"
+        );
         assert_eq!(proveedor.peticiones_al_token().await, 1);
     }
 
@@ -1791,6 +1979,596 @@ mod tests {
             proveedor.peticiones_al_jwks(),
             1,
             "el conjunto anterior sigue en la caché: verificar no vuelve al jwks_uri"
+        );
+    }
+
+    /// Extrae el `state` y el `nonce` de la `Location` de un login.
+    fn state_y_nonce(location: &str) -> (String, String) {
+        let consulta = location
+            .split_once('?')
+            .map(|(_, consulta)| consulta)
+            .expect("el login debe traer cadena de consulta");
+
+        let mut state = None;
+        let mut nonce = None;
+
+        for par in consulta.split('&') {
+            if let Some((clave, valor)) = par.split_once('=') {
+                match clave {
+                    "state" => state = Some(valor.to_owned()),
+                    "nonce" => nonce = Some(valor.to_owned()),
+                    _ => {}
+                }
+            }
+        }
+
+        (
+            state.expect("la Location debe traer state"),
+            nonce.expect("la Location debe traer nonce"),
+        )
+    }
+
+    /// Siembra una sesión a punto de caducar (dentro de la ventana de renovación)
+    /// con un `jti` y un `refresh_token` del proveedor asociado a ese `jti`.
+    ///
+    /// Es la puerta de los escenarios de refresco: la asociación vive en el estado
+    /// y la cookie lleva el mismo `jti`, así que el *gate* encuentra el token y
+    /// entra por el camino del proveedor.
+    async fn sesion_con_refresh(
+        entorno: &crate::test_support::Entorno,
+        jti: &str,
+        refresh_token: &str,
+    ) -> String {
+        let auth = entorno
+            .state()
+            .auth
+            .as_ref()
+            .expect("el entorno oidc tiene estado de autenticación");
+        auth.guardar_refresh_token(jti, refresh_token).await;
+
+        cookie_de_sesion_con_jti(Some(jti), ahora_en_segundos() + 3600)
+    }
+
+    /// Los `claims` de una cookie de sesión, verificándola.
+    ///
+    /// Es lo que permite comparar la sesión renovada con la original sin volver a
+    /// recorrer el flujo: la cookie lleva el JWT y el JWT se verifica con el mismo
+    /// secreto que usa el *gate*.
+    fn claims_de_cookie(cookie: &str) -> Claims {
+        let token = cookie
+            .split_once('=')
+            .map(|(_, token)| token)
+            .expect("la cookie de sesión debe ser nombre=valor");
+
+        session::verify(&SecretString::new(SECRETO.to_owned()), token)
+            .expect("la cookie de sesión de prueba tiene que verificar")
+    }
+
+    /// Escenario «Captura del refresh_token en el callback»: un canje que devuelve
+    /// `refresh_token` emite una sesión con `jti` y deja el token asociado a ese
+    /// `jti` en el estado.
+    #[tokio::test]
+    async fn captura_del_refresh_token_en_el_callback_emit_con_jti() {
+        let proveedor = ProveedorFalso::servir().await;
+        proveedor.devolver_refresh_token(true);
+        let entorno = entorno_oidc_con_emisor(&proveedor.issuer).await;
+
+        // El login registra el `state`/`nonce`; el `nonce` hay que pasárselo al ID
+        // token que sirva el canje.
+        let login = peticion_cruda(&entorno.app(), Method::GET, "/api/v1/auth/login").await;
+        let location = header_texto(&login, header::LOCATION).expect("el 302 trae Location");
+        let (state, nonce) = state_y_nonce(&location);
+
+        proveedor
+            .montar_token_endpoint(&proveedor.firmar(&IdToken::valido(
+                &proveedor.issuer,
+                OIDC_CLIENT_ID,
+                &nonce,
+            )))
+            .await;
+
+        let callback = peticion_cruda(
+            &entorno.app(),
+            Method::GET,
+            &format!("/api/v1/auth/callback?code=un-codigo&state={state}"),
+        )
+        .await;
+
+        assert_eq!(callback.status(), StatusCode::FOUND);
+
+        let set_cookie = header_texto(&callback, header::SET_COOKIE)
+            .expect("el callback correcto emite la cookie de sesión");
+        let token = valor_de_cookie(&set_cookie, SESSION_COOKIE_NAME)
+            .expect("la Set-Cookie trae el token de sesión");
+
+        let claims = session::verify(&SecretString::new(SECRETO.to_owned()), &token)
+            .expect("la sesión emitida tiene que verificar");
+
+        let jti = claims
+            .jti
+            .expect("toda sesión emitida por el callback lleva jti");
+
+        let auth = entorno
+            .state()
+            .auth
+            .as_ref()
+            .expect("el entorno oidc tiene estado de autenticación");
+
+        assert!(
+            auth.obtener_refresh_token_por_jti(&jti).await.is_some(),
+            "el refresh_token del proveedor tiene que quedar asociado al jti de la sesión"
+        );
+    }
+
+    /// Escenario «Renovación con refresh_token válido»: una sesión en la ventana
+    /// con `jti` y `refresh_token` pide un ID token nuevo al `token_endpoint` y
+    /// emite una cookie nueva que conserva la identidad y el `jti` y alarga la
+    /// vida. El `refresh_token` del proveedor no puede acabar ni en la cookie ni
+    /// en el cuerpo.
+    #[tokio::test]
+    async fn renovacion_con_refresh_token_valido_pide_al_token_endpoint() {
+        let proveedor = ProveedorFalso::servir().await;
+        proveedor.devolver_refresh_token(true);
+        // El proveedor rota el token a un valor distinguible: así se puede afirmar
+        // que **ese** token no se filtra por la respuesta.
+        proveedor.rotar_refresh_token("refresh-secreto-distinguible");
+        proveedor
+            .montar_token_endpoint(&proveedor.firmar(&IdToken::valido(
+                &proveedor.issuer,
+                OIDC_CLIENT_ID,
+                "nonce-que-el-refresh-no-exige",
+            )))
+            .await;
+        let entorno = entorno_oidc_con_emisor(&proveedor.issuer).await;
+
+        let cookie = sesion_con_refresh(&entorno, "jti-a-renovar", "refresh-vigente").await;
+        let original = claims_de_cookie(&cookie);
+
+        let respuesta =
+            peticion_cruda_con_cookie(&entorno.app(), Method::GET, "/api/v1/units", &cookie).await;
+
+        assert_eq!(respuesta.status(), StatusCode::OK);
+        assert!(
+            proveedor.peticiones_de_refresh_token() >= 1,
+            "la renovación con refresh_token tiene que llamar al token_endpoint"
+        );
+
+        let set_cookie = header_texto(&respuesta, header::SET_COOKIE)
+            .expect("la renovación con refresh_token tiene que emitir una cookie nueva");
+        let token = valor_de_cookie(&set_cookie, SESSION_COOKIE_NAME)
+            .expect("la Set-Cookie trae el token de sesión");
+        let renovada = session::verify(&SecretString::new(SECRETO.to_owned()), &token)
+            .expect("la sesión renovada tiene que verificar");
+
+        assert_eq!(renovada.sub, original.sub, "la renovación conserva el sub");
+        assert_eq!(
+            renovada.email, original.email,
+            "la renovación conserva el email"
+        );
+        assert!(
+            renovada.exp > original.exp,
+            "la renovación tiene que alargar la vida: {} no es mayor que {}",
+            renovada.exp,
+            original.exp
+        );
+        assert_eq!(
+            renovada.jti.as_deref(),
+            Some("jti-a-renovar"),
+            "la renovación conserva el jti que ata la sesión a su refresh_token"
+        );
+
+        assert!(
+            !set_cookie.contains("refresh-secreto-distinguible"),
+            "el refresh_token no puede viajar en la Set-Cookie: {set_cookie}"
+        );
+        let cuerpo = body_json(respuesta).await;
+        assert!(
+            !cuerpo.to_string().contains("refresh-secreto-distinguible"),
+            "el refresh_token no puede viajar en el cuerpo: {cuerpo}"
+        );
+    }
+
+    /// Escenario «Rotación del refresh_token»: si el proveedor devuelve un
+    /// `refresh_token` nuevo, sustituye al anterior asociado al mismo `jti`.
+    #[tokio::test]
+    async fn rotacion_del_refresh_token() {
+        let proveedor = ProveedorFalso::servir().await;
+        proveedor.devolver_refresh_token(true);
+        proveedor.rotar_refresh_token("refresh-nuevo");
+        proveedor
+            .montar_token_endpoint(&proveedor.firmar(&IdToken::valido(
+                &proveedor.issuer,
+                OIDC_CLIENT_ID,
+                "nonce-que-el-refresh-no-exige",
+            )))
+            .await;
+        let entorno = entorno_oidc_con_emisor(&proveedor.issuer).await;
+
+        let cookie = sesion_con_refresh(&entorno, "jti-a-rotar", "refresh-viejo").await;
+
+        let respuesta =
+            peticion_cruda_con_cookie(&entorno.app(), Method::GET, "/api/v1/units", &cookie).await;
+        assert_eq!(respuesta.status(), StatusCode::OK);
+
+        let auth = entorno
+            .state()
+            .auth
+            .as_ref()
+            .expect("el entorno oidc tiene estado de autenticación");
+
+        assert_eq!(
+            auth.obtener_refresh_token_por_jti("jti-a-rotar")
+                .await
+                .as_deref(),
+            Some("refresh-nuevo"),
+            "el refresh_token nuevo del proveedor tiene que sustituir al anterior"
+        );
+    }
+
+    /// Escenario «Refresh rechazado por el proveedor»: un `invalid_grant` descarta
+    /// el `refresh_token`, contesta `401` con la envoltura y borra la cookie. La
+    /// revocación es **pegajosa**: una segunda petición con la misma cookie sigue
+    /// dando `401` —no resucita por la renovación local—.
+    #[tokio::test]
+    async fn refresh_rechazado_por_el_proveedor() {
+        let proveedor = ProveedorFalso::servir().await;
+        proveedor.rechazar_refresh();
+        proveedor
+            .montar_token_endpoint(&proveedor.firmar(&IdToken::valido(
+                &proveedor.issuer,
+                OIDC_CLIENT_ID,
+                "nonce-que-el-refresh-no-exige",
+            )))
+            .await;
+        let entorno = entorno_oidc_con_emisor(&proveedor.issuer).await;
+
+        let cookie = sesion_con_refresh(&entorno, "jti-revocado", "refresh-revocado").await;
+
+        let respuesta =
+            peticion_cruda_con_cookie(&entorno.app(), Method::GET, "/api/v1/units", &cookie).await;
+
+        assert_eq!(
+            respuesta.status(),
+            StatusCode::UNAUTHORIZED,
+            "un refresh rechazado tiene que cerrar la sesión"
+        );
+
+        let set_cookie = header_texto(&respuesta, header::SET_COOKIE)
+            .expect("el cierre por revocación tiene que borrar la cookie");
+        assert!(
+            set_cookie.starts_with(&format!("{SESSION_COOKIE_NAME}=;")),
+            "la Set-Cookie tiene que ser el borrado de la sesión: {set_cookie}"
+        );
+
+        let auth = entorno
+            .state()
+            .auth
+            .as_ref()
+            .expect("el entorno oidc tiene estado de autenticación");
+        assert!(
+            auth.obtener_refresh_token_por_jti("jti-revocado")
+                .await
+                .is_none(),
+            "el refresh_token rechazado tiene que descartarse"
+        );
+
+        let cuerpo = body_json(respuesta).await;
+        assert_eq!(cuerpo["error"]["code"], "unauthorized");
+
+        // La revocación no puede quedarse en la primera petición: con la misma
+        // cookie —todavía vigente por su `exp`— la siguiente tampoco pasa, en vez
+        // de resucitar por la renovación local.
+        let segunda =
+            peticion_cruda_con_cookie(&entorno.app(), Method::GET, "/api/v1/units", &cookie).await;
+
+        assert_eq!(
+            segunda.status(),
+            StatusCode::UNAUTHORIZED,
+            "una sesión revocada tiene que seguir cerrada en la petición siguiente"
+        );
+        assert!(
+            header_texto(&segunda, header::SET_COOKIE)
+                .is_some_and(|valor| valor.starts_with(&format!("{SESSION_COOKIE_NAME}=;"))),
+            "la petición siguiente también tiene que borrar la cookie"
+        );
+    }
+
+    /// Escenario «Dos renovaciones concurrentes»: con un proveedor que rota el
+    /// `refresh_token`, dos peticiones simultáneas de la misma sesión no pueden
+    /// perderla. Solo una dispara el refresh —la otra reutiliza el resultado— y
+    /// ninguna recibe `401`.
+    #[tokio::test]
+    async fn dos_renovaciones_concurrentes_no_pierden_la_sesion() {
+        let proveedor = ProveedorFalso::servir().await;
+        proveedor.devolver_refresh_token(true);
+        proveedor.rotar_refresh_token("refresh-rotado-concurrente");
+        // El retardo ensancha la ventana en la que las dos peticiones coinciden:
+        // sin él, la primera podría terminar antes de que la segunda mirara el
+        // estado y el escenario se volvería intermitente.
+        proveedor.retrasar_refresh(300);
+        proveedor
+            .montar_token_endpoint(&proveedor.firmar(&IdToken::valido(
+                &proveedor.issuer,
+                OIDC_CLIENT_ID,
+                "nonce-que-el-refresh-no-exige",
+            )))
+            .await;
+        let entorno = entorno_oidc_con_emisor(&proveedor.issuer).await;
+
+        let cookie = sesion_con_refresh(&entorno, "jti-concurrente", "refresh-concurrente").await;
+
+        let app_a = entorno.app();
+        let app_b = entorno.app();
+        let cookie_a = cookie.clone();
+        let cookie_b = cookie.clone();
+
+        let (a, b) = tokio::join!(
+            async move {
+                peticion_cruda_con_cookie(&app_a, Method::GET, "/api/v1/units", &cookie_a).await
+            },
+            async move {
+                peticion_cruda_con_cookie(&app_b, Method::GET, "/api/v1/units", &cookie_b).await
+            },
+        );
+
+        assert_eq!(
+            a.status(),
+            StatusCode::OK,
+            "una renovación concurrente no puede perder la sesión"
+        );
+        assert_eq!(
+            b.status(),
+            StatusCode::OK,
+            "una renovación concurrente no puede perder la sesión"
+        );
+        assert_eq!(
+            proveedor.peticiones_de_refresh_token(),
+            1,
+            "sólo una petición puede disparar el refresh del proveedor"
+        );
+    }
+
+    /// Escenario «Error del proveedor distinto de `invalid_grant`»: un `400` con
+    /// `{"error":"invalid_request"}` no es un rechazo del token, así que la sesión
+    /// local se mantiene —nada de `401`—.
+    #[tokio::test]
+    async fn un_error_del_proveedor_distinto_de_invalid_grant_mantiene_la_sesion() {
+        let proveedor = ProveedorFalso::servir().await;
+        proveedor.rechazar_refresh_con("invalid_request");
+        proveedor
+            .montar_token_endpoint(&proveedor.firmar(&IdToken::valido(
+                &proveedor.issuer,
+                OIDC_CLIENT_ID,
+                "nonce-que-el-refresh-no-exige",
+            )))
+            .await;
+        let entorno = entorno_oidc_con_emisor(&proveedor.issuer).await;
+
+        let cookie = sesion_con_refresh(&entorno, "jti-error", "refresh-vigente").await;
+
+        let respuesta =
+            peticion_cruda_con_cookie(&entorno.app(), Method::GET, "/api/v1/units", &cookie).await;
+
+        assert_eq!(
+            respuesta.status(),
+            StatusCode::OK,
+            "un error del proveedor que no es un rechazo no puede cerrar la sesión"
+        );
+        assert!(
+            header_texto(&respuesta, header::SET_COOKIE).is_some(),
+            "la sesión local se renueva como hasta ahora"
+        );
+
+        let auth = entorno
+            .state()
+            .auth
+            .as_ref()
+            .expect("el entorno oidc tiene estado de autenticación");
+        assert!(
+            auth.obtener_refresh_token_por_jti("jti-error")
+                .await
+                .is_some(),
+            "el error del proveedor no descarta el refresh_token"
+        );
+    }
+
+    /// Escenario «El ID token del refresh es de otro usuario»: si el proveedor
+    /// contesta con un `sub` distinto al de la sesión, la sesión local se mantiene
+    /// con su identidad original —la cookie no se reetiqueta con el `sub` nuevo— y
+    /// la petición no da `401`.
+    #[tokio::test]
+    async fn un_id_token_de_refresh_con_otro_sub_mantiene_la_sesion_local() {
+        let proveedor = ProveedorFalso::servir().await;
+        proveedor.devolver_refresh_token(true);
+        proveedor
+            .montar_token_endpoint(&proveedor.firmar(&IdToken::valido(
+                &proveedor.issuer,
+                OIDC_CLIENT_ID,
+                "nonce-que-el-refresh-no-exige",
+            )))
+            .await;
+        // El refresh contesta con la identidad de otro usuario: el `sub` no cuadra
+        // con el de la sesión.
+        proveedor.refresh_con_otro_sub("usuario-que-no-es-el-de-la-sesion");
+        let entorno = entorno_oidc_con_emisor(&proveedor.issuer).await;
+
+        let cookie = sesion_con_refresh(&entorno, "jti-otro-sub", "refresh-vigente").await;
+        let original = claims_de_cookie(&cookie);
+
+        let respuesta =
+            peticion_cruda_con_cookie(&entorno.app(), Method::GET, "/api/v1/units", &cookie).await;
+
+        assert_eq!(
+            respuesta.status(),
+            StatusCode::OK,
+            "un ID token de otro usuario no puede cerrar la sesión"
+        );
+        assert!(
+            proveedor.peticiones_de_refresh_token() >= 1,
+            "la sesión en ventana tiene que pedir el refresh al proveedor"
+        );
+
+        let set_cookie = header_texto(&respuesta, header::SET_COOKIE)
+            .expect("la sesión local se renueva como hasta ahora");
+        let token = valor_de_cookie(&set_cookie, SESSION_COOKIE_NAME)
+            .expect("la Set-Cookie trae el token de sesión");
+        let renovada = session::verify(&SecretString::new(SECRETO.to_owned()), &token)
+            .expect("la sesión renovada tiene que verificar");
+
+        assert_eq!(
+            renovada.sub, original.sub,
+            "la cookie no puede reetiquetarse con el sub del proveedor"
+        );
+        assert_eq!(
+            renovada.email, original.email,
+            "la cookie conserva el email de la sesión"
+        );
+        assert_ne!(
+            renovada.sub, "usuario-que-no-es-el-de-la-sesion",
+            "el sub del ID token del refresh no puede acabar en la cookie"
+        );
+        assert_eq!(
+            renovada.jti.as_deref(),
+            Some("jti-otro-sub"),
+            "la renovación conserva el jti que ata la sesión a su refresh_token"
+        );
+    }
+
+    /// Escenario «ID token de refresh sin `nonce`»: en un refresh el proveedor
+    /// puede no reenviarlo, así que se acepta. Es la rama `nonce: Option` en su
+    /// camino real.
+    #[tokio::test]
+    async fn un_id_token_de_refresh_sin_nonce_se_acepta() {
+        let proveedor = ProveedorFalso::servir().await;
+        let estado = auth(&proveedor);
+
+        let ahora = jsonwebtoken::get_current_timestamp();
+        let claims = serde_json::json!({
+            "iss": proveedor.issuer,
+            "aud": OIDC_CLIENT_ID,
+            "sub": SUB,
+            "email": EMAIL,
+            "iat": ahora,
+            "exp": ahora + 600,
+        });
+        let id_token = proveedor.firmar_claims(&claims);
+
+        let identidad = verificar_id_token_renovado(&estado, &id_token)
+            .await
+            .expect("un ID token de refresh sin nonce tiene que aceptarse");
+
+        assert_eq!(identidad.sub, SUB);
+        assert_eq!(identidad.email, EMAIL);
+    }
+
+    /// Escenario «ID token de login sin `nonce`»: en el callback el `nonce` es
+    /// obligatorio —ata el token al login y cierra la repetición—, así que un ID
+    /// token que no lo trae se rechaza.
+    #[tokio::test]
+    async fn un_id_token_sin_nonce_se_rechaza_en_el_callback() {
+        let proveedor = ProveedorFalso::servir().await;
+        let estado = auth(&proveedor);
+
+        let ahora = jsonwebtoken::get_current_timestamp();
+        let claims = serde_json::json!({
+            "iss": proveedor.issuer,
+            "aud": OIDC_CLIENT_ID,
+            "sub": SUB,
+            "email": EMAIL,
+            "iat": ahora,
+            "exp": ahora + 600,
+        });
+        let id_token = proveedor.firmar_claims(&claims);
+
+        let error = verificar_id_token(&estado, &id_token, "nonce-esperado")
+            .await
+            .expect_err("sin nonce no se puede verificar un ID token de login");
+
+        assert!(
+            matches!(error, AppError::Unauthorized(_)),
+            "el rechazo debe ser un 401 tipado: {error}"
+        );
+    }
+
+    /// Escenario «Proveedor no disponible durante el refresh»: un fallo del
+    /// proveedor que no es un rechazo no cierra la sesión: se mantiene la local y
+    /// se renueva como hasta ahora.
+    #[tokio::test]
+    async fn proveedor_no_disponible_durante_el_refresh() {
+        let proveedor = ProveedorFalso::servir().await;
+        proveedor.tumbar_el_refresh();
+        proveedor
+            .montar_token_endpoint(&proveedor.firmar(&IdToken::valido(
+                &proveedor.issuer,
+                OIDC_CLIENT_ID,
+                "nonce-que-el-refresh-no-exige",
+            )))
+            .await;
+        let entorno = entorno_oidc_con_emisor(&proveedor.issuer).await;
+
+        let cookie = sesion_con_refresh(&entorno, "jti-caido", "refresh-vigente").await;
+
+        let respuesta =
+            peticion_cruda_con_cookie(&entorno.app(), Method::GET, "/api/v1/units", &cookie).await;
+
+        assert_eq!(
+            respuesta.status(),
+            StatusCode::OK,
+            "un proveedor caído al refrescar no puede cerrar la sesión local"
+        );
+        assert!(
+            header_texto(&respuesta, header::SET_COOKIE).is_some(),
+            "la sesión local se renueva como hasta ahora"
+        );
+        assert_eq!(
+            proveedor.peticiones_de_refresh_token(),
+            1,
+            "se intentó el refresh antes de caer al camino local"
+        );
+
+        let auth = entorno
+            .state()
+            .auth
+            .as_ref()
+            .expect("el entorno oidc tiene estado de autenticación");
+        assert!(
+            auth.obtener_refresh_token_por_jti("jti-caido")
+                .await
+                .is_some(),
+            "la caída del proveedor no descarta el refresh_token"
+        );
+    }
+
+    /// Escenario «Sesión sin refresh_token»: sin token asociado, la renovación es
+    /// la local de siempre y no se llama al proveedor.
+    #[tokio::test]
+    async fn sesion_sin_refresh_token() {
+        let proveedor = ProveedorFalso::servir().await;
+        proveedor
+            .montar_token_endpoint(&proveedor.firmar(&IdToken::valido(
+                &proveedor.issuer,
+                OIDC_CLIENT_ID,
+                "nonce-que-el-refresh-no-exige",
+            )))
+            .await;
+        let entorno = entorno_oidc_con_emisor(&proveedor.issuer).await;
+
+        // Una sesión con `jti` pero **sin** refresco asociado: la rama del
+        // proveedor no puede dispararse.
+        let cookie = cookie_de_sesion_con_jti(Some("jti-sin-refresh"), ahora_en_segundos() + 3600);
+
+        let respuesta =
+            peticion_cruda_con_cookie(&entorno.app(), Method::GET, "/api/v1/units", &cookie).await;
+
+        assert_eq!(respuesta.status(), StatusCode::OK);
+        assert!(
+            header_texto(&respuesta, header::SET_COOKIE).is_some(),
+            "la renovación local tiene que emitir cookie nueva"
+        );
+        assert_eq!(
+            proveedor.peticiones_de_refresh_token(),
+            0,
+            "sin refresh_token no puede llamarse al token_endpoint"
         );
     }
 }

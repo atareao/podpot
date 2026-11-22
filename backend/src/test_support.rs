@@ -588,12 +588,24 @@ pub fn ahora_en_segundos() -> u64 {
 /// de las pruebas.
 ///
 /// Es la puerta de los escenarios de renovación: permite colocar la sesión a
-/// punto de caducar, recién emitida o ya caducada sin esperar ocho horas.
+/// punto de caducar, recién emitida o ya caducada sin esperar ocho horas. Va sin
+/// `jti`: los escenarios que necesitan atar la sesión a un `refresh_token` usan
+/// [`cookie_de_sesion_con_jti`].
 pub fn cookie_de_sesion_con_caducidad(exp: u64) -> String {
+    cookie_de_sesion_con_jti(None, exp)
+}
+
+/// Una cookie de sesión válida con el `jti` y la caducidad indicados.
+///
+/// Es la puerta del refresco del proveedor: una sesión con `jti` es la que puede
+/// tener un `refresh_token` asociado en el estado, de modo que colocarla a punto
+/// de caducar ejercita la renovación con refresco.
+pub fn cookie_de_sesion_con_jti(jti: Option<&str>, exp: u64) -> String {
     let token = crate::auth::session::issue_con_caducidad(
         &SecretString::new(SECRETO.to_owned()),
         SUB.to_owned(),
         EMAIL.to_owned(),
+        jti.map(str::to_owned),
         exp,
     )
     .expect("la sesión de prueba con caducidad tiene que poder emitirse");
@@ -681,7 +693,7 @@ pub mod proveedor_falso {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
-    use super::{EMAIL, SUB};
+    use super::{EMAIL, OIDC_CLIENT_ID, SUB};
 
     /// Ruta del documento de descubrimiento.
     const RUTA_DESCUBRIMIENTO: &str = "/.well-known/openid-configuration";
@@ -820,6 +832,58 @@ pub mod proveedor_falso {
         /// refresco antes de que el segundo llegue a mirar la caché y el escenario de
         /// concurrencia se vuelve intermitente.
         retardo_jwks: Arc<AtomicU64>,
+        /// El ID token que el `token_endpoint` devuelve.
+        ///
+        /// Se fija con [`ProveedorFalso::montar_token_endpoint`]. El endpoint lo
+        /// lee en cada petición —tanto del canje del código como del refresh—, así
+        /// que la prueba puede cambiarlo sin volver a montar el mock.
+        id_token: Arc<Mutex<String>>,
+        /// Si el `token_endpoint` debe devolver `refresh_token` en el canje.
+        ///
+        /// Se controla con [`ProveedorFalso::devolver_refresh_token`]. Por defecto
+        /// es `false`: el proveedor no emite refresh tokens salvo que la prueba lo
+        /// pida.
+        devolver_refresh: Arc<AtomicBool>,
+        /// `refresh_token` que el proveedor devuelve al **rotar**.
+        ///
+        /// Si está puesto, tanto el canje como el refresh devuelven ese valor
+        /// nuevo en vez de uno aleatorio: es lo que permite comprobar que la
+        /// renovación **sustituye** el token anterior. Se fija con
+        /// [`ProveedorFalso::rotar_refresh_token`].
+        refresh_rotado: Arc<Mutex<Option<String>>>,
+        /// ID token que el `token_endpoint` devuelve **solo** al refresh.
+        ///
+        /// `None` por defecto: el refresh devuelve el mismo ID token que el canje.
+        /// Se fija con [`ProveedorFalso::refresh_con_otro_sub`] para reproducir al
+        /// proveedor que contesta con la identidad de otro usuario.
+        id_token_refresh: Arc<Mutex<Option<String>>>,
+        /// Código de error con el que el refresh debe rechazarse, si lo hay.
+        ///
+        /// `None` por defecto. Se fija con [`ProveedorFalso::rechazar_refresh`]
+        /// (`invalid_grant`, la revocación) o con
+        /// [`ProveedorFalso::rechazar_refresh_con`] (cualquier otro código): desde
+        /// aquí, las peticiones con `grant_type=refresh_token` contestan `400` con
+        /// `{"error":"<código>"}`.
+        refresh_rechazo: Arc<Mutex<Option<String>>>,
+        /// Si el refresh debe caerse: desde aquí, las peticiones con
+        /// `grant_type=refresh_token` contestan `500`.
+        ///
+        /// Se enciende con [`ProveedorFalso::tumbar_el_refresh`]: reproduce al
+        /// proveedor que falla por algo que **no** es un rechazo del token.
+        refresh_caido: Arc<AtomicBool>,
+        /// Retardo de la respuesta del `token_endpoint` al refresh, en ms.
+        ///
+        /// A cero por defecto. Se sube a voluntad para ensanchar la ventana en la
+        /// que varias peticiones concurrentes de la misma sesión coinciden pidiendo
+        /// el refresh: sin retardo, la primera puede terminarlo antes de que la
+        /// segunda llegue a mirar el estado y el escenario de concurrencia se
+        /// vuelve intermitente.
+        retardo_refresh: Arc<AtomicU64>,
+        /// Cuántas peticiones de `refresh_token` han llegado al `token_endpoint`.
+        ///
+        /// Cuenta las peticiones con `grant_type=refresh_token`. Lo usa
+        /// [`ProveedorFalso::peticiones_de_refresh_token`].
+        peticiones_de_refresh: Arc<AtomicUsize>,
     }
 
     impl ProveedorFalso {
@@ -887,6 +951,14 @@ pub mod proveedor_falso {
                 caido_descubrimiento,
                 peticiones_al_jwks,
                 retardo_jwks,
+                id_token: Arc::new(Mutex::new(String::new())),
+                devolver_refresh: Arc::new(AtomicBool::new(false)),
+                refresh_rotado: Arc::new(Mutex::new(None)),
+                id_token_refresh: Arc::new(Mutex::new(None)),
+                refresh_rechazo: Arc::new(Mutex::new(None)),
+                refresh_caido: Arc::new(AtomicBool::new(false)),
+                retardo_refresh: Arc::new(AtomicU64::new(0)),
+                peticiones_de_refresh: Arc::new(AtomicUsize::new(0)),
             }
         }
 
@@ -1038,22 +1110,130 @@ pub mod proveedor_falso {
             self.peticiones_al_jwks.load(Ordering::SeqCst)
         }
 
-        /// Monta el `token_endpoint` para que devuelva el ID token dado.
+        /// Controla si el `token_endpoint` debe devolver `refresh_token` en el canje.
         ///
-        /// Devuelve también un `access_token` distinguible: el flujo no lo usa
-        /// —con el ID token verificado sobra— y así se comprueba que no acaba en
-        /// la cookie.
-        pub async fn montar_token_endpoint(&self, id_token: &str) {
-            let cuerpo = serde_json::json!({
-                "id_token": id_token,
-                "access_token": "access-token-del-proveedor-distinguible",
-                "token_type": "Bearer",
-                "expires_in": 600,
+        /// Por defecto es `false`: el proveedor no emite refresh tokens salvo que
+        /// la prueba lo pida con [`ProveedorFalso::devolver_refresh_token`].
+        pub fn devolver_refresh_token(&self, si: bool) {
+            self.devolver_refresh.store(si, Ordering::SeqCst);
+        }
+
+        /// Hace que el proveedor **rote** el `refresh_token`: en el refresh (y en
+        /// el canje) devolverá `nuevo` en vez de uno aleatorio.
+        ///
+        /// Es lo que permite comprobar que la renovación sustituye el token
+        /// anterior por el que emite el proveedor.
+        pub fn rotar_refresh_token(&self, nuevo: &str) {
+            *self
+                .refresh_rotado
+                .lock()
+                .expect("el refresh_token rotado de prueba no puede envenenarse") =
+                Some(nuevo.to_owned());
+        }
+
+        /// Hace que el **refresh** devuelva un ID token con un `sub` distinto.
+        ///
+        /// El canje sigue devolviendo el ID token de siempre; sólo las peticiones
+        /// con `grant_type=refresh_token` reciben este otro, firmado con la misma
+        /// clave y con el `iss`/`aud` de siempre. Es el escenario del proveedor
+        /// que contesta con la identidad de otro usuario: la sesión local no puede
+        /// reetiquetarse con ese `sub`.
+        pub fn refresh_con_otro_sub(&self, sub: &str) {
+            let ahora = jsonwebtoken::get_current_timestamp();
+            let claims = serde_json::json!({
+                "iss": self.issuer.as_str(),
+                "aud": OIDC_CLIENT_ID,
+                "sub": sub,
+                "email": format!("{sub}@example.test"),
+                "iat": ahora,
+                "exp": ahora + 600,
             });
+
+            *self
+                .id_token_refresh
+                .lock()
+                .expect("el ID token de refresh de prueba no puede envenenarse") =
+                Some(self.firmar_claims(&claims));
+        }
+
+        /// Hace que el proveedor **rechace** el refresh con `invalid_grant`.
+        ///
+        /// Desde aquí, las peticiones con `grant_type=refresh_token` contestan
+        /// `400` con `{"error":"invalid_grant"}`: es el escenario de la sesión
+        /// revocada, que obliga a cerrarla.
+        pub fn rechazar_refresh(&self) {
+            self.rechazar_refresh_con("invalid_grant");
+        }
+
+        /// Hace que el proveedor **rechace** el refresh con el código dado.
+        ///
+        /// Es el complemento de [`ProveedorFalso::rechazar_refresh`] para un
+        /// error del proveedor que **no** es un rechazo del token: la sesión
+        /// local tiene que mantenerse. Desde aquí, las peticiones con
+        /// `grant_type=refresh_token` contestan `400` con `{"error":"<código>"}`.
+        pub fn rechazar_refresh_con(&self, codigo: &str) {
+            *self
+                .refresh_rechazo
+                .lock()
+                .expect("el código de rechazo de prueba no puede envenenarse") =
+                Some(codigo.to_owned());
+        }
+
+        /// Tumba el **refresh**: desde aquí, las peticiones con
+        /// `grant_type=refresh_token` contestan `500`.
+        ///
+        /// Es el escenario del proveedor que falla por algo que no es un rechazo
+        /// del token: la sesión local tiene que mantenerse y renovarse como hasta
+        /// ahora.
+        pub fn tumbar_el_refresh(&self) {
+            self.refresh_caido.store(true, Ordering::SeqCst);
+        }
+
+        /// Retrasa la respuesta del `token_endpoint` al refresh los milisegundos
+        /// dados.
+        ///
+        /// A cero por defecto. Se sube a voluntad para dar una ventana real en la
+        /// que varias peticiones concurrentes de la misma sesión coinciden pidiendo
+        /// el refresh, sin la cual el escenario de concurrencia se vuelve
+        /// intermitente.
+        pub fn retrasar_refresh(&self, milisegundos: u64) {
+            self.retardo_refresh.store(milisegundos, Ordering::SeqCst);
+        }
+
+        /// Cuántas peticiones de `refresh_token` han llegado al `token_endpoint`.
+        ///
+        /// Cuenta sólo las peticiones con `grant_type=refresh_token`.
+        pub fn peticiones_de_refresh_token(&self) -> usize {
+            self.peticiones_de_refresh.load(Ordering::SeqCst)
+        }
+
+        /// Monta el `token_endpoint`: sirve el ID token dado, al canje y al refresh.
+        ///
+        /// El mock es **uno solo** y decide por el cuerpo de la petición: si trae
+        /// `grant_type=refresh_token` cuenta el refresh y, según las banderas, lo
+        /// rechaza (`400` con el código de error), lo tumba (`500`) o devuelve el
+        /// ID token vigente. En el canje devuelve siempre el ID token y, si toca,
+        /// un `refresh_token`. El `access_token` es distinguible y no lo usa el
+        /// flujo —con el ID token verificado sobra—: así se comprueba que no acaba
+        /// en la cookie.
+        pub async fn montar_token_endpoint(&self, id_token: &str) {
+            *self
+                .id_token
+                .lock()
+                .expect("el ID token de prueba no puede envenenarse") = id_token.to_owned();
 
             Mock::given(method("POST"))
                 .and(path(RUTA_TOKEN))
-                .respond_with(ResponseTemplate::new(200).set_body_json(cuerpo))
+                .respond_with(responder_del_token(EstadoDelToken {
+                    id_token: Arc::clone(&self.id_token),
+                    id_token_refresh: Arc::clone(&self.id_token_refresh),
+                    devolver_refresh: Arc::clone(&self.devolver_refresh),
+                    refresh_rotado: Arc::clone(&self.refresh_rotado),
+                    refresh_rechazo: Arc::clone(&self.refresh_rechazo),
+                    refresh_caido: Arc::clone(&self.refresh_caido),
+                    retardo_refresh: Arc::clone(&self.retardo_refresh),
+                    peticiones_de_refresh: Arc::clone(&self.peticiones_de_refresh),
+                }))
                 .mount(&self.server)
                 .await;
         }
@@ -1174,6 +1354,117 @@ pub mod proveedor_falso {
             }
 
             ResponseTemplate::new(200).set_body_json(documento.clone())
+        }
+    }
+
+    /// El estado compartido del `token_endpoint` de prueba.
+    ///
+    /// Agrupa las banderas y contadores que el respondedor lee en cada petición.
+    /// Se pasa como un solo valor porque el cierre que monta `wiremock` no puede
+    /// capturar el proveedor entero —no es `'static`— y ocho argumentos sueltos
+    /// esconden qué se está tocando.
+    struct EstadoDelToken {
+        /// El ID token que devuelve el canje.
+        id_token: Arc<Mutex<String>>,
+        /// El ID token que devuelve el refresh, si se fijó otro.
+        id_token_refresh: Arc<Mutex<Option<String>>>,
+        /// Si el proveedor emite `refresh_token` en el canje.
+        devolver_refresh: Arc<AtomicBool>,
+        /// El `refresh_token` con el que el proveedor rota.
+        refresh_rotado: Arc<Mutex<Option<String>>>,
+        /// El código de error con el que se rechaza el refresh, si lo hay.
+        refresh_rechazo: Arc<Mutex<Option<String>>>,
+        /// Si el refresh se cae con `500`.
+        refresh_caido: Arc<AtomicBool>,
+        /// Retardo de la respuesta al refresh, en ms.
+        retardo_refresh: Arc<AtomicU64>,
+        /// Peticiones de refresh atendidas.
+        peticiones_de_refresh: Arc<AtomicUsize>,
+    }
+
+    /// El respondedor del `token_endpoint`: canje y refresh en un solo mock.
+    ///
+    /// Decide por el cuerpo de la petición. Las peticiones con
+    /// `grant_type=refresh_token` se cuentan siempre y, según las banderas, se
+    /// rechazan (`400` con el código de error), se tumban (`500`) o devuelven el
+    /// ID token vigente —el de refresh si se fijó otro, tras el retardo si lo
+    /// hay—. El `refresh_token` de la respuesta es el rotado si lo hay, o uno
+    /// aleatorio si el proveedor emite refresh tokens; sin ninguno de los dos, no
+    /// viaja.
+    fn responder_del_token(
+        estado: EstadoDelToken,
+    ) -> impl Fn(&Request) -> ResponseTemplate + Send + Sync + 'static {
+        move |peticion| {
+            let cuerpo = String::from_utf8_lossy(&peticion.body).into_owned();
+            let es_refresh = cuerpo.contains("grant_type=refresh_token");
+
+            if es_refresh {
+                estado.peticiones_de_refresh.fetch_add(1, Ordering::SeqCst);
+
+                let milisegundos = estado.retardo_refresh.load(Ordering::SeqCst);
+                if milisegundos > 0 {
+                    std::thread::sleep(Duration::from_millis(milisegundos));
+                }
+
+                if estado.refresh_caido.load(Ordering::SeqCst) {
+                    return ResponseTemplate::new(500);
+                }
+
+                let rechazo = estado
+                    .refresh_rechazo
+                    .lock()
+                    .expect("el código de rechazo de prueba no puede envenenarse")
+                    .clone();
+
+                if let Some(codigo) = rechazo {
+                    return ResponseTemplate::new(400)
+                        .set_body_json(serde_json::json!({ "error": codigo }));
+                }
+            }
+
+            // El refresh puede servirse con otro ID token —el de otro usuario— sin
+            // tocar el del canje: si no se fijó uno, se usa el de siempre.
+            let id_token = if es_refresh {
+                estado
+                    .id_token_refresh
+                    .lock()
+                    .expect("el ID token de refresh de prueba no puede envenenarse")
+                    .clone()
+            } else {
+                None
+            }
+            .unwrap_or_else(|| {
+                estado
+                    .id_token
+                    .lock()
+                    .expect("el ID token de prueba no puede envenenarse")
+                    .clone()
+            });
+
+            let refresh_token = estado
+                .refresh_rotado
+                .lock()
+                .expect("el refresh_token rotado de prueba no puede envenenarse")
+                .clone()
+                .or_else(|| {
+                    estado
+                        .devolver_refresh
+                        .load(Ordering::SeqCst)
+                        .then(|| format!("token-refresh-{}", rand::random::<u32>()))
+                });
+
+            let mut respuesta = serde_json::json!({
+                "id_token": id_token,
+                "access_token": "access-token-del-proveedor-distinguible",
+                "token_type": "Bearer",
+                "expires_in": 600,
+            });
+
+            if let Some(refresh_token) = refresh_token {
+                respuesta["refresh_token"] = serde_json::Value::String(refresh_token);
+            }
+
+            ResponseTemplate::new(200).set_body_json(respuesta)
         }
     }
 
