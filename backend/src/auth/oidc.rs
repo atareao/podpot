@@ -433,7 +433,11 @@ async fn fetch_jwks(url: &str) -> Result<JwkSet, AppError> {
 /// el ID token venga firmado con un `kid` que el conjunto cacheado no publica— no se
 /// decide aquí, porque depende del token y no del conjunto: lo detecta
 /// [`verificar_id_token`], que en ese caso pide un refresco forzado
-/// ([`refrescar_jwks`] con `forzar` a `true`) y reintenta la búsqueda.
+/// ([`refrescar_jwks_si_obsoleto`]) y reintenta la búsqueda.
+///
+/// Se mantiene como API pública aunque el flujo de verificación use
+/// [`jwks_cached_con_marca`]: es el acceso al conjunto sin marca de lectura para quien
+/// no necesite deduplicar un refresco forzado.
 pub async fn jwks_cached(auth: &AuthState) -> Result<JwkSet, AppError> {
     jwks_cached_en(auth, Instant::now()).await
 }
@@ -448,26 +452,49 @@ pub async fn jwks_cached(auth: &AuthState) -> Result<JwkSet, AppError> {
 /// público, que es justamente lo que se quiere cubrir.
 async fn jwks_cached_en(auth: &AuthState, ahora: Instant) -> Result<JwkSet, AppError> {
     if let Some(cacheado) = leer_jwks_fresco(auth, ahora).await {
-        return Ok(cacheado);
+        return Ok(cacheado.conjunto);
     }
 
-    refrescar_jwks(auth, false, ahora).await
+    refrescar_jwks(auth, ahora)
+        .await
+        .map(|(conjunto, _)| conjunto)
 }
 
-/// Devuelve el conjunto cacheado si sigue fresco a fecha de `ahora`, y `None` si no
+/// [`jwks_cached`] devolviendo además la marca de lectura del conjunto.
+///
+/// La marca es lo que permite deduplicar un refresco forzado: si otro callback
+/// refresca la caché después de esta lectura, [`refrescar_jwks_si_obsoleto`] reutiliza
+/// el conjunto en vez de volver a pedir el `jwks_uri`. Si no hay entrada fresca se
+/// refresca por caducidad y se devuelve el conjunto junto con la marca con la que
+/// quedó escrito —la de la entrada reutilizada o la de la recién leída—, sin releer
+/// la caché: así la marca nunca es anterior al conjunto que se entrega.
+async fn jwks_cached_con_marca(
+    auth: &AuthState,
+    ahora: Instant,
+) -> Result<(JwkSet, Instant), AppError> {
+    if let Some(cacheado) = leer_jwks_fresco(auth, ahora).await {
+        return Ok((cacheado.conjunto, cacheado.leido_en));
+    }
+
+    refrescar_jwks(auth, ahora).await
+}
+
+/// Devuelve la entrada cacheada si sigue fresco a fecha de `ahora`, y `None` si no
 /// hay entrada o ya ha caducado.
 ///
 /// Es el camino barato: basta un candado de **lectura**, así que los callbacks
 /// dentro del TTL no se bloquean entre sí. La frescura la calcula
 /// [`JwksCacheado::esta_fresco`] contra el instante de lectura de la propia entrada,
-/// de modo que el conjunto y su caducidad no pueden desemparejarse.
-async fn leer_jwks_fresco(auth: &AuthState, ahora: Instant) -> Option<JwkSet> {
+/// de modo que el conjunto y su caducidad no pueden desemparejarse. Se devuelve la
+/// entrada entera —clonada— y no solo el conjunto porque el llamador necesita
+/// además su marca de lectura para deduplicar un refresco forzado.
+async fn leer_jwks_fresco(auth: &AuthState, ahora: Instant) -> Option<JwksCacheado> {
     auth.jwks
         .read()
         .await
         .as_ref()
         .filter(|entrada| entrada.esta_fresco(ahora))
-        .map(|entrada| entrada.conjunto.clone())
+        .cloned()
 }
 
 /// Pide el `jwks_uri` y deja el conjunto recién leído en la caché.
@@ -478,22 +505,19 @@ async fn leer_jwks_fresco(auth: &AuthState, ahora: Instant) -> Option<JwkSet> {
 /// segundo pise el resultado del primero: el que llega después espera al candado y ya
 /// encuentra la entrada fresca. El precio es que los demás callbacks aguardan mientras
 /// dura un refresco —y, en el peor caso, lo que tarde en vencer
-/// [`INTERCAMBIO_TIMEOUT`]—; se acepta porque el refresco solo ocurre al caducar el TTL
-/// o al rotar una clave, no en cada callback, y a cambio la caché nunca queda a medias
-/// ni se pide dos veces para lo mismo.
+/// [`INTERCAMBIO_TIMEOUT`]—; se acepta porque el refresco solo ocurre al caducar el
+/// TTL, no en cada callback, y a cambio la caché nunca queda a medias ni se pide dos
+/// veces para lo mismo.
 ///
-/// Esa **deduplicación vale solo para `forzar` a `false`** —la caducidad—, el único
-/// caso en que se vuelve a comprobar la frescura ya bajo el candado: si otra tarea
-/// refrescó mientras se esperaba por él, su conjunto vale y no hay que pedir nada. Con
-/// `forzar` a `true` —la rotación— esa comprobación se salta a propósito, porque el
-/// motivo del refresco no es que la entrada haya caducado sino que no publica la clave
-/// que el ID token pide: el conjunto puede estar fresco y seguir siendo el viejo. Por
-/// eso, con `forzar` a `true`, **N callbacks concurrentes con un `kid` desconocido
-/// pueden encadenar N peticiones** al `jwks_uri`, serializadas bajo el candado pero
-/// todas de verdad. Se asume: el caso es raro —solo lo provoca una rotación que varios
-/// callbacks pisan a la vez— y una guardia de «refresco en curso» no compensaría la
-/// complejidad, porque el candado ya evita la carrera y una petición de más no rompe
-/// nada.
+/// La deduplicación es por **frescura**: si otra tarea refrescó mientras se esperaba
+/// por el candado, su conjunto vale y no hay que pedir nada. El refresco **forzado**
+/// por rotación —cuando el conjunto puede estar fresco y seguir sin publicar el `kid`
+/// que el ID token pide— no pasa por aquí: lo decide [`refrescar_jwks_si_obsoleto`],
+/// que compara la marca de lectura que el llamador observó con la de la entrada actual.
+///
+/// Devuelve el conjunto junto con la marca de lectura con la que quedó cacheado —la de
+/// la entrada reutilizada o la de la recién escrita—, para que el llamador pueda
+/// deduplicar un refresco forzado sin releer la caché.
 ///
 /// Un fallo de la petición —o del descubrimiento— se propaga tal cual y **no se
 /// cachea**: se devuelve antes de escribir, así que la entrada anterior se queda como
@@ -504,20 +528,31 @@ async fn leer_jwks_fresco(auth: &AuthState, ahora: Instant) -> Option<JwkSet> {
 /// que se comprobó la frescura— y no con una lectura nueva del reloj: una sola fuente
 /// de tiempo para decidir y para fechar evita que el TTL empiece a contar en un
 /// instante distinto al que se usó para mirar la caché.
-async fn refrescar_jwks(
-    auth: &AuthState,
-    forzar: bool,
-    ahora: Instant,
-) -> Result<JwkSet, AppError> {
+async fn refrescar_jwks(auth: &AuthState, ahora: Instant) -> Result<(JwkSet, Instant), AppError> {
     let mut cache = auth.jwks.write().await;
 
-    if !forzar
-        && let Some(entrada) = cache.as_ref()
+    if let Some(entrada) = cache.as_ref()
         && entrada.esta_fresco(ahora)
     {
-        return Ok(entrada.conjunto.clone());
+        return Ok((entrada.conjunto.clone(), entrada.leido_en));
     }
 
+    refrescar_bajo_candado(auth, &mut cache, ahora).await
+}
+
+/// Hace el descubrimiento, pide el conjunto y lo escribe en la caché.
+///
+/// El llamador tiene que traer el candado de escritura ya tomado y lo conserva
+/// durante todo el refresco: así el `fetch` queda dentro de la sección crítica y dos
+/// callbacks que coinciden no piden el conjunto por duplicado. La escritura usa el
+/// `ahora` recibido, de modo que la marca de lectura y la fecha con la que se decidió
+/// la frescura son la misma. Devuelve el conjunto junto con esa marca, sin releer la
+/// caché.
+async fn refrescar_bajo_candado(
+    auth: &AuthState,
+    cache: &mut Option<JwksCacheado>,
+    ahora: Instant,
+) -> Result<(JwkSet, Instant), AppError> {
     let discovery = discovery_cached(auth).await?;
     let conjunto = fetch_jwks(&discovery.jwks_uri).await?;
 
@@ -526,7 +561,44 @@ async fn refrescar_jwks(
         leido_en: ahora,
     });
 
-    Ok(conjunto)
+    Ok((conjunto, ahora))
+}
+
+/// Refresca el JWKS si la caché no ha cambiado desde `visto_en`.
+///
+/// Es el camino del refresco **forzado** por rotación: el llamador leyó un
+/// conjunto que no publicaba el `kid` del token. Si otro callback ya refrescó
+/// la caché después de esa lectura, reutiliza el conjunto nuevo en vez de
+/// volver a pedir el `jwks_uri`.
+///
+/// `visto_en` es la marca de lectura de la entrada que el llamador consultó. Si
+/// la caché actual se leyó **después**, su conjunto ya incorpora el refresco que
+/// este llamador iba a pedir. La comprobación se hace bajo el candado de
+/// escritura, el mismo que serializa los refrescos, de modo que entre la
+/// comprobación y la reutilización no se cuela otro refresco. Si la marca no
+/// avanzó, se delega en [`refrescar_bajo_candado`] con el candado todavía en la
+/// mano.
+///
+/// La garantía de una sola petición es **best-effort** ante carreras estrechas: si
+/// el refresco falla, el siguiente callback puede reintentarlo; y dos llamadas con
+/// marcas que el reloj no distinga podrían no deduplicarse. Como mucho se paga una
+/// petición de más, nunca se sirve un conjunto incorrecto.
+async fn refrescar_jwks_si_obsoleto(
+    auth: &AuthState,
+    visto_en: Instant,
+    ahora: Instant,
+) -> Result<JwkSet, AppError> {
+    let mut cache = auth.jwks.write().await;
+
+    if let Some(entrada) = cache.as_ref()
+        && entrada.leido_en > visto_en
+    {
+        return Ok(entrada.conjunto.clone());
+    }
+
+    refrescar_bajo_candado(auth, &mut cache, ahora)
+        .await
+        .map(|(conjunto, _)| conjunto)
 }
 
 /// Rechaza un ID token dejando la causa en el registro y un motivo genérico al
@@ -543,9 +615,11 @@ fn rechazar_id_token(causa: &str) -> AppError {
 /// Cualquier fallo rechaza con [`AppError::Unauthorized`]: no hay sesión que
 /// emitir.
 ///
-/// El conjunto de claves se resuelve por [`jwks_cached`] a partir del estado —y no
-/// por el descubrimiento que el llamador tenga en la mano— porque el JWKS se cachea:
-/// quien llama no tiene por qué saber de dónde sale el conjunto ni cuándo caduca.
+/// El conjunto de claves se resuelve por [`jwks_cached_con_marca`] a partir del estado
+/// —y no por el descubrimiento que el llamador tenga en la mano— porque el JWKS se
+/// cachea: quien llama no tiene por qué saber de dónde sale el conjunto ni cuándo
+/// caduca. La llamada devuelve además la marca de lectura, que se usa para deduplicar
+/// el refresco forzado si el `kid` no está en el conjunto.
 ///
 /// Si el `kid` del ID token no está en el conjunto cacheado, se refresca **una sola
 /// vez** y se reintenta: es lo que cubre una rotación de claves sin que el login
@@ -557,7 +631,7 @@ pub async fn verificar_id_token(
     id_token: &str,
     nonce_esperado: &str,
 ) -> Result<IdentidadVerificada, AppError> {
-    let jwks = jwks_cached(auth).await?;
+    let (jwks, visto_en) = jwks_cached_con_marca(auth, Instant::now()).await?;
 
     // El `kid` de la cabecera elige la clave del conjunto. Sin `kid`, o con uno
     // que el JWKS no publica, no hay clave con la que verificar.
@@ -580,10 +654,15 @@ pub async fn verificar_id_token(
     // distingue este caso del de la caducidad— y se reintenta la búsqueda; si tampoco
     // así aparece, el rechazo es el de siempre. El refresco solo se intenta cuando el
     // `kid` falta, no en cada verificación, de modo que el camino normal no paga
-    // ninguna petición de más.
+    // ninguna petición de más. La marca de la lectura inicial se pasa al refresco
+    // forzado: si otro callback ya refrescó la caché desde entonces, se reutiliza su
+    // conjunto en vez de repetir la petición.
     let jwk = match jwks.find(&kid) {
         Some(jwk) => jwk.clone(),
-        None => match refrescar_jwks(auth, true, Instant::now()).await?.find(&kid) {
+        None => match refrescar_jwks_si_obsoleto(auth, visto_en, Instant::now())
+            .await?
+            .find(&kid)
+        {
             Some(jwk) => jwk.clone(),
             None => {
                 return Err(rechazar_id_token(
@@ -650,6 +729,7 @@ pub async fn verificar_id_token(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     use axum::http::StatusCode;
@@ -658,16 +738,19 @@ mod tests {
     use super::{
         AuthorizationRequest, Discovery, JWKS_TTL, JwksCacheado, MARGEN_DE_RELOJ, SCOPE,
         TOKEN_LENGTH, build_authorization_url, canjear_codigo, discovery_cached, discovery_url,
-        jwks_cached_en, verificar_id_token,
+        jwks_cached_en, refrescar_jwks_si_obsoleto, verificar_id_token,
     };
     use crate::auth::state::AuthState;
     use crate::config::OidcSettings;
     use crate::error::{AppError, BAD_GATEWAY_MESSAGE};
     use crate::secret::SecretString;
-    use crate::test_support::proveedor_falso::{IdToken, ProveedorFalso, token_con_alg_none};
+    use crate::test_support::proveedor_falso::{
+        IdToken, KID_ROTADO, ProveedorFalso, token_con_alg_none,
+    };
     use crate::test_support::{
         EMAIL, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, SECRETO, SUB, body_json, capturar_log,
     };
+    use tokio::sync::Barrier;
     use tokio::task::JoinSet;
 
     /// Configuración del proveedor apuntando a un emisor dado.
@@ -1453,6 +1536,118 @@ mod tests {
         );
     }
 
+    /// Escenario «Refresco forzado ya hecho por otro callback»: el llamador leyó
+    /// la caché vieja, otro callback refrescó el conjunto después de esa lectura y,
+    /// al forzar el refresco por el `kid` ausente, reutiliza el conjunto nuevo sin
+    /// volver a pedir el `jwks_uri`.
+    ///
+    /// Es la comprobación determinista de la deduplicación: el entrelazado de la
+    /// prueba concurrente no garantiza qué lee cada callback —con la `Barrier` uno
+    /// puede leer la caché vieja y llegar a deduplicar, o quedarse esperando el
+    /// candado y ver el conjunto nuevo—; aquí se fija el caso más estrecho —la
+    /// lectura vieja ya ocurrió— con la marca de lectura como testigo. La primera
+    /// llamada paga el refresco; la segunda, con la **misma** marca, tiene que
+    /// encontrar la caché más nueva y no repetir la petición.
+    #[tokio::test]
+    async fn el_refresco_forzado_reutiliza_el_conjunto_si_otro_callback_ya_refresco() {
+        let proveedor = ProveedorFalso::servir().await;
+        let estado = auth(&proveedor);
+
+        cachear_el_jwks(&estado, &proveedor).await;
+
+        // La marca que observó el llamador: el conjunto cacheado todavía es el viejo.
+        let visto_en = estado
+            .jwks
+            .read()
+            .await
+            .as_ref()
+            .expect("hay caché")
+            .leido_en;
+
+        // El proveedor rota y el token se firma con la clave nueva: el `kid` que el
+        // llamador no encuentra en el conjunto que leyó.
+        let rotada = proveedor.rotar_clave();
+        let _token = proveedor.firmar_con_rotada(
+            &rotada,
+            &IdToken::valido(&proveedor.issuer, OIDC_CLIENT_ID, "nonce-esperado"),
+        );
+
+        let refrescado = refrescar_jwks_si_obsoleto(&estado, visto_en, Instant::now())
+            .await
+            .expect("el primer refresco forzado debe traer el conjunto nuevo");
+        assert!(
+            refrescado.find(KID_ROTADO).is_some(),
+            "el refresco tiene que publicar la clave rotada"
+        );
+
+        // Otro callback ya refrescó desde la marca observada: con la misma marca, el
+        // conjunto nuevo vale y no hay que volver al `jwks_uri`.
+        let reutilizado = refrescar_jwks_si_obsoleto(&estado, visto_en, Instant::now())
+            .await
+            .expect("la segunda llamada debe reutilizar el conjunto ya refrescado");
+        assert!(
+            reutilizado.find(KID_ROTADO).is_some(),
+            "el conjunto reutilizado es el que ya publicaba la clave rotada"
+        );
+
+        assert_eq!(
+            proveedor.peticiones_al_jwks(),
+            2,
+            "la segunda llamada no puede repetir el refresco ya hecho"
+        );
+    }
+
+    /// Escenario «Varios callbacks concurrentes con un `kid` rotado»: dos callbacks
+    /// que llegan a la vez con un `kid` que la caché no publica comparten **un solo**
+    /// refresco del `jwks_uri`, además de la lectura inicial con la que se cacheó el
+    /// conjunto.
+    ///
+    /// Es un smoke end-to-end del caso común: con la `Barrier` los dos callbacks
+    /// arrancan a la vez, pero el entrelazado no está fijado —uno puede leer la caché
+    /// vieja y deduplicar con la marca, o quedarse esperando el candado y ver el
+    /// conjunto nuevo—. La aserción de una sola petición extra se sostiene en ambos
+    /// casos; la deduplicación determinista por marca de lectura está en
+    /// [`el_refresco_forzado_reutiliza_el_conjunto_si_otro_callback_ya_refresco`].
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn varios_callbacks_concurrentes_con_un_kid_rotado_piden_el_jwks_una_sola_vez() {
+        let proveedor = ProveedorFalso::servir().await;
+        let estado = auth(&proveedor);
+
+        cachear_el_jwks(&estado, &proveedor).await;
+
+        let rotada = proveedor.rotar_clave();
+        let token = proveedor.firmar_con_rotada(
+            &rotada,
+            &IdToken::valido(&proveedor.issuer, OIDC_CLIENT_ID, "nonce-esperado"),
+        );
+
+        proveedor.retrasar_jwks(150);
+
+        let barrera = Arc::new(Barrier::new(2));
+        let mut tareas = JoinSet::new();
+        for _ in 0..2 {
+            let estado = estado.clone();
+            let token = token.clone();
+            let barrera = Arc::clone(&barrera);
+            tareas.spawn(async move {
+                barrera.wait().await;
+                verificar_id_token(&estado, &token, "nonce-esperado").await
+            });
+        }
+
+        while let Some(resultado) = tareas.join_next().await {
+            resultado
+                .expect("la tarea no puede entrar en pánico")
+                .expect("los dos callbacks deben verificar con el refresco");
+        }
+
+        assert_eq!(
+            proveedor.peticiones_al_jwks(),
+            2,
+            "una lectura inicial y un solo refresco para los dos callbacks"
+        );
+    }
+
     /// Escenario «Proveedor caído al refrescar el JWKS»: el `jwks_uri` deja de
     /// responder justo cuando hay que refrescar. El desenlace es el `502` de la casa
     /// —la envoltura de siempre, y **sin** la causa del proveedor— y no hay identidad
@@ -1501,6 +1696,23 @@ mod tests {
             proveedor.peticiones_al_jwks(),
             2,
             "el jwks_uri se refresca una sola vez antes de rendirse"
+        );
+
+        // El fallo no envenena la caché: el conjunto anterior sigue sirviendo y el
+        // token con el `kid` original verifica sin volver a ir al `jwks_uri`.
+        let token_original = proveedor.firmar(&IdToken::valido(
+            &proveedor.issuer,
+            OIDC_CLIENT_ID,
+            "nonce-esperado",
+        ));
+        verificar_id_token(&estado, &token_original, "nonce-esperado")
+            .await
+            .expect("el conjunto anterior sigue sirviendo tras el fallo del refresco");
+
+        assert_eq!(
+            proveedor.peticiones_al_jwks(),
+            2,
+            "el conjunto anterior sigue en la caché: verificar no vuelve al jwks_uri"
         );
     }
 }

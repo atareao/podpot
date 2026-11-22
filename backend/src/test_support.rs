@@ -669,8 +669,9 @@ pub async fn peticion_cruda_con_cookie(
 /// atado a `127.0.0.1` con un puerto efímero, y todas las peticiones se quedan en
 /// la máquina.
 pub mod proveedor_falso {
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use jsonwebtoken::jwk::{Jwk, JwkSet};
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
@@ -803,6 +804,14 @@ pub mod proveedor_falso {
         /// conjunto**, incluidas las lecturas que el proveedor ha contestado con un
         /// error.
         peticiones_al_jwks: Arc<AtomicUsize>,
+        /// Retardo del `jwks_uri`, en milisegundos.
+        ///
+        /// A cero por defecto, para que el proveedor conteste al instante. Se sube a
+        /// voluntad para ensanchar la ventana en la que varios callbacks concurrentes
+        /// coinciden pidiendo el conjunto: sin retardo, el primero puede terminar el
+        /// refresco antes de que el segundo llegue a mirar la caché y el escenario de
+        /// concurrencia se vuelve intermitente.
+        retardo_jwks: Arc<AtomicU64>,
     }
 
     impl ProveedorFalso {
@@ -836,6 +845,7 @@ pub mod proveedor_falso {
             let publicadas = Arc::new(Mutex::new(vec![jwk_publicada(&clave, KID)]));
             let caido = Arc::new(AtomicBool::new(false));
             let peticiones_al_jwks = Arc::new(AtomicUsize::new(0));
+            let retardo_jwks = Arc::new(AtomicU64::new(0));
 
             Mock::given(method("GET"))
                 .and(path(RUTA_JWKS))
@@ -843,6 +853,7 @@ pub mod proveedor_falso {
                     Arc::clone(&publicadas),
                     Arc::clone(&caido),
                     Arc::clone(&peticiones_al_jwks),
+                    Arc::clone(&retardo_jwks),
                 ))
                 .mount(&server)
                 .await;
@@ -859,6 +870,7 @@ pub mod proveedor_falso {
                 publicadas,
                 caido,
                 peticiones_al_jwks,
+                retardo_jwks,
             }
         }
 
@@ -964,6 +976,15 @@ pub mod proveedor_falso {
         /// flujo tenía cacheado sigue valiendo, y lo que no llega es el nuevo.
         pub fn tumbar_el_jwks(&self) {
             self.caido.store(true, Ordering::SeqCst);
+        }
+
+        /// Retrasa la respuesta del `jwks_uri` el número de milisegundos dado.
+        ///
+        /// A cero por defecto. El retardo se aplica **antes** de contestar, de modo
+        /// que la lectura cuenta igualmente y el escenario de concurrencia tiene una
+        /// ventana real en la que los callbacks coinciden pidiendo el conjunto.
+        pub fn retrasar_jwks(&self, milisegundos: u64) {
+            self.retardo_jwks.store(milisegundos, Ordering::SeqCst);
         }
 
         /// El conjunto que el `jwks_uri` publica **ahora mismo**.
@@ -1086,9 +1107,15 @@ pub mod proveedor_falso {
         publicadas: Arc<Mutex<Vec<Jwk>>>,
         caido: Arc<AtomicBool>,
         peticiones: Arc<AtomicUsize>,
+        retardo: Arc<AtomicU64>,
     ) -> impl Fn(&Request) -> ResponseTemplate + Send + Sync + 'static {
         move |_peticion| {
             peticiones.fetch_add(1, Ordering::SeqCst);
+
+            let milisegundos = retardo.load(Ordering::SeqCst);
+            if milisegundos > 0 {
+                std::thread::sleep(Duration::from_millis(milisegundos));
+            }
 
             if caido.load(Ordering::SeqCst) {
                 return ResponseTemplate::new(500);
