@@ -2,6 +2,7 @@ import { Button, Empty, Popconfirm, Space, Spin, Table, Tag, Typography } from '
 import type { TableProps } from 'antd'
 import { EstadoDeUnidad } from '../EstadoDeUnidad/EstadoDeUnidad'
 import { etiquetaDeAccionEnCurso } from '../../acciones'
+import { identidadDe } from '../../identidad'
 import type { TrabajosEnCurso } from '../../hooks/useTrabajosEnVivo'
 import type { AccionDeUnidad, QuadletUnit } from '../../types/api'
 
@@ -42,17 +43,6 @@ export interface TablaDeUnidadesProps {
  */
 const EN_MARCHA: ReadonlySet<string> = new Set(['active', 'activating', 'reloading'])
 const PARADA: ReadonlySet<string> = new Set(['inactive', 'deactivating'])
-
-/**
- * Identidad con la que se muestra y se nombra una quadlet: su `file_name`
- * publicado por la API (la clave real de `PATCH`/`DELETE`), no el nombre de
- * unidad systemd. El contrato de `file_name` es `string` no nulo; si llega
- * vacío, cae al nombre de unidad para no dejar la fila sin identificar ni los
- * botones sin nombre accesible.
- */
-function identidadDe(unidad: QuadletUnit): string {
-  return unidad.file_name || unidad.name
-}
 
 /**
  * Listado de quadlets: una fila por unidad, con su estado y las acciones de
