@@ -50,7 +50,7 @@ En modo `oidc`, la aplicación SHALL exponer `GET /api/v1/auth/login`, que SHALL
 
 ### Requirement: Sesión en cookie
 
-La sesión SHALL ser un JWT firmado con un secreto de la configuración, transportado en una cookie `HttpOnly` y `SameSite=Strict`, con `Secure` únicamente cuando el redirect sea https. La sesión SHALL caducar. `GET /api/v1/auth/session` SHALL devolver la identidad autenticada de la sesión actual, y `POST /api/v1/auth/logout` SHALL invalidarla.
+La sesión SHALL ser un JWT firmado con un secreto de la configuración, transportado en una cookie `HttpOnly` y `SameSite=Strict`, con `Secure` únicamente cuando el redirect sea https. La sesión SHALL caducar. `GET /api/v1/auth/session` SHALL devolver la identidad autenticada de la sesión actual. `POST /api/v1/auth/logout` SHALL borrar la cookie de sesión siempre, con independencia de que la cookie presentada verifique o no.
 
 #### Scenario: Identidad de la sesión
 
@@ -62,6 +62,16 @@ La sesión SHALL ser un JWT firmado con un secreto de la configuración, transpo
 - **WHEN** un cliente pide `POST /api/v1/auth/logout`
 - **THEN** SHALL eliminar la cookie de sesión y las peticiones posteriores SHALL quedar sin sesión
 
+#### Scenario: Cierre de sesión con cookie inválida
+
+- **WHEN** un cliente pide `POST /api/v1/auth/logout` con una cookie de sesión que no verifica
+- **THEN** SHALL responder con éxito y SHALL eliminar la cookie de sesión
+
+#### Scenario: Cierre de sesión sin cookie
+
+- **WHEN** un cliente pide `POST /api/v1/auth/logout` sin cookie de sesión
+- **THEN** SHALL responder con éxito y SHALL emitir la cookie de borrado
+
 #### Scenario: Sesión caducada
 
 - **WHEN** se presenta una sesión caducada
@@ -69,7 +79,7 @@ La sesión SHALL ser un JWT firmado con un secreto de la configuración, transpo
 
 ### Requirement: Protección de la superficie de negocio
 
-En modo `oidc`, la aplicación SHALL exigir sesión válida para toda la superficie de negocio (unidades, acciones, quadlets, stream y las rutas de sesión/logout), y SHALL dejar públicas únicamente la salud, el login y el callback. Sin sesión, una petición a una ruta protegida SHALL responder `401` con la envoltura `{error}` habitual (nunca una redirección ni HTML). El stream SSE SHALL quedar protegido por el mismo mecanismo, de modo que sin sesión no se abra el flujo.
+En modo `oidc`, la aplicación SHALL exigir sesión válida para toda la superficie de negocio (unidades, acciones, quadlets, stream y la ruta de sesión), y SHALL dejar públicas únicamente la salud, el login, el callback y el logout. Sin sesión, una petición a una ruta protegida SHALL responder `401` con la envoltura `{error}` habitual (nunca una redirección ni HTML). El stream SSE SHALL quedar protegido por el mismo mecanismo, de modo que sin sesión no se abra el flujo.
 
 #### Scenario: Petición sin sesión
 
@@ -78,7 +88,7 @@ En modo `oidc`, la aplicación SHALL exigir sesión válida para toda la superfi
 
 #### Scenario: Rutas públicas
 
-- **WHEN** en modo `oidc` se piden la salud, el login o el callback
+- **WHEN** en modo `oidc` se piden la salud, el login, el callback o el logout
 - **THEN** SHALL atenderse sin exigir sesión
 
 #### Scenario: Stream sin sesión

@@ -27,6 +27,6 @@
 ## 5. Cierre
 
 - [x] 5.1 Crear `docs/logout-cookie-invalida.md`.
-- [ ] 5.2 Actualizar `HANDOFF.md`.
-- [ ] 5.3 Commit gitmoji, push y PR a `development`.
-- [ ] 5.4 Archivar el change y el plan tras el merge.
+- [x] 5.2 Actualizar `HANDOFF.md`.
+- [x] 5.3 Commit gitmoji, push y PR a `development`.
+- [x] 5.4 Archivar el change y el plan tras el merge.

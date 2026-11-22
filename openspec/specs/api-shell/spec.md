@@ -166,23 +166,9 @@ El servidor SHALL exponer `GET /api/v1/units/stream` como ruta de negocio bajo `
 - **WHEN** se usa un método distinto de `GET` sobre `/api/v1/units/stream`
 - **THEN** la respuesta SHALL ser `405` con la envoltura `{error}` habitual
 
-### Requirement: Rutas de autenticación
-
-El servidor SHALL exponer `GET /api/v1/auth/login` y `GET /api/v1/auth/callback` como rutas públicas, y `POST /api/v1/auth/logout` y `GET /api/v1/auth/session` como rutas protegidas (ver la capability `autenticacion`).
-
-#### Scenario: Login y callback públicos
-
-- **WHEN** en modo `oidc` se piden `GET /api/v1/auth/login` o `GET /api/v1/auth/callback`
-- **THEN** SHALL atenderse sin exigir sesión
-
-#### Scenario: Sesión y logout protegidos
-
-- **WHEN** en modo `oidc` se piden `POST /api/v1/auth/logout` o `GET /api/v1/auth/session` sin sesión válida
-- **THEN** SHALL responder `401` con la envoltura `{error}`
-
 ### Requirement: Partición público/negocio
 
-En modo `oidc`, el servidor SHALL servir la superficie de negocio tras un gate que exige sesión, y SHALL mantener públicas únicamente la salud y las rutas de login/callback. Un método no permitido sobre una ruta de negocio SHALL seguir respondiendo `405` con la envoltura, con independencia de la sesión.
+En modo `oidc`, el servidor SHALL servir la superficie de negocio tras un gate que exige sesión, y SHALL mantener públicas únicamente la salud y las rutas de login, callback y logout. Un método no permitido sobre una ruta de negocio SHALL seguir respondiendo `405` con la envoltura, con independencia de la sesión.
 
 #### Scenario: Superficie de negocio protegida
 
@@ -236,3 +222,22 @@ El servidor SHALL exponer `GET /api/v1/jobs/stream` como ruta de negocio bajo `/
 
 - **WHEN** en modo `oidc` se pide la ruta de trabajos sin sesión válida
 - **THEN** SHALL responder `401` con la envoltura `{error}` y NO SHALL abrir el flujo
+
+### Requirement: Rutas de autenticación con logout público
+
+El servidor SHALL exponer `GET /api/v1/auth/login`, `GET /api/v1/auth/callback` y `POST /api/v1/auth/logout` como rutas públicas, y `GET /api/v1/auth/session` como ruta protegida (ver la capability `autenticacion`).
+
+#### Scenario: Login y callback públicos
+
+- **WHEN** en modo `oidc` se piden `GET /api/v1/auth/login` o `GET /api/v1/auth/callback`
+- **THEN** SHALL atenderse sin exigir sesión
+
+#### Scenario: Sesión protegida
+
+- **WHEN** en modo `oidc` se pide `GET /api/v1/auth/session` sin sesión válida
+- **THEN** SHALL responder `401` con la envoltura `{error}`
+
+#### Scenario: Logout público
+
+- **WHEN** en modo `oidc` se pide `POST /api/v1/auth/logout` sin sesión válida
+- **THEN** SHALL responder con éxito y SHALL emitir la cookie de borrado
