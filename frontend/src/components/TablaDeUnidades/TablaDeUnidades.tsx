@@ -46,9 +46,9 @@ const PARADA: ReadonlySet<string> = new Set(['inactive', 'deactivating'])
 /**
  * Identidad con la que se muestra y se nombra una quadlet: su `file_name`
  * publicado por la API (la clave real de `PATCH`/`DELETE`), no el nombre de
- * unidad systemd. Si la API no lo publica —nulo o vacío—, cae al nombre de
- * unidad para no dejar la fila sin identificar ni los botones sin nombre
- * accesible.
+ * unidad systemd. El contrato de `file_name` es `string` no nulo; si llega
+ * vacío, cae al nombre de unidad para no dejar la fila sin identificar ni los
+ * botones sin nombre accesible.
  */
 function identidadDe(unidad: QuadletUnit): string {
   return unidad.file_name || unidad.name
@@ -188,8 +188,8 @@ export function TablaDeUnidades({
                 La confirmación nombra el fichero real (identidad publicada por
                 la API): el nombre de unidad no basta para identificarlo. */}
             <Popconfirm
-              title={`¿Borrar la quadlet «${unidad.name}»?`}
-              description={`Se borrará el fichero «${unidad.file_name}». No se puede deshacer.`}
+              title={`¿Borrar la quadlet «${identidadDe(unidad)}»?`}
+              description={`Se borrará el fichero «${identidadDe(unidad)}». No se puede deshacer.`}
               okText="Sí, borrar"
               cancelText="Cancelar"
               okButtonProps={{ danger: true }}

@@ -534,7 +534,7 @@ describe('borrado de quadlets desde el panel', () => {
 
     await usuario.click(await screen.findByRole('button', { name: 'Borrar web.container' }))
 
-    expect(await screen.findByText('¿Borrar la quadlet «web.service»?')).toBeInTheDocument()
+    expect(await screen.findByText('¿Borrar la quadlet «web.container»?')).toBeInTheDocument()
 
     await usuario.click(screen.getByRole('button', { name: 'Cancelar' }))
 

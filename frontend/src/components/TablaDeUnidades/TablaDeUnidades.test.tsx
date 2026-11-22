@@ -141,7 +141,7 @@ describe('TablaDeUnidades', () => {
 
     await usuario.click(screen.getByRole('button', { name: 'Borrar web.container' }))
 
-    expect(await screen.findByText('¿Borrar la quadlet «web.service»?')).toBeInTheDocument()
+    expect(await screen.findByText('¿Borrar la quadlet «web.container»?')).toBeInTheDocument()
     expect(onBorrar).not.toHaveBeenCalled()
 
     await usuario.click(screen.getByRole('button', { name: 'Sí, borrar' }))
@@ -167,7 +167,12 @@ describe('TablaDeUnidades', () => {
 
     // El fichero que se va a borrar es el que publica la API, no el deducido del
     // nombre de unidad (que aquí resolvería al volumen `web.volume`).
-    expect(await screen.findByText(/«web-volume\.container»/)).toBeInTheDocument()
+    expect(
+      await screen.findByText('¿Borrar la quadlet «web-volume.container»?'),
+    ).toBeInTheDocument()
+    expect(
+      await screen.findByText('Se borrará el fichero «web-volume.container». No se puede deshacer.'),
+    ).toBeInTheDocument()
   })
 
   it('distingue dos quadlets con el mismo nombre de unidad por su file_name', async () => {
@@ -185,11 +190,13 @@ describe('TablaDeUnidades', () => {
     const botonVolumen = screen.getByRole('button', { name: 'Borrar web.volume' })
 
     await usuario.click(botonContenedor)
-    expect(await screen.findByText(/«web-volume\.container»/)).toBeInTheDocument()
+    expect(
+      await screen.findByText('¿Borrar la quadlet «web-volume.container»?'),
+    ).toBeInTheDocument()
     await usuario.click(screen.getByRole('button', { name: 'Cancelar' }))
 
     await usuario.click(botonVolumen)
-    expect(await screen.findByText(/«web\.volume»/)).toBeInTheDocument()
+    expect(await screen.findByText('¿Borrar la quadlet «web.volume»?')).toBeInTheDocument()
   })
 
   it('muestra el indicador «en curso» con el tipo de acción en español', () => {
@@ -270,16 +277,51 @@ describe('TablaDeUnidades', () => {
     it('identifica la fila por su file_name y deja el nombre de unidad como dato secundario', () => {
       tabla([unidad({ name: 'web.service', file_name: 'web.container' })])
 
-      // El `file_name` es la identidad primaria: vive en la celda «Unidad»…
       const celdaIdentidad = screen.getByText('web.container').closest('td')
       expect(celdaIdentidad).not.toBeNull()
-      expect(celdaIdentidad).toHaveTextContent('web.container')
 
-      // …y el nombre de unidad acompaña como dato secundario, después del `file_name`.
-      expect(celdaIdentidad).toHaveTextContent('web.service')
-      expect(celdaIdentidad!.textContent!.indexOf('web.container')).toBeLessThan(
-        celdaIdentidad!.textContent!.indexOf('web.service'),
+      const nodoFichero = screen.getByText('web.container')
+      const nodoUnidad = screen.getByText('web.service')
+
+      // Ambos viven en la misma celda «Unidad»…
+      expect(celdaIdentidad).toContainElement(nodoFichero)
+      expect(celdaIdentidad).toContainElement(nodoUnidad)
+
+      // …y el `file_name` precede al nombre de unidad en el orden del documento.
+      expect(nodoFichero.compareDocumentPosition(nodoUnidad)).toBe(
+        Node.DOCUMENT_POSITION_FOLLOWING,
       )
+    })
+
+    it('usa el file_name en el título del Popconfirm de borrado', async () => {
+      const usuario = userEvent.setup()
+      tabla([unidad({ name: 'web.service', file_name: 'web.container' })])
+
+      await usuario.click(screen.getByRole('button', { name: 'Borrar web.container' }))
+
+      // El título identifica la quadlet por el fichero publicado por la API…
+      const titulo = await screen.findByText('¿Borrar la quadlet «web.container»?')
+      expect(titulo).toBeInTheDocument()
+      // …y no por el nombre de unidad.
+      expect(titulo).not.toHaveTextContent('web.service')
+    })
+
+    it('cae al nombre de unidad en el Popconfirm cuando el file_name está vacío', async () => {
+      const usuario = userEvent.setup()
+      // Contrato: `file_name` es una cadena no nula; ante una cadena vacía la UI
+      // cae al nombre de unidad como identidad defensiva.
+      tabla([unidad({ name: 'web.service', file_name: '' })])
+
+      await usuario.click(screen.getByRole('button', { name: 'Borrar web.service' }))
+
+      expect(await screen.findByText('¿Borrar la quadlet «web.service»?')).toBeInTheDocument()
+      expect(
+        await screen.findByText('Se borrará el fichero «web.service». No se puede deshacer.'),
+      ).toBeInTheDocument()
+
+      // Ni el literal `null` ni comillas vacías.
+      expect(screen.queryByText(/null/)).not.toBeInTheDocument()
+      expect(screen.queryByText(/«»/)).not.toBeInTheDocument()
     })
 
     it('nombra cada botón de acción con el file_name de la quadlet', () => {
@@ -339,14 +381,11 @@ describe('TablaDeUnidades', () => {
       expect(screen.getByRole('button', { name: 'Reiniciar web.container' })).toBeDisabled()
     })
 
-    it('cae al nombre de unidad como identidad cuando la API no publica file_name (null)', () => {
-      // Contrato: la identidad de la fila es el `file_name`. Si la API no lo
-      // publica (`null`), la fila cae al nombre de unidad para seguir siendo
-      // operable y accesible; nunca se renderiza el literal «null».
-      const sinFichero = {
-        ...unidad({ name: 'web.service', active_state: 'inactive' }),
-        file_name: null as unknown as string,
-      }
+    it('cae al nombre de unidad como identidad cuando el file_name está vacío', () => {
+      // Contrato: `file_name` es una cadena no nula; si llega vacía, la fila cae
+      // al nombre de unidad para seguir siendo operable y accesible. Nunca se
+      // renderiza el literal «null».
+      const sinFichero = unidad({ name: 'web.service', file_name: '', active_state: 'inactive' })
 
       render(
         <TablaDeUnidades
@@ -360,7 +399,7 @@ describe('TablaDeUnidades', () => {
       )
 
       expect(screen.getByRole('button', { name: 'Arrancar web.service' })).toBeInTheDocument()
-      expect(screen.queryByText('null')).not.toBeInTheDocument()
+      expect(screen.queryByText(/null/)).not.toBeInTheDocument()
     })
   })
 })
