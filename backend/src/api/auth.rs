@@ -231,7 +231,7 @@ pub struct IdentidadDeSesion {
     pub email: String,
 }
 
-/// `POST /api/v1/auth/logout` — protegida.
+/// `POST /api/v1/auth/logout` — pública. El logout es idempotente y borra la cookie aunque la sesión no verifique o falte.
 ///
 /// Borra la cookie de sesión —la **misma** cookie, con el mismo `Path` y con
 /// `Max-Age=0`— y contesta la envoltura. Se declara como `POST` y no como `GET`
@@ -515,17 +515,76 @@ mod tests {
         );
     }
 
-    /// Escenario «Sesión y logout protegidos»: sin cookie, el `logout` contesta
-    /// `401` con la envoltura.
+    /// Escenario «Cierre sin cookie»: el `logout` se atiende igual —contesta
+    /// `200` y la cookie de borrado— aunque la petición no traiga sesión.
     #[tokio::test]
-    async fn sin_sesion_el_cierre_no_se_atiende() {
+    async fn el_cierre_atiende_sin_cookie() {
         let proveedor = ProveedorFalso::servir().await;
         let entorno = entorno_oidc_con_emisor(&proveedor.issuer).await;
 
-        let (status, cuerpo) = peticion(&entorno.app(), Method::POST, "/api/v1/auth/logout").await;
+        let (status, _) = peticion(&entorno.app(), Method::POST, "/api/v1/auth/logout").await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "el cierre no puede exigir sesión: tiene que borrar la cookie igual"
+        );
 
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
-        assert_eq!(cuerpo["error"]["code"], "unauthorized");
+        let respuesta = peticion_cruda(&entorno.app(), Method::POST, "/api/v1/auth/logout").await;
+        assert_eq!(respuesta.status(), StatusCode::OK);
+
+        let cabecera = header_texto(&respuesta, header::SET_COOKIE)
+            .expect("el logout sin cookie también debe traer la Set-Cookie de borrado");
+
+        assert!(
+            cabecera.starts_with(&format!("{SESSION_COOKIE_NAME}=;")),
+            "la cookie de borrado debe dejar el valor vacío: {cabecera}"
+        );
+        assert!(
+            cabecera.contains("Max-Age=0"),
+            "la cookie de borrado debe llevar Max-Age=0: {cabecera}"
+        );
+        assert!(
+            cabecera.contains("Path=/"),
+            "la cookie de borrado debe llevar el mismo Path que la de sesión: {cabecera}"
+        );
+    }
+
+    /// Escenario «Cierre con cookie inválida»: una cookie que no verifica no
+    /// impide el cierre; se atiende `200` y se borra la cookie.
+    #[tokio::test]
+    async fn el_cierre_atiende_con_cookie_invalida() {
+        let proveedor = ProveedorFalso::servir().await;
+        let entorno = entorno_oidc_con_emisor(&proveedor.issuer).await;
+
+        let respuesta = peticion_con_cookie_cruda(
+            &entorno.app(),
+            Method::POST,
+            "/api/v1/auth/logout",
+            &format!("{SESSION_COOKIE_NAME}=no-es-un-jwt"),
+        )
+        .await;
+
+        assert_eq!(
+            respuesta.status(),
+            StatusCode::OK,
+            "una cookie que no verifica no puede bloquear el cierre"
+        );
+
+        let cabecera = header_texto(&respuesta, header::SET_COOKIE)
+            .expect("el logout con cookie inválida también debe traer la Set-Cookie de borrado");
+
+        assert!(
+            cabecera.starts_with(&format!("{SESSION_COOKIE_NAME}=;")),
+            "la cookie de borrado debe dejar el valor vacío: {cabecera}"
+        );
+        assert!(
+            cabecera.contains("Max-Age=0"),
+            "la cookie de borrado debe llevar Max-Age=0: {cabecera}"
+        );
+        assert!(
+            cabecera.contains("Path=/"),
+            "la cookie de borrado debe llevar el mismo Path que la de sesión: {cabecera}"
+        );
     }
 
     /// El `logout` no se declara como `GET`: un `GET` lo dispararían un enlace o

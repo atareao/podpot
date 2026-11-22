@@ -40,7 +40,7 @@ const PANEL_INDEX: &str = "index.html";
 /// Compone el router de la aplicación con su estado.
 ///
 /// La superficie de `/api/v1/` se parte en dos mitades por **lista blanca**: una
-/// pública —la salud y, en modo `Oidc`, las dos rutas del flujo de entrada— y
+/// pública —la salud y, en modo `Oidc`, las tres rutas públicas de autenticación (login, callback y logout)— y
 /// una de negocio con el resto, a la que el *gate* de sesión se cuelga con
 /// `route_layer` para que no alcance a las públicas. La lista blanca y no una
 /// lista negra: así una ruta nueva queda del lado protegido por construcción, sin
@@ -91,15 +91,15 @@ pub fn router(state: AppState) -> Router {
 
     // Con proveedor, el flujo de entrada es público y las rutas de sesión, de
     // negocio; sin él, ni unas ni otras se declaran —contestan el `404` de la
-    // casa— y no se monta ninguna capa.
+    // casa— y no se monta ninguna capa. El logout es público e idempotente:
+    // cerrar sesión sin sesión no es un error, así que no pasa por el *gate*.
     let (public, negocio) = match &state.auth {
         Some(_) => (
             public
                 .route("/auth/login", get(auth::login))
-                .route("/auth/callback", get(auth::callback)),
-            negocio
-                .route("/auth/logout", post(auth::logout))
-                .route("/auth/session", get(auth::session)),
+                .route("/auth/callback", get(auth::callback))
+                .route("/auth/logout", post(auth::logout)),
+            negocio.route("/auth/session", get(auth::session)),
         ),
         None => (public, negocio),
     };
@@ -347,7 +347,7 @@ mod tests {
         );
     }
 
-    /// Escenario «Rutas públicas»: la salud, el login y el callback se atienden
+    /// Escenario «Rutas públicas»: la salud, el login, el callback y el logout se atienden
     /// sin exigir sesión.
     #[tokio::test]
     async fn las_rutas_publicas_se_atienden_sin_sesion() {
@@ -369,6 +369,13 @@ mod tests {
             callback,
             StatusCode::BAD_REQUEST,
             "el callback sin parámetros se atiende —y se queja del flujo—, no del gate"
+        );
+
+        let (logout, _) = peticion(&entorno.app(), Method::POST, "/api/v1/auth/logout").await;
+        assert_eq!(
+            logout,
+            StatusCode::OK,
+            "el cierre también es público: sin sesión responde 200, no 401"
         );
     }
 
