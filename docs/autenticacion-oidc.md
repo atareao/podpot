@@ -60,5 +60,5 @@ Para exponer: define las variables, usa un `redirect_url` con el host público, 
 
 - **JWKS sin caché**: se pide en cada callback (paridad con kesto); considerar cachearlo si se expone en producción.
 - **Logout con cookie inválida**: el gate responde 401, así que el cliente debe descartar la cookie en cliente.
-- **Autorización por rol/permiso** y **refresh de tokens** contra el proveedor (fuera de alcance).
+- **Autorización por rol/permiso** (fuera de alcance). El **refresh de tokens** contra el proveedor sí está implementado: ver `docs/refresh-tokens-proveedor.md`.
 - Endurecer el tope del mapa de `state` si `/auth/login` llega a estar muy expuesto.

@@ -49,6 +49,8 @@ pub struct Claims {
     pub sub: String,
     /// Correo del usuario, tomado del ID token ya verificado.
     pub email: String,
+    /// Identificador opcional del usuario en el proveedor.
+    pub jti: Option<String>,
     /// Momento de emisión, en segundos desde la época.
     pub iat: u64,
     /// Momento de caducidad, en segundos desde la época.
@@ -58,25 +60,80 @@ pub struct Claims {
 /// Emite el JWT de sesión firmado con `HS256` y `secret`.
 ///
 /// Devuelve el token, no la cookie: quien lo llame decide si además lo envuelve
-/// en una cabecera `Set-Cookie`.
+/// en una cabecera `Set-Cookie`. La sesión sale **sin `jti`**: es el atajo de los
+/// caminos que no asocian un `refresh_token` del proveedor. El callback usa
+/// [`issue_con_jti`] para emitir la sesión atada a su `refresh_token`.
 pub fn issue(secret: &SecretString, sub: String, email: String) -> Result<String, AppError> {
+    issue_con_jti(secret, sub, email, None)
+}
+
+/// Emite el JWT de sesión con un `jti` opcional.
+///
+/// El `jti` ata la sesión al `refresh_token` del proveedor que el callback
+/// guarda en memoria: la renovación lo necesita para volver a pedir el ID token
+/// y para localizar el token que hay que rotar o descartar. Las sesiones sin
+/// `refresh_token` se emiten igualmente con `jti` —el callback siempre pone
+/// uno—, de modo que toda sesión de producción tiene con qué identificarse; el
+/// `None` queda para la emisión sin refresco y para las pruebas.
+pub fn issue_con_jti(
+    secret: &SecretString,
+    sub: String,
+    email: String,
+    jti: Option<String>,
+) -> Result<String, AppError> {
     let emitido = get_current_timestamp();
     let claims = Claims {
         sub,
         email,
+        jti,
         iat: emitido,
         exp: emitido + SESSION_LIFETIME.as_secs(),
     };
 
+    firmar(secret, &claims)
+}
+
+/// Firma unos `claims` de sesión con `HS256` y `secret`.
+///
+/// Es el único sitio donde la clave de firma sale por `expose`: emitir, renovar
+/// y el atajo de las pruebas comparten esta firma en vez de repetir la clave.
+fn firmar(secret: &SecretString, claims: &Claims) -> Result<String, AppError> {
     let cabecera = Header::new(Algorithm::HS256);
-    // La clave entra por el tipo que redacta y solo sale por `expose`, en el
-    // único sitio donde hace falta: firmar.
     let clave = EncodingKey::from_secret(secret.expose().as_bytes());
 
-    encode(&cabecera, &claims, &clave).map_err(|error| {
+    encode(&cabecera, claims, &clave).map_err(|error| {
         tracing::error!(%error, "no se pudo firmar el JWT de sesión");
         AppError::Internal("no se pudo emitir la sesión".to_owned())
     })
+}
+
+/// Un `jti` nuevo para la sesión: 16 bytes aleatorios en forma de UUID v4.
+///
+/// Es el identificador con el que el callback asocia el `refresh_token` del
+/// proveedor a la sesión emitida. Se construye a mano —versión 4, variante
+/// RFC 4122— y no con una caja de `uuid`: `rand` ya está en el árbol de
+/// dependencias y el formato es una decena de líneas. Es opaco: solo tiene que
+/// ser único y no adivinable, no llevar información.
+pub fn nuevo_jti() -> String {
+    use rand::Rng as _;
+
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill(&mut bytes);
+    // Los bits de versión (4) y variante (RFC 4122), para que sea un UUID v4
+    // bien formado y no solo dieciséis bytes con guiones.
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+
+    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32],
+    )
 }
 
 /// ¿Toca renovar la sesión?
@@ -94,19 +151,26 @@ pub fn should_renew(claims: &Claims, ahora: u64) -> bool {
 
 /// Reemite la sesión con la misma identidad y una vida nueva.
 ///
-/// Conserva `sub` y `email` —la renovación no cambia quién es el operador— y
-/// vuelve a firmar con `issue`, así que el token nuevo tiene el `iat` y el `exp`
-/// de una emisión recién hecha. No toca la cookie: quien la envuelva decide si
-/// además la manda en `Set-Cookie`.
+/// Conserva `sub`, `email` **y el `jti`** —el `jti` ata la sesión renovada al
+/// mismo `refresh_token`, de modo que la renovación siguiente sigue teniendo con
+/// qué refrescar— y vuelve a firmar con `issue_con_jti`, así que el token nuevo
+/// tiene el `iat` y el `exp` de una emisión recién hecha. No toca la cookie:
+/// quien la envuelva decide si además la manda en `Set-Cookie`.
 pub fn renew(secret: &SecretString, claims: &Claims) -> Result<String, AppError> {
-    issue(secret, claims.sub.clone(), claims.email.clone())
+    issue_con_jti(
+        secret,
+        claims.sub.clone(),
+        claims.email.clone(),
+        claims.jti.clone(),
+    )
 }
 
 /// Emite un JWT de sesión con una caducidad dada, para las pruebas.
 ///
 /// `issue` fija la vida de la sesión a [`SESSION_LIFETIME`]; este atajo permite
 /// fabricar tokens con el `exp` que cada escenario necesita —recién emitido, a
-/// punto de caducar o ya caducado— sin tocar la constante ni depender del reloj.
+/// punto de caducar o ya caducado— sin tocar la constante ni depender del reloj,
+/// y con el `jti` que la prueba quiera para ejercer la renovación con refresco.
 /// Firma con `HS256` y el mismo secreto que `issue`, así que `verify` lo acepta
 /// igual que un token de producción.
 #[cfg(test)]
@@ -114,22 +178,33 @@ pub(crate) fn issue_con_caducidad(
     secret: &SecretString,
     sub: String,
     email: String,
+    jti: Option<String>,
     exp: u64,
 ) -> Result<String, AppError> {
     let claims = Claims {
         sub,
         email,
+        jti,
         iat: get_current_timestamp(),
         exp,
     };
 
-    let cabecera = Header::new(Algorithm::HS256);
-    let clave = EncodingKey::from_secret(secret.expose().as_bytes());
+    firmar(secret, &claims)
+}
 
-    encode(&cabecera, &claims, &clave).map_err(|error| {
-        tracing::error!(%error, "no se pudo firmar el JWT de sesión");
-        AppError::Internal("no se pudo emitir la sesión".to_owned())
-    })
+/// La cookie de borrado de la sesión: la misma cookie, con el mismo `Path` y
+/// `Max-Age=0`.
+///
+/// Se construye con `make_removal` en vez de con `CookieJar::remove` a
+/// propósito: `remove` solo emite la `Set-Cookie` si la petición traía esa
+/// cookie, y ni el `logout` ni el cierre por revocación del proveedor pueden
+/// depender de que la cookie siga ahí. El borrado define la cookie en un único
+/// sitio —[`SESSION_COOKIE_NAME`] con `Path=/`— para que el `logout` y el `401`
+/// por revocación manden exactamente la misma.
+pub fn cookie_de_borrado() -> Cookie<'static> {
+    let mut cookie = Cookie::build((SESSION_COOKIE_NAME, "")).path("/").build();
+    cookie.make_removal();
+    cookie
 }
 
 /// Verifica la firma, el algoritmo y la vigencia de un JWT de sesión.
@@ -263,6 +338,7 @@ mod tests {
         let claims = Claims {
             sub: SUB.to_owned(),
             email: EMAIL.to_owned(),
+            jti: None,
             iat: exp - SESSION_LIFETIME.as_secs(),
             exp,
         };
@@ -370,8 +446,8 @@ mod tests {
 
         assert_eq!(
             claves_del_payload(&token),
-            ["email", "exp", "iat", "sub"],
-            "los claims de la sesión deben ser exactamente los cuatro: {token}"
+            ["email", "exp", "iat", "jti", "sub"],
+            "los claims de la sesión deben ser exactamente los cinco: {token}"
         );
 
         assert!(
@@ -511,6 +587,7 @@ mod tests {
         Claims {
             sub: SUB.to_owned(),
             email: EMAIL.to_owned(),
+            jti: None,
             iat: exp.saturating_sub(SESSION_LIFETIME.as_secs()),
             exp,
         }
