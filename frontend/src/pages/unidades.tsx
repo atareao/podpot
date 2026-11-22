@@ -127,7 +127,7 @@ export default function Unidades() {
   const alAccionar = async (unidad: QuadletUnit, tipo: AccionDeUnidad) => {
     try {
       const resultado = await accion.mutateAsync({ name: unidad.name, accion: tipo })
-      message.success(`Unidad «${resultado.name}» ${VERBOS[tipo]} (${resultado.active_state}).`)
+      message.success(`Quadlet «${identidadDe(unidad)}» ${VERBOS[tipo]} (${resultado.active_state}).`)
     } catch (error) {
       message.error(mensajeDeError(error))
     }
@@ -136,7 +136,7 @@ export default function Unidades() {
   const alCrear = async (peticion: PeticionDeCreacion): Promise<boolean> => {
     try {
       const creada = await creacion.mutateAsync(peticion)
-      message.success(`Quadlet «${creada.unit_name}» creada.`)
+      message.success(`Quadlet «${creada.file_name}» creada.`)
       return true
     } catch (error) {
       message.error(mensajeDeError(error))
@@ -161,7 +161,7 @@ export default function Unidades() {
         nombre: enEdicion.file_name,
         datos: completarConDefinicion(peticion, lectura.data),
       })
-      message.success(`Quadlet «${enEdicion.name}» editada.`)
+      message.success(`Quadlet «${identidadDe(enEdicion)}» editada.`)
       setEnEdicion(null)
       return true
     } catch (error) {
