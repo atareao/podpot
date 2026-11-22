@@ -222,7 +222,7 @@ export default function Unidades() {
         </Card>
       ) : (
         <Card
-          title={`Editar quadlet «${enEdicion.name}»`}
+          title={`Editar quadlet «${identidadDe(enEdicion)}»`}
           size="small"
           style={{ marginBottom: 16 }}
         >
