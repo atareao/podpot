@@ -109,7 +109,7 @@ describe('pantalla de quadlets', () => {
 
     await usuario.click(screen.getByRole('button', { name: 'Arrancar web.container' }))
 
-    expect(await screen.findByText(/«web.service» arrancada/i)).toBeInTheDocument()
+    expect(await screen.findByText(/Quadlet «web.container» arrancada/i)).toBeInTheDocument()
     expect(vi.mocked(accionDeUnidad)).toHaveBeenCalledWith('web.service', 'start')
     // El refresco vuelve a pedir la lista y termina mostrando el estado nuevo.
     expect(await screen.findByText('En ejecución')).toBeInTheDocument()
@@ -156,7 +156,7 @@ describe('pantalla de quadlets', () => {
     await usuario.type(screen.getByLabelText('Imagen'), 'docker.io/library/nginx')
     await usuario.click(screen.getByRole('button', { name: 'Crear' }))
 
-    expect(await screen.findByText(/«web.service» creada/i)).toBeInTheDocument()
+    expect(await screen.findByText(/«web.container» creada/i)).toBeInTheDocument()
     expect(vi.mocked(crearQuadlet)).toHaveBeenCalledWith({
       name: 'web',
       kind: 'container',
@@ -295,7 +295,7 @@ describe('edición de quadlets desde el panel', () => {
     await usuario.click(await screen.findByRole('button', { name: 'Editar web.container' }))
     await usuario.click(await screen.findByRole('button', { name: 'Guardar' }))
 
-    expect(await screen.findByText(/«web.service» editada/i)).toBeInTheDocument()
+    expect(await screen.findByText(/«web.container» editada/i)).toBeInTheDocument()
     // El identificador de la ruta es el nombre de fichero, no el de unidad.
     expect(vi.mocked(editarQuadlet)).toHaveBeenCalledWith('web.container', {
       name: 'web',
@@ -411,7 +411,7 @@ describe('edición de quadlets desde el panel', () => {
     expect(screen.getByRole('button', { name: 'Borrar web.container' })).toBeDisabled()
 
     guardado.resolver({ file_name: 'web.container', unit_name: 'web.service', kind: 'container' })
-    expect(await screen.findByText(/«web.service» editada/i)).toBeInTheDocument()
+    expect(await screen.findByText(/«web.container» editada/i)).toBeInTheDocument()
   })
 })
 
