@@ -129,7 +129,7 @@ En modo `oidc`, la aplicación SHALL exigir sesión válida para toda la superfi
 
 ### Requirement: Caché del JWKS con frescura acotada
 
-En modo `oidc`, el conjunto de claves públicas del proveedor (`JWKS`) SHALL almacenarse en caché tras la primera lectura y reutilizarse en los callbacks posteriores, de manera que NO SHALL realizarse una petición al `jwks_uri` en cada callback. La caché SHALL considerarse fresca solo durante un TTL acotado; transcurrido el TTL, el siguiente callback SHALL volver a solicitar el `jwks_uri`. Si el ID token presenta un `kid` que el conjunto cacheado no publica, la aplicación SHALL refrescar el `jwks_uri` (una sola vez) antes de rechazar el token. Si varios callbacks concurrentes fuerzan el refresco por el mismo `kid` desconocido, la aplicación SHALL reutilizar el conjunto ya refrescado por otro callback en lugar de repetir la petición. El contrato HTTP NO SHALL cambiar: un ID token que no verifica SHALL seguir rechazándose con `401` y con el mismo motivo genérico, y un fallo del proveedor al refrescar el `jwks_uri` SHALL desenlazar en `BadGateway` (`502`) con la envoltura existente `{error:{code,message}}`, sin exponer la causa subyacente.
+En modo `oidc`, el conjunto de claves públicas del proveedor (`JWKS`) SHALL almacenarse en caché tras la primera lectura y reutilizarse en los callbacks posteriores, de manera que NO SHALL realizarse una petición al `jwks_uri` en cada callback. La caché SHALL considerarse fresca solo durante un TTL acotado; transcurrido el TTL, el siguiente callback SHALL volver a solicitar el `jwks_uri`. Si el ID token presenta un `kid` que el conjunto cacheado no publica, la aplicación SHALL refrescar el `jwks_uri` (una sola vez) antes de rechazar el token. Si varios callbacks concurrentes fuerzan el refresco por el mismo `kid` desconocido, la aplicación SHALL reutilizar el conjunto ya refrescado por otro callback en lugar de repetir la petición. El contrato HTTP NO SHALL cambiar: un ID token que no verifica SHALL seguir rechazándose con `401` y con el mismo motivo genérico, y un fallo del proveedor al refrescar el `jwks_uri` —fallo del propio `jwks_uri` o del descubrimiento que el refresco necesita resolver primero— SHALL desenlazar en `bad_gateway` (`502`) con la envoltura existente `{error:{code,message}}`, sin exponer la causa subyacente y sin modificar la caché anterior.
 
 #### Scenario: Reutilización dentro del TTL
 
@@ -158,6 +158,15 @@ En modo `oidc`, el conjunto de claves públicas del proveedor (`JWKS`) SHALL alm
 #### Scenario: Proveedor caído al refrescar el JWKS
 
 - **WHEN** el refresco del `jwks_uri` falla (red, estado no exitoso o cuerpo no válido)
-- **THEN** la respuesta SHALL ser `502` con el código `BadGateway` y la envoltura existente
+- **THEN** la respuesta SHALL ser `502` con el código `bad_gateway` y la envoltura existente
 - **AND** la causa subyacente NO SHALL exponerse en el cuerpo
 - **AND** NO SHALL emitirse sesión
+- **AND** la caché anterior del JWKS NO SHALL modificarse
+
+#### Scenario: Descubrimiento caído al refrescar el JWKS
+
+- **WHEN** el refresco del JWKS necesita resolver el descubrimiento y este falla
+- **THEN** la respuesta SHALL ser `502` con el código `bad_gateway` y la envoltura existente
+- **AND** la causa subyacente NO SHALL exponerse en el cuerpo
+- **AND** NO SHALL emitirse sesión
+- **AND** la caché anterior del JWKS NO SHALL modificarse

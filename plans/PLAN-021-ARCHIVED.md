@@ -34,6 +34,6 @@ Cubrir con test el camino en el que `refrescar_bajo_candado` necesita el descubr
 ## Cierre
 
 - [x] `docs/discovery-caido-en-refresco-jwks.md`.
-- [ ] `HANDOFF.md` actualizado.
-- [ ] Commit, push y PR a `development`.
-- [ ] Change y plan archivados; issue #43 cerrada.
+- [x] `HANDOFF.md` actualizado.
+- [x] Commit, push y PR a `development`.
+- [x] Change y plan archivados; issue #43 cerrada.
