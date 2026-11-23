@@ -10,3 +10,4 @@ Habla con systemd por **D-Bus** (`org.freedesktop.systemd1`); nunca por shell-ou
 
 > Proyecto en construcción. Arquitectura y convenciones en [AGENTS.md](AGENTS.md).
 Trigger release workflow
+Trigger release workflow
