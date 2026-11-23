@@ -9,3 +9,5 @@ Backend en **Rust + Axum** (`backend/`), frontend en **React + Ant Design** (`fr
 Habla con systemd por **D-Bus** (`org.freedesktop.systemd1`); nunca por shell-out.
 
 > Proyecto en construcción. Arquitectura y convenciones en [AGENTS.md](AGENTS.md).
+Trigger release workflow
+Trigger release workflow
