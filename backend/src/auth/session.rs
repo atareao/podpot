@@ -36,12 +36,18 @@ pub const SESSION_LIFETIME: std::time::Duration = std::time::Duration::from_secs
 /// para que la renovación llegue antes de que el `exp` caduque.
 pub const RENEWAL_WINDOW: std::time::Duration = std::time::Duration::from_secs(2 * 60 * 60);
 
-/// Identidad de la sesión: exactamente `sub`, `email`, `iat` y `exp`.
+/// Identidad de la sesión: exactamente `sub`, `email`, `iat`, `exp` y `logout_epoch`.
 ///
-/// La estructura es la que sella la superficie: con esos cuatro campos y
+/// La estructura es la que sella la superficie: con esos cinco campos y
 /// `deny_unknown_fields`, un token que traiga cualquier claim de más —un rol,
 /// por ejemplo— no se puede deserializar y por tanto no se acepta. No hay que
 /// acordarse de rechazarlo: no cabe.
+///
+/// `logout_epoch` indica cuándo se cerró la sesión desde el servidor. Si es
+/// `Some(epoch)` y `epoch >= ahora`, ninguna petición posterior con este token
+/// se renueva —el *gate* contesta `401` con borrado de cookie. Es el cierre de
+/// la carrera logout↔refresh: un logout pone el epoch muy futuro para que todas
+/// las peticiones en vuelo lo detecten; si es `None` o `0`, funciona como siempre.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Claims {
@@ -55,6 +61,13 @@ pub struct Claims {
     pub iat: u64,
     /// Momento de caducidad, en segundos desde la época.
     pub exp: u64,
+    /// Cuando la sesión fue revocada por el servidor (`0` si nunca revocada).
+    ///
+    /// Se escribe en el `logout` con una hora muy futura (día) para que
+    /// cualquier petición en vuelo la detecte. Las sesiones emitidas normales
+    /// tienen `logout_epoch = 0`: se considera expirado y no bloquea renovación.
+    #[serde(default)]
+    pub logout_epoch: u64,
 }
 
 /// Emite el JWT de sesión firmado con `HS256` y `secret`.
@@ -88,6 +101,33 @@ pub fn issue_con_jti(
         jti,
         iat: emitido,
         exp: emitido + SESSION_LIFETIME.as_secs(),
+        // Nueva sesión: nunca revocada por el servidor.
+        logout_epoch: 0,
+    };
+
+    firmar(secret, &claims)
+}
+
+/// Versión interna de [`issue_con_jti`] que fija el `logout_epoch` a voluntad.
+///
+/// Se usa por [`renew`] para conservar el epoch cuando el servidor ya marcó la
+/// sesión como revocada y no quiere que las peticiones subsiguientes se renueven
+/// ignorando ese marcador.
+fn issue_con_jti_with_logout(
+    secret: &SecretString,
+    sub: String,
+    email: String,
+    jti: Option<String>,
+    logout_epoch: u64,
+) -> Result<String, AppError> {
+    let emitido = get_current_timestamp();
+    let claims = Claims {
+        sub,
+        email,
+        jti,
+        iat: emitido,
+        exp: emitido + SESSION_LIFETIME.as_secs(),
+        logout_epoch,
     };
 
     firmar(secret, &claims)
@@ -145,7 +185,22 @@ pub fn nuevo_jti() -> String {
 /// ha llegado su `exp`. Se compara con `<=` para que el borde —exactamente dos
 /// horas— también renueve: llegar justo al umbral no es un caso que convenga
 /// dejar fuera.
+///
+/// Si el servidor marcó esta sesión como revocada (`logout_epoch > 0`) y ese
+/// momento todavía no llegó, devuelve `false` independientemente de si la
+/// ventana lo permitiría: es el cierre de la carrera logout↔refresh. El valor
+/// cero significa «sesión emitida, nunca cerrada» y no bloquea nada.
+///
+/// Nota: el cierre de carrera principal ocurre en el *gate* vía
+/// `esta_revocado_por_logout`; `should_renew` es una verificación de defensa
+/// en profundidad por si se llama sin pasar por el gate.
 pub fn should_renew(claims: &Claims, ahora: u64) -> bool {
+    // Bloqueo por revocación del servidor: logout_epoch > 0 marca el cierre
+    // y >= ahora indica que todavía está vigente.
+    if claims.logout_epoch > 0 && claims.logout_epoch >= ahora {
+        return false;
+    }
+
     claims.exp > ahora && claims.exp <= ahora.saturating_add(RENEWAL_WINDOW.as_secs())
 }
 
@@ -156,12 +211,23 @@ pub fn should_renew(claims: &Claims, ahora: u64) -> bool {
 /// qué refrescar— y vuelve a firmar con `issue_con_jti`, así que el token nuevo
 /// tiene el `iat` y el `exp` de una emisión recién hecha. No toca la cookie:
 /// quien la envuelva decide si además la manda en `Set-Cookie`.
+///
+/// Preserva también el `logout_epoch`: si el servidor marcó esta sesión como
+/// revocada mientras se ejecutaba la renovación, el token nuevo lo mantiene para
+/// que las peticiones subsiguientes detecten el cierre antes de renovar sin mirar
+/// el epoch (que ahora apunta a un momento futuro pero la petición ya superó ese
+/// instante).
 pub fn renew(secret: &SecretString, claims: &Claims) -> Result<String, AppError> {
-    issue_con_jti(
+    let logout_epoch = claims.logout_epoch;
+
+    // issue_con_jti fija logout_epoch = 0 por defecto; pasarlo por aquí conserva
+    // el valor original cuando el servidor ya marcó la sesión como cerrada.
+    issue_con_jti_with_logout(
         secret,
         claims.sub.clone(),
         claims.email.clone(),
         claims.jti.clone(),
+        logout_epoch,
     )
 }
 
@@ -187,6 +253,8 @@ pub(crate) fn issue_con_caducidad(
         jti,
         iat: get_current_timestamp(),
         exp,
+        // Las pruebas emiten sin revocación del servidor.
+        logout_epoch: 0,
     };
 
     firmar(secret, &claims)
@@ -341,6 +409,7 @@ mod tests {
             jti: None,
             iat: exp - SESSION_LIFETIME.as_secs(),
             exp,
+            logout_epoch: 0,
         };
 
         jsonwebtoken::encode(
@@ -438,16 +507,16 @@ mod tests {
         );
     }
 
-    /// Escenario «Payload exacto»: la sesión lleva exactamente los cuatro claims
+    /// Escenario «Payload exacto»: la sesión lleva exactamente los cinco claims
     /// y ninguno de rol, así que no hay dónde meter claims del proveedor.
     #[test]
-    fn el_payload_de_la_sesion_son_exactamente_los_cuatro_claims() {
+    fn el_payload_de_la_sesion_son_exactamente_los_cinco_claims() {
         let token = sesion();
 
         assert_eq!(
             claves_del_payload(&token),
-            ["email", "exp", "iat", "jti", "sub"],
-            "los claims de la sesión deben ser exactamente los cinco: {token}"
+            ["email", "exp", "iat", "jti", "logout_epoch", "sub"],
+            "los claims de la sesión deben ser exactamente los seis: {token}"
         );
 
         assert!(
@@ -473,6 +542,7 @@ mod tests {
             "email": EMAIL,
             "iat": ahora,
             "exp": ahora + SESSION_LIFETIME.as_secs(),
+            "logout_epoch": 0,
             "role": "admin",
         });
 
@@ -590,6 +660,7 @@ mod tests {
             jti: None,
             iat: exp.saturating_sub(SESSION_LIFETIME.as_secs()),
             exp,
+            logout_epoch: 0,
         }
     }
 
@@ -678,6 +749,109 @@ mod tests {
             "la renovación tiene que alargar la vida: {} no es mayor que {}",
             renovada.exp,
             original.exp
+        );
+    }
+
+    // ── logout_epoch ────────────────────────────────────────────────────
+
+    /// Helper para construir claims con un `logout_epoch` arbitrario.
+    ///
+    /// La estructura de producción usa `u64`: cero significa «nunca revocada» y
+    /// cualquier valor mayor es el instante en que el servidor cerró la sesión.
+    fn claims_con_logout_epoch(exp: u64, logout_epoch: u64) -> Claims {
+        Claims {
+            sub: SUB.to_owned(),
+            email: EMAIL.to_owned(),
+            jti: None,
+            iat: exp.saturating_sub(SESSION_LIFETIME.as_secs()),
+            exp,
+            logout_epoch,
+        }
+    }
+
+    /// Escenario «Logout epoch activo» (`logout_epoch >= now`): no se renueva.
+    #[test]
+    fn logout_epoch_activo_bloquea_la_renovacion() {
+        let ahora = 1_000_000;
+        // logout_epoch 1 hora vista: todavía está activo.
+        let claims = claims_con_logout_epoch(ahora + RENEWAL_WINDOW.as_secs() + 1, ahora + 3600);
+
+        assert!(
+            !should_renew(&claims, ahora),
+            "un logout_epoch futuro dentro de la ventana bloquea la renovación"
+        );
+    }
+
+    /// Escenario «Logout epoch expirado» (`logout_epoch < now`, > 0): sí se renueva
+    /// si la sesión sigue dentro de la ventana.
+    #[test]
+    fn logout_epoch_expirado_permite_la_renovacion() {
+        let ahora = 1_000_000;
+        // logout_epoch hace 2 horas: ya expiró, pero es > 0.
+        let claims = claims_con_logout_epoch(ahora + RENEWAL_WINDOW.as_secs(), ahora - 7200);
+
+        assert!(
+            should_renew(&claims, ahora),
+            "cuando el logout_epoch expiró y la ventana lo permite, se renueva"
+        );
+    }
+
+    /// Escenario «Sin logout_epoch» (`logout_epoch == 0`): se renueva dentro de la
+    /// ventana como siempre.
+    #[test]
+    fn sin_logout_epoch_se_renuvia_normalmente() {
+        let ahora = 1_000_000;
+        let claims = claims_con_logout_epoch(ahora + RENEWAL_WINDOW.as_secs(), 0);
+
+        assert!(
+            should_renew(&claims, ahora),
+            "con logout_epoch == 0, funciona como siempre"
+        );
+    }
+
+    /// Escenario «Logout epoch exactamente ahora»: `logout_epoch >= now`, así que
+    /// no se renueva (borde).
+    #[test]
+    fn logout_epoch_exactamente_now_bloquea() {
+        let ahora = 1_000_000;
+        let claims = claims_con_logout_epoch(ahora + RENEWAL_WINDOW.as_secs(), ahora);
+
+        assert!(
+            !should_renew(&claims, ahora),
+            "logout_epoch == ahora también bloquea (borde)"
+        );
+    }
+
+    /// Escenario «Renovación conserva `logout_epoch`»: cuando la sesión emitida lleva
+    /// `logout_epoch > 0` (revocada por el servidor), la renovación mantiene ese
+    /// valor para que las peticiones subsiguientes sigan detectando el cierre.
+    #[test]
+    fn la_renovacion_conserva_logout_epoch_revocado() {
+        let ahora = jsonwebtoken::get_current_timestamp();
+        let logout_at = ahora + 86400; // revocada mañana.
+        let claims = claims_con_logout_epoch(ahora + 60, logout_at);
+
+        let token = renew(&secret(), &claims).expect("la renovación no puede fallar");
+        let renovada = verify(&secret(), &token).expect("el JWT renovado debe verificarse");
+
+        assert_eq!(
+            renovada.logout_epoch, logout_at,
+            "la renovación conserva el logout_epoch revocado"
+        );
+    }
+
+    /// Escenario «Renovación sin revocación» (`logout_epoch == 0`): permanece `0`.
+    #[test]
+    fn la_renovacion_mantiene_logout_epoch_cero() {
+        let ahora = jsonwebtoken::get_current_timestamp();
+        let claims = claims_con_logout_epoch(ahora + 60, 0);
+
+        let token = renew(&secret(), &claims).expect("la renovación no puede fallar");
+        let renovada = verify(&secret(), &token).expect("el JWT renovado debe verificarse");
+
+        assert_eq!(
+            renovada.logout_epoch, 0,
+            "si no había revocación, la renovación mantiene logout_epoch en 0"
         );
     }
 }

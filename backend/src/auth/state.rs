@@ -322,6 +322,40 @@ impl AuthState {
 
         Arc::clone(cerrojos.entry(jti.to_owned()).or_default())
     }
+
+    /// Marca un `jti` como cerrado por [`crate::api::auth::logout`]. Escribe un
+    /// instante de bloqueo (`Instant`) en el mapa de revocados; la entrada dura
+    /// [`SESSION_LIFETIME`]. El gate lo detecta en `esta_revocado_por_logout` y
+    /// rechaza cualquier renovación, cerrando la carrera entre el cierre y la
+    /// renovación automática.
+    ///
+    /// Se usa exclusivamente por el logout, nunca por el proveedor OIDC.
+    pub async fn cerrar_sesion_por_logout(&self, jti: &str) {
+        let ahora = Instant::now();
+        let bloqueo_hasta = ahora + SESSION_LIFETIME; // día entero después
+
+        let mut revocados = self.revocados.lock().await;
+
+        // Purga vieja al insertar, igual que en `revocar_jti`.
+        revocados.retain(|_, bloqueo_hasta| {
+            ahora.saturating_duration_since(*bloqueo_hasta) < SESSION_LIFETIME
+        });
+        revocados.insert(jti.to_owned(), bloqueo_hasta);
+    }
+
+    /// ¿Está este `jti` marcado como cerrado por logout?
+    ///
+    /// Devuelve `true` si la marca de cierre todavía no ha caducado: mientras
+    /// `bloqueo_hasta` esté dentro de [`SESSION_LIFETIME`], cualquier petición que
+    /// lleve este `jti` se considera sin sesión y el *gate* contesta `401`.
+    pub async fn esta_revocado_por_logout(&self, jti: &str) -> bool {
+        let ahora = Instant::now();
+        let revocados = self.revocados.lock().await;
+
+        revocados.get(jti).is_some_and(|bloqueo_hasta| {
+            ahora.saturating_duration_since(*bloqueo_hasta) < SESSION_LIFETIME
+        })
+    }
 }
 
 /// Purga los refresh tokens que no se han tocado en [`SESSION_LIFETIME`].
@@ -479,5 +513,116 @@ mod tests {
             Some("refresh-nuevo"),
             "el refresh_token recién guardado sobrevive a la purga"
         );
+    }
+
+    /// Escenario «Logout marca inmediatamente»: un `jti` marcado por logout
+    /// pasa a estar revocado al instante, sin esperar al TTL.
+    #[tokio::test]
+    async fn cerrar_sesion_por_logout_marca_inmediatamente() {
+        let estado = estado();
+        let jti = "test-jti-mark";
+
+        // Antes de marcar, no debería estar revocado
+        assert!(
+            !estado.esta_revocado_por_logout(jti).await,
+            "un jti sin marca no debe aparecer como revocado"
+        );
+
+        // Marcar como logout
+        estado.cerrar_sesion_por_logout(jti).await;
+
+        // Inmediatamente después, debe estar revocado
+        assert!(
+            estado.esta_revocado_por_logout(jti).await,
+            "un jti marcado por logout tiene que estar revocado al instante"
+        );
+    }
+
+    /// Escenario «Persistencia durante el periodo de vida»: un `jti` marcado por
+    /// logout permanece revocado mientras dure [`SESSION_LIFETIME`].
+    #[tokio::test]
+    async fn jti_marca_por_logout_dura_session_lifetime() {
+        let estado = estado();
+        let jti = "test-jti-duration";
+
+        estado.cerrar_sesion_por_logout(jti).await;
+
+        // Durante la ejecución del test (mucho menos de SESSION_LIFETIME)
+        // debe seguir marcado
+        for _ in 0..5 {
+            assert!(
+                estado.esta_revocado_por_logout(jti).await,
+                "la marca de bloqueo debe persistir durante todo el periodo de vida"
+            );
+            // Pequeña pausa para simular consultas reales
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Escenario «Purga de entradas viejas al insertar»: al marcar varios JTIs,
+    /// la entrada más vieja que [`SESSION_LIFETIME`] se descarta automáticamente.
+    #[tokio::test]
+    async fn cerrar_sesion_por_logout_purga_entradas_viejas() {
+        let estado = estado();
+
+        // Marcar varios JTIs con marcas antiguas manualmente
+        for i in 0..5 {
+            estado.revocados.lock().await.insert(
+                format!("jti-old-{}", i),
+                Instant::now() - SESSION_LIFETIME - Duration::from_secs(1),
+            );
+        }
+
+        // Marcar JTIs nuevos
+        for i in 5..10 {
+            estado
+                .cerrar_sesion_por_logout(&format!("jti-new-{}", i))
+                .await;
+        }
+
+        // Los antiguos ya no están en el mapa por la purga automática
+        for i in 0..5 {
+            assert!(
+                !estado
+                    .esta_revocado_por_logout(&format!("jti-old-{}", i))
+                    .await,
+                "las entradas más viejas que SESSION_LIFETIME deben purgarse"
+            );
+        }
+
+        // Los nuevos sí están marcados
+        for i in 5..10 {
+            assert!(
+                estado
+                    .esta_revocado_por_logout(&format!("jti-new-{}", i))
+                    .await,
+                "las entradas nuevas deben sobrevivir"
+            );
+        }
+    }
+
+    /// Escenario completo: flujo donde el marcaje de logout impide cualquier
+    /// operación de renovación hasta la expiración.
+    #[tokio::test]
+    async fn logout_mark_prevents_any_operation_until_expired() {
+        let estado = estado();
+        let jti = "test-jti-full-flow";
+
+        // Login normal → simulamos marca de logout
+        estado.cerrar_sesion_por_logout(jti).await;
+
+        // Cualquier intento de renovar con este jti falla
+        assert!(
+            estado.esta_revocado_por_logout(jti).await,
+            "un jti con logout activo debe bloquear todas las renovaciones"
+        );
+
+        // La marca persiste incluso tras múltiples consultas concurrentes
+        for _ in 0..3 {
+            assert!(
+                estado.esta_revocado_por_logout(jti).await,
+                "la marca debe ser estable entre llamadas consecutivas"
+            );
+        }
     }
 }
