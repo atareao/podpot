@@ -164,9 +164,10 @@ fn sesion_revocada() -> Response {
 /// `refresh_token` por el proveedor devuelve [`ResolucionDeSesion::Revocada`].
 ///
 /// La revocación se consulta **antes** de intentar renovar: una sesión cuyo `jti`
-/// ya está marcado como revocado no se renueva —ni contra el proveedor ni
-/// localmente—, porque su `refresh_token` ya se descartó y la renovación local la
-/// resucitaría.
+/// ya está marcado como revocado (por el proveedor o por [`crate::api::auth::logout]) no se renueva —ni contra el proveedor ni localmente—, porque su
+/// `refresh_token` ya se descartó y la renovación local la resucitaría. El cierre
+/// por logout se comprueba después de la revocación del proveedor pero antes de
+/// decidir si renovar: cualquier petición en vuelo detecta el cierre al instante.
 async fn con_cookie(estado: &AppState, jar: &CookieJar) -> Result<ResolucionDeSesion, AppError> {
     // Por construcción el *gate* sólo se monta donde hay proveedor, así que un
     // `None` aquí es un fallo de invariante: se rechaza la petición en vez de
@@ -190,6 +191,18 @@ async fn con_cookie(estado: &AppState, jar: &CookieJar) -> Result<ResolucionDeSe
     if let Some(jti) = claims.jti.as_deref()
         && auth.esta_revocado(jti).await
     {
+        return Ok(ResolucionDeSesion::Revocada);
+    }
+
+    // Cierre por logout: si el servidor marcó esta sesión (`jti`) como cerrada,
+    // el *gate* contesta `401` con borrado de cookie incluso si el JWT sigue
+    // vigente y dentro de la ventana de renovación. Es el cierre de la carrera
+    // logout↔refresh: el logout gana siempre.
+    if let Some(jti) = claims.jti.as_deref()
+        && auth.esta_revocado_por_logout(jti).await
+    {
+        tracing::debug!("la sesión fue cerrada por logout");
+
         return Ok(ResolucionDeSesion::Revocada);
     }
 
