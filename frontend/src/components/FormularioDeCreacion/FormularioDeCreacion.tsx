@@ -1,7 +1,13 @@
-import { useState } from 'react'
-import { Button } from 'antd'
+import { Button, Form, Input, Select, Space } from 'antd'
 import type { PeticionDeCreacion, TipoDeQuadlet } from '../../types/api'
 
+/**
+ * Etiquetas del selector de tipo, con su extensión a la vista.
+ *
+ * Se declara como `Record<TipoDeQuadlet, string>`: si se añade una variante al
+ * tipo, TypeScript exige aquí su etiqueta en vez de dejar el desplegable cojo.
+ * El orden de las claves es el de inserción, que es el que verá el usuario.
+ */
 const ETIQUETAS: Record<TipoDeQuadlet, string> = {
   container: 'Contenedor (.container)',
   volume: 'Volumen (.volume)',
@@ -9,10 +15,12 @@ const ETIQUETAS: Record<TipoDeQuadlet, string> = {
   pod: 'Pod (.pod)',
 }
 
+/** Opciones del `Select`, derivadas una sola vez del mapa de etiquetas. */
 const OPCIONES = (Object.entries(ETIQUETAS) as Array<[TipoDeQuadlet, string]>).map(
   ([value, label]) => ({ value, label }),
 )
 
+/** Valores tal y como los recoge el formulario (planos, sin anidar). */
 export interface ValoresDeFormulario {
   kind: TipoDeQuadlet
   name: string
@@ -20,14 +28,36 @@ export interface ValoresDeFormulario {
 }
 
 export interface FormularioDeCreacionProps {
+  /**
+   * Crea o guarda la quadlet con la API. Devuelve `true` si salió bien: solo
+   * entonces se limpia el formulario, para no perder lo escrito si hubo un error.
+   */
   onCrear: (peticion: PeticionDeCreacion) => Promise<boolean> | boolean
+  /** Mientras hay una operación en curso: el botón se bloquea. */
   creando?: boolean
+  /**
+   * Valores de arranque del formulario. Al editar trae el tipo y el nombre (el
+   * stem) de la quadlet elegida; sin ellos, un `.container` vacío.
+   */
   valoresIniciales?: Partial<ValoresDeFormulario>
+  /** Etiqueta del botón de envío (`Crear` por defecto; `Guardar` al editar). */
   etiquetaDeEnvio?: string
+  /**
+   * Bloquea tipo y nombre: al editar, la identidad de la quadlet no se toca
+   * —renombrarla es `InvalidName` en la API— y el tipo decide qué campos se piden.
+   */
   identidadFija?: boolean
+  /** Acción de cancelar; solo se pinta si se pasa (modo edición). */
   alCancelar?: () => void
 }
 
+/**
+ * Compone el cuerpo plano de la petición desde los valores del formulario.
+ *
+ * El cliente **nunca** manda contenido de fichero ni nada anidado: solo los
+ * campos del contrato (`name`, `kind` y, en `.container`, `image`). Un campo de
+ * más lo rechazaría el `deny_unknown_fields` del backend con un `400`.
+ */
 function construirPeticion(valores: ValoresDeFormulario): PeticionDeCreacion {
   const peticion: PeticionDeCreacion = { name: valores.name.trim(), kind: valores.kind }
   if (valores.kind === 'container') {
@@ -37,94 +67,7 @@ function construirPeticion(valores: ValoresDeFormulario): PeticionDeCreacion {
 }
 
 /**
- * Select nativo desplegable: mantiene accesible el desplegable con
- * `role="combobox"` y `role="option"` para que los tests puedan hacer
- * `getByLabelText` y `findByText(etiqueta)` exactamente como con Ant Design.
- * Usa un `<button>` como trigger para que `getByLabelText` devuelva un elemento
- * que pueda estar deshabilitado (`toBeDisabled()`).
- */
-function SelectNativo({
-  value,
-  disabled,
-  onChange,
-}: {
-  value: TipoDeQuadlet
-  disabled?: boolean
-  onChange: (kind: TipoDeQuadlet) => void
-}) {
-  const [abierto, setAbierto] = useState(false)
-  const etiqueta = ETIQUETAS[value]
-
-  return (
-    <div style={{ position: 'relative' }}>
-      <label htmlFor="select-tipo">Tipo de quadlet</label>
-      <button
-        id="select-tipo"
-        type="button"
-        role="combobox"
-        aria-expanded={abierto}
-        aria-label="Tipo de quadlet"
-        onClick={() => !disabled && setAbierto(!abierto)}
-        disabled={disabled}
-        tabIndex={0}
-        style={{
-          width: 200,
-          border: '1px solid #d9d9d9',
-          borderRadius: 4,
-          padding: '6px 11px',
-          background: disabled ? '#fafafa' : '#fff',
-          cursor: disabled ? 'not-allowed' : 'pointer',
-          userSelect: 'none',
-          textAlign: 'left',
-        }}
-      >
-        {etiqueta}
-      </button>
-      {abierto && (
-        <div
-          role="listbox"
-          style={{
-            position: 'absolute',
-            zIndex: 1050,
-            width: 200,
-            border: '1px solid #d9d9d9',
-            borderTop: 'none',
-            borderRadius: '0 0 4px 4px',
-            background: '#fff',
-            maxHeight: 256,
-            overflowY: 'auto',
-            boxShadow: '0 3px 6px -4px rgba(0,0,0,.12)',
-          }}
-        >
-          {OPCIONES.map((opt) => (
-            <div
-              key={opt.value}
-              role="option"
-              aria-selected={opt.value === value}
-              onClick={() => {
-                if (!disabled) {
-                  onChange(opt.value)
-                  setAbierto(false)
-                }
-              }}
-              style={{
-                padding: '6px 11px',
-                cursor: disabled ? 'not-allowed' : 'pointer',
-                color: disabled ? 'rgba(0,0,0,.25)' : undefined,
-                background: opt.value === value ? '#e6f7ff' : undefined,
-              }}
-            >
-              {opt.label}
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  )
-}
-
-/**
- * Formulario nativo para crear una quadlet nueva —y, con
+ * Formulario Ant Design para crear una quadlet nueva —y, con
  * `valoresIniciales`/`identidadFija`, para editar una existente—.
  *
  * Presentacional respecto a React Query: quien lo usa (`pages/unidades.tsx`)
@@ -140,116 +83,68 @@ export function FormularioDeCreacion({
   identidadFija = false,
   alCancelar,
 }: FormularioDeCreacionProps) {
-  const [kind, setKind] = useState(valoresIniciales?.kind ?? 'container')
-  const [name, setName] = useState(valoresIniciales?.name ?? '')
-  const [image, setImage] = useState(valoresIniciales?.image ?? '')
-  const [errores, setErrores] = useState<Record<string, string>>({})
+  const [formulario] = Form.useForm<ValoresDeFormulario>()
+  // El tipo manda en los campos visibles: se observa y el resto del formulario
+  // se adapta sin duplicar el estado en un `useState` que podría desincronizarse.
+  const kind = Form.useWatch('kind', formulario) ?? valoresIniciales?.kind ?? 'container'
 
-  const alEnviar = async (e: React.FormEvent) => {
-    e.preventDefault()
-
-    const nuevosErrores: Record<string, string> = {}
-    if (!name.trim()) nuevosErrores.name = 'Introduce un nombre'
-    if (kind === 'container' && !image.trim()) {
-      nuevosErrores.image = 'Introduce una imagen'
-    }
-    setErrores(nuevosErrores)
-
-    if (Object.keys(nuevosErrores).length > 0) return
-
-    const guardada = await onCrear(construirPeticion({ kind, name, image }))
-    if (guardada) {
-      setKind(valoresIniciales?.kind ?? 'container')
-      setName(valoresIniciales?.name ?? '')
-      setImage('')
-      setErrores({})
-    }
+  const alEnviar = async (valores: ValoresDeFormulario) => {
+    const guardada = await onCrear(construirPeticion(valores))
+    if (guardada) formulario.resetFields()
   }
 
   return (
-    <form onSubmit={alEnviar} className="antd-form">
-      <div
-        style={{
-          display: 'flex',
-          flexDirection: 'column',
-          gap: '1rem',
-          flexWrap: 'wrap',
-        }}
-      >
-        <SelectNativo
-          value={kind}
-          disabled={identidadFija}
-          onChange={setKind}
-        />
+    <Form<ValoresDeFormulario>
+      form={formulario}
+      layout="vertical"
+      initialValues={{ kind: 'container', ...valoresIniciales }}
+      onFinish={(valores) => void alEnviar(valores)}
+    >
+      <Space size="middle" wrap align="start">
+        <Form.Item name="kind" label="Tipo de quadlet">
+          <Select style={{ width: 200 }} options={OPCIONES} disabled={identidadFija} />
+        </Form.Item>
 
-        <div>
-          <label htmlFor="input-nombre">Nombre</label>
-          <input
-            id="input-nombre"
-            name="name"
-            aria-label="Nombre"
-            value={name}
-            onChange={(e) => setName(e.target.value)}
+        <Form.Item
+          name="name"
+          label="Nombre"
+          rules={[{ required: true, whitespace: true, message: 'Introduce un nombre' }]}
+        >
+          <Input
+            style={{ width: 220 }}
             placeholder="web"
             autoComplete="off"
             disabled={identidadFija}
-            style={{
-              width: 220,
-              padding: '6px 11px',
-              border: '1px solid #d9d9d9',
-              borderRadius: 4,
-              background: identidadFija ? '#fafafa' : '#fff',
-            }}
           />
-          {errores.name && <div style={{ color: '#ff4d4f', fontSize: '0.75rem', marginTop: 4 }}>{errores.name}</div>}
-        </div>
+        </Form.Item>
 
         {kind === 'container' && (
-          <div>
-            <label htmlFor="input-imagen">Imagen</label>
-            <input
-              id="input-imagen"
-              name="image"
-              aria-label="Imagen"
-              value={image}
-              onChange={(e) => setImage(e.target.value)}
+          <Form.Item
+            name="image"
+            label="Imagen"
+            rules={[{ required: true, whitespace: true, message: 'Introduce una imagen' }]}
+          >
+            <Input
+              style={{ width: 320 }}
               placeholder="docker.io/library/nginx"
               autoComplete="off"
-              style={{
-                width: 320,
-                padding: '6px 11px',
-                border: '1px solid #d9d9d9',
-                borderRadius: 4,
-                background: '#fff',
-              }}
             />
-            {errores.image && <div style={{ color: '#ff4d4f', fontSize: '0.75rem', marginTop: 4 }}>{errores.image}</div>}
-          </div>
+          </Form.Item>
         )}
-      </div>
+      </Space>
 
-      <div style={{ marginTop: '0.5rem', display: 'flex', gap: '0.5rem' }}>
-        <Button
-          type="primary"
-          htmlType="submit"
-          className="antd-button-primary"
-          loading={creando}
-          disabled={identidadFija && kind !== valoresIniciales?.kind}
-          style={{ width: 'auto' }}
-        >
-          {etiquetaDeEnvio}
-        </Button>
-        {alCancelar !== undefined && (
-          <Button
-            type="default"
-            onClick={alCancelar}
-            disabled={creando}
-            className="antd-button-default"
-          >
-            Cancelar
+      <Form.Item style={{ marginBottom: 0 }}>
+        <Space size="small">
+          <Button type="primary" htmlType="submit" loading={creando}>
+            {etiquetaDeEnvio}
           </Button>
-        )}
-      </div>
-    </form>
+          {alCancelar !== undefined && (
+            <Button htmlType="button" onClick={alCancelar} disabled={creando}>
+              Cancelar
+            </Button>
+          )}
+        </Space>
+      </Form.Item>
+    </Form>
   )
 }
