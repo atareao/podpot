@@ -1,5 +1,4 @@
-import { Button, Empty, Popconfirm, Space, Spin, Table, Tag, Typography } from 'antd'
-import type { TableProps } from 'antd'
+import { Button, Empty, Popconfirm, Space, Spin, Tag } from 'antd'
 import { EstadoDeUnidad } from '../EstadoDeUnidad/EstadoDeUnidad'
 import { etiquetaDeAccionEnCurso } from '../../acciones'
 import { identidadDe } from '../../identidad'
@@ -34,13 +33,6 @@ export interface TablaDeUnidadesProps {
   progresoPorUnidad?: TrabajosEnCurso
 }
 
-/**
- * Estados intermedios: aunque `ActiveState` no sea `active`/`inactive`, una
- * unidad que se está activando (`activating`, `reloading`) no se puede arrancar
- * otra vez, y una que se está desactivando (`deactivating`) no se puede parar.
- * Es una unión abierta a propósito: un estado nuevo de systemd cae del lado
- * permisivo en vez de romper la tabla.
- */
 const EN_MARCHA: ReadonlySet<string> = new Set(['active', 'activating', 'reloading'])
 const PARADA: ReadonlySet<string> = new Set(['inactive', 'deactivating'])
 
@@ -64,156 +56,133 @@ export function TablaDeUnidades({
   enCurso = null,
   progresoPorUnidad = {},
 }: TablaDeUnidadesProps) {
-  const columnas: TableProps<QuadletUnit>['columns'] = [
-    {
-      title: 'Unidad',
-      key: 'unidad',
-      render: (_valor, unidad) => (
-        <Space direction="vertical" size={0}>
-          {/* El `file_name` es la identidad primaria de la fila… */}
-          <span>{identidadDe(unidad)}</span>
-          {/* …y el nombre de unidad systemd, el dato secundario. */}
-          <Typography.Text type="secondary">{unidad.name}</Typography.Text>
-        </Space>
-      ),
-    },
-    {
-      title: 'Estado',
-      key: 'estado',
-      render: (_valor, unidad) => <EstadoDeUnidad estado={unidad.active_state} />,
-    },
-    {
-      title: 'Progreso',
-      key: 'progreso',
-      render: (_valor, unidad) => {
-        const kinds = progresoPorUnidad[unidad.name]
-        if (kinds === undefined || kinds.length === 0) return null
-        const etiquetas = kinds.map(etiquetaDeAccionEnCurso)
-        // Indicador aditivo: mientras haya jobs para la unidad se ve un spinner
-        // con sus tipos de acción, en español. Es un `<div role="status">` (no un
-        // `<span>`): contiene el `Space`, que rinde un elemento de flujo. El
-        // `aria-label` da el nombre accesible completo, así que el `Spin` se marca
-        // decorativo con `aria-hidden` para no anunciar dos veces la región.
-        return (
-          <div
-            role="status"
-            aria-label={`Acción en curso en ${identidadDe(unidad)}: ${etiquetas.join(', ')}`}
-          >
-            <Space size="small" wrap>
-              <Spin size="small" aria-hidden="true" />
-              {kinds.map((kind, indice) => (
-                <Tag color="processing" key={`${kind}-${indice}`}>
-                  {etiquetaDeAccionEnCurso(kind)}
-                </Tag>
-              ))}
-            </Space>
-          </div>
-        )
-      },
-    },
-    {
-      title: 'Sub-estado',
-      dataIndex: 'sub_state',
-      key: 'sub-estado',
-    },
-    {
-      title: 'Fichero',
-      dataIndex: 'unit_file_state',
-      key: 'fichero',
-    },
-    {
-      title: 'Acciones',
-      key: 'acciones',
-      render: (_valor, unidad) => {
-        // Las claves internas siguen por **nombre de unidad**: es lo que viaja en
-        // la acción HTTP (`{ name }`) y en el campo `unit` del SSE de jobs. El
-        // `aria-label`, en cambio, usa la identidad mostrada (`file_name`).
-        const bloqueada = enCurso === unidad.name
-        const identidad = identidadDe(unidad)
-        return (
-          <Space size="small" wrap>
-            <Button
-              size="small"
-              aria-label={`Arrancar ${identidad}`}
-              disabled={bloqueada || EN_MARCHA.has(unidad.active_state)}
-              onClick={() => onAccion(unidad, 'start')}
-            >
-              Arrancar
-            </Button>
-            <Button
-              size="small"
-              aria-label={`Parar ${identidad}`}
-              disabled={bloqueada || PARADA.has(unidad.active_state)}
-              onClick={() => onAccion(unidad, 'stop')}
-            >
-              Parar
-            </Button>
-            <Button
-              size="small"
-              aria-label={`Reiniciar ${identidad}`}
-              disabled={bloqueada}
-              onClick={() => onAccion(unidad, 'restart')}
-            >
-              Reiniciar
-            </Button>
-            <Button
-              size="small"
-              aria-label={`Editar ${identidad}`}
-              disabled={bloqueada}
-              onClick={() => onEditar(unidad)}
-            >
-              Editar
-            </Button>
-            {/* Los logs solo se leen: no se bloquean con una operación en curso
-                sobre la fila (no encadenan nada destructivo). */}
-            <Button
-              size="small"
-              aria-label={`Logs ${identidad}`}
-              onClick={() => onVerRegistros(unidad)}
-            >
-              Logs
-            </Button>
-            {/* El borrado es destructivo: la confirmación vive aquí y solo al
-                confirmarla se emite `onBorrar`; cancelar no sale de la fila.
-                La confirmación nombra el fichero real (identidad publicada por
-                la API): el nombre de unidad no basta para identificarlo. */}
-            <Popconfirm
-              title={`¿Borrar la quadlet «${identidadDe(unidad)}»?`}
-              description={`Se borrará el fichero «${identidadDe(unidad)}». No se puede deshacer.`}
-              okText="Sí, borrar"
-              cancelText="Cancelar"
-              okButtonProps={{ danger: true }}
-              onConfirm={() => onBorrar(unidad)}
-            >
-              <Button
-                size="small"
-                danger
-                aria-label={`Borrar ${identidad}`}
-                disabled={bloqueada}
-              >
-                Borrar
-              </Button>
-            </Popconfirm>
-          </Space>
-        )
-      },
-    },
-  ]
-
-  // `aria-label` llega al `<table>` real: antd lo reenvía a rc-table, que lo
-  // esparce sobre el elemento (`pickAttrs(props, { aria: true })`).
   return (
-    <Table<QuadletUnit>
-      aria-label="Quadlets"
-      // El `file_name` es la identidad única de la quadlet: dos filas pueden
-      // compartir nombre de unidad (colisión no inyectiva), pero nunca fichero.
-      rowKey="file_name"
-      columns={columnas}
-      dataSource={unidades}
-      loading={cargando}
-      pagination={false}
-      scroll={{ x: 'max-content' }}
-      locale={{ emptyText: <Empty description="No hay quadlets" /> }}
-    />
+    <table aria-label="Quadlets" className="podpot-tabla">
+      <thead>
+        <tr>
+          <th scope="col">Unidad</th>
+          <th scope="col">Estado</th>
+          <th scope="col">Progreso</th>
+          <th scope="col">Sub-estado</th>
+          <th scope="col">Fichero</th>
+          <th scope="col">Acciones</th>
+        </tr>
+      </thead>
+      <tbody>
+        {cargando ? (
+          <tr>
+            <td colSpan={6} className="podpot-tabla__cargando">
+              <Spin size="small" />
+              <span> Cargando…</span>
+            </td>
+          </tr>
+        ) : unidades.length === 0 ? (
+          <tr>
+            <td colSpan={6}>
+              <Empty description="No hay quadlets" />
+            </td>
+          </tr>
+        ) : (
+          unidades.map((unidad) => {
+            const bloqueada = enCurso === unidad.name
+            const identidad = identidadDe(unidad)
+            const kinds = progresoPorUnidad[unidad.name]
+            const etiquetas = kinds?.map(etiquetaDeAccionEnCurso) ?? []
+            return (
+              <tr key={unidad.file_name}>
+                <td className="podpot-tabla__celda--unidad">
+                  <Space direction="vertical" size={0}>
+                    <span>{identidadDe(unidad)}</span>
+                    <span className="podpot-texto-secundario">{unidad.name}</span>
+                  </Space>
+                </td>
+                <td>
+                  <EstadoDeUnidad estado={unidad.active_state} />
+                </td>
+                <td>
+                  {kinds && kinds.length > 0 && (
+                    <div
+                      role="status"
+                      aria-label={`Acción en curso en ${identidadDe(unidad)}: ${etiquetas.join(', ')}`}
+                    >
+                      <Space size="small" wrap>
+                        <Spin size="small" aria-hidden="true" />
+                        {kinds.map((kind, indice) => (
+                          <Tag color="processing" key={`${kind}-${indice}`}>
+                            {etiquetaDeAccionEnCurso(kind)}
+                          </Tag>
+                        ))}
+                      </Space>
+                    </div>
+                  )}
+                </td>
+                <td>{unidad.sub_state}</td>
+                <td>{unidad.unit_file_state}</td>
+                <td>
+                  <Space size="small" wrap>
+                    <Button
+                      size="small"
+                      aria-label={`Arrancar ${identidad}`}
+                      disabled={bloqueada || EN_MARCHA.has(unidad.active_state)}
+                      onClick={() => onAccion(unidad, 'start')}
+                    >
+                      Arrancar
+                    </Button>
+                    <Button
+                      size="small"
+                      aria-label={`Parar ${identidad}`}
+                      disabled={bloqueada || PARADA.has(unidad.active_state)}
+                      onClick={() => onAccion(unidad, 'stop')}
+                    >
+                      Parar
+                    </Button>
+                    <Button
+                      size="small"
+                      aria-label={`Reiniciar ${identidad}`}
+                      disabled={bloqueada}
+                      onClick={() => onAccion(unidad, 'restart')}
+                    >
+                      Reiniciar
+                    </Button>
+                    <Button
+                      size="small"
+                      aria-label={`Editar ${identidad}`}
+                      disabled={bloqueada}
+                      onClick={() => onEditar(unidad)}
+                    >
+                      Editar
+                    </Button>
+                    <Button
+                      size="small"
+                      aria-label={`Logs ${identidad}`}
+                      onClick={() => onVerRegistros(unidad)}
+                    >
+                      Logs
+                    </Button>
+                    <Popconfirm
+                      title={`¿Borrar la quadlet «${identidadDe(unidad)}»?`}
+                      description={`Se borrará el fichero «${identidadDe(unidad)}». No se puede deshacer.`}
+                      okText="Sí, borrar"
+                      cancelText="Cancelar"
+                      okButtonProps={{ danger: true }}
+                      onConfirm={() => onBorrar(unidad)}
+                    >
+                      <Button
+                        size="small"
+                        danger
+                        aria-label={`Borrar ${identidad}`}
+                        disabled={bloqueada}
+                      >
+                        Borrar
+                      </Button>
+                    </Popconfirm>
+                  </Space>
+                </td>
+              </tr>
+            )
+          })
+        )}
+      </tbody>
+    </table>
   )
 }
