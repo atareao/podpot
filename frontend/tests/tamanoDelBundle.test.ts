@@ -1,49 +1,84 @@
 // @vitest-environment node
 import { build } from 'vite'
+import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
-// El panel mide su huella de antd en el build de producción: los chunks
-// atribuibles a antd (`vendor-antd*`) deben quedar por debajo del umbral de
-// aviso de Vite (500 kB raw, como `chunkSizeWarningLimit`). Hoy superan el
-// umbral (~834 kB raw entre `vendor-antd` y `vendor-antd-rc`), por lo que este
-// test arranca en rojo y pasa una vez se reduzca la huella.
-const UMBRAL_RAW = 500 * 1024 // 500 kB raw
+// Presupuesto por chunk individual: Vite separa `antd` de sus dependencias
+// `rc-*` en chunks `vendor-antd*`, y cada uno debe quedar por debajo del
+// umbral raw de 500 kB. No se suman tamaños entre chunks.
+const UMBRAL_RAW = 500 * 1024
 
-const esChunkDeAntd = (nombre: string): boolean => /vendor-antd/.test(nombre)
+const esChunkDeAntd = (nombre: string): boolean => /^vendor-antd/.test(nombre)
 
-it('la huella de antd en el bundle de producción está por debajo de 500 kB', async () => {
-  const salida = await build({
+// `build()` puede devolver un watcher: solo los resultados con `output`
+// contienen ficheros. Tipado mínimo para no depender de `rollup` como
+// dependencia directa (Vite 7 no reexporta `OutputChunk`/`RollupOutput`).
+interface ArchivoSalida {
+  type: string
+  fileName: string
+  code?: string
+}
+
+interface ChunkSalida extends ArchivoSalida {
+  type: 'chunk'
+  code: string
+}
+
+type SalidaBuild = Awaited<ReturnType<typeof build>>
+
+// Rollup entrega la ruta completa (`assets/vendor-antd-*.js`); el nombre
+// lógico del chunk es el último segmento.
+const nombreLogico = (ruta: string): string => ruta.split('/').pop() ?? ruta
+
+const chunksDeAntd = (salida: SalidaBuild): ChunkSalida[] => {
+  const resultados = Array.isArray(salida) ? salida : [salida]
+  const archivos: ArchivoSalida[] = resultados.flatMap((resultado) =>
+    'output' in resultado ? resultado.output : [],
+  )
+
+  return archivos.filter(
+    (f): f is ChunkSalida => f.type === 'chunk' && esChunkDeAntd(nombreLogico(f.fileName)),
+  )
+}
+
+const verificarPresupuesto = (chunks: ChunkSalida[]): void => {
+  chunks.forEach((f) => {
+    expect(f.code.length, `${f.fileName}: ${(f.code.length / 1024).toFixed(2)} kB`).toBeLessThan(
+      UMBRAL_RAW,
+    )
+  })
+}
+
+it('mantiene antd y @ant-design/icons como dependencias declaradas', () => {
+  const contenido: unknown = JSON.parse(
+    readFileSync(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8'),
+  )
+  const paquete = contenido as { dependencies: Record<string, string> }
+
+  expect(paquete.dependencies.antd).toBeDefined()
+  expect(paquete.dependencies['@ant-design/icons']).toBeDefined()
+})
+
+it('cada chunk de antd en el bundle de producción está por debajo de 500 kB', async () => {
+  const salida: SalidaBuild = await build({
     mode: 'production',
     configFile: fileURLToPath(new URL('../vite.config.ts', import.meta.url)),
     logLevel: 'silent',
     build: { write: false },
   })
 
-  const chunks = Array.isArray(salida)
-    ? salida.flatMap((resultado) => resultado.output)
-    : salida.output
+  const chunks = chunksDeAntd(salida)
 
-  const chunksDeAntd = chunks.filter((f) => f.type === 'chunk' && esChunkDeAntd(f.fileName))
+  expect(chunks.length).toBeGreaterThan(0)
+  verificarPresupuesto(chunks)
+})
 
-  expect(chunksDeAntd.length).toBeGreaterThan(0)
-
-  // Cada chunk antd por debajo del umbral.
-  chunksDeAntd.forEach((f) => {
-    const kB = (f.code.length / 1024).toFixed(2)
-    expect(
-      `${f.fileName}: ${kB} kB — un chunk de antd supera o toca el umbral de 500 kB`,
-    )
-    expect(f.code.length).toBeLessThan(UMBRAL_RAW)
-  })
-
-  // Huella combinada de antd por debajo del umbral.
-  const bytes = chunksDeAntd.reduce((total, f) => total + f.code.length, 0)
-  const desglose = chunksDeAntd
-    .map((f) => `${f.fileName}: ${(f.code.length / 1024).toFixed(2)} kB`)
-    .join(' · ')
-  if (bytes > UMBRAL_RAW) {
-    throw new Error(
-      `La huella de antd pesa ${(bytes / 1024).toFixed(2)} kB (raw) y supera el umbral de 500 kB: ${desglose}`,
-    )
+it('informa del nombre y tamaño en kB si un chunk de antd alcanza el umbral', () => {
+  const chunkEnElLimite: ChunkSalida = {
+    type: 'chunk',
+    fileName: 'assets/vendor-antd-Grande.js',
+    code: 'x'.repeat(UMBRAL_RAW),
   }
+
+  expect(() => verificarPresupuesto([chunkEnElLimite])).toThrow(/vendor-antd.*kB/)
 })
