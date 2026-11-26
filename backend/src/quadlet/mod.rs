@@ -17,6 +17,7 @@
 //! [`QuadletKind::from_extension`], que es la única puerta a un [`QuadletKind`].
 
 pub mod service;
+pub mod stack;
 pub mod store;
 
 use std::fmt;

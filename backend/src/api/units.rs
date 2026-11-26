@@ -16,6 +16,7 @@ use serde::Serialize;
 use crate::api::response::ApiResponse;
 use crate::error::AppError;
 use crate::quadlet::QuadletKind;
+use crate::quadlet::stack::stack_name;
 use crate::state::AppState;
 use crate::systemd::{ActiveState, UnitAction, UnitFileState, UnitName, UnitStatus};
 
@@ -39,6 +40,10 @@ pub struct UnitSummary {
     /// El tipo derivado de la extensión del fichero, o `null` si la extensión no
     /// corresponde a un tipo que podpot sepa crear.
     kind: Option<QuadletKind>,
+    /// El identificador del stack, derivado de la extensión del fichero y del
+    /// `kind` cuando concuerdan, con el nombre de la unidad como fallback. No
+    /// depende del estado en vivo.
+    stack: String,
 }
 
 impl From<UnitStatus> for UnitSummary {
@@ -62,6 +67,7 @@ impl From<UnitStatus> for UnitSummary {
             .extension()
             .and_then(std::ffi::OsStr::to_str)
             .and_then(|extension| QuadletKind::from_extension(extension).ok());
+        let stack = stack_name(Some(file_name.as_str()), kind, estado.name.as_str());
 
         Self {
             name: estado.name,
@@ -70,6 +76,7 @@ impl From<UnitStatus> for UnitSummary {
             unit_file_state: estado.unit_file_state,
             file_name,
             kind,
+            stack,
         }
     }
 }
@@ -142,6 +149,7 @@ mod tests {
 
     use axum::http::{Method, StatusCode};
 
+    use super::UnitSummary;
     use crate::systemd::{
         ActiveState, SystemdClient, SystemdError, UnitAction, UnitFileState, UnitName, UnitOrigin,
         UnitStatus, fake::FakeSystemd,
@@ -173,14 +181,15 @@ mod tests {
         assert_eq!(unidades[0]["unit_file_state"], "generated");
         assert_eq!(unidades[0]["file_name"], "podpot-demo-db.container");
         assert_eq!(unidades[0]["kind"], "container");
+        assert_eq!(unidades[0]["stack"], "podpot-demo-db");
 
         assert_eq!(
             unidades[0]
                 .as_object()
                 .expect("una unidad es un objeto")
                 .len(),
-            6,
-            "el listado publica seis campos y ninguno más: {}",
+            7,
+            "el listado publica siete campos y ninguno más: {}",
             unidades[0]
         );
         assert!(
@@ -188,6 +197,83 @@ mod tests {
             "la procedencia no se publica: {}",
             unidades[0]
         );
+    }
+
+    /// Contrato «GET /api/v1/units»: el mapper que alimenta el listado serializa
+    /// el `stack` derivado, sin depender de systemd ni del handler HTTP.
+    #[test]
+    fn el_mapper_publica_el_stack_en_el_json_de_la_unidad() {
+        let unidad = |nombre: &str, origen: &str| UnitStatus {
+            name: UnitName::sin_validar(nombre),
+            active_state: ActiveState::Active,
+            sub_state: "running".to_owned(),
+            unit_file_state: UnitFileState::Generated,
+            origin: UnitOrigin::desde(origen),
+        };
+
+        let principal = UnitSummary::from(unidad(
+            "foo.service",
+            "/home/lorenzo/.config/containers/systemd/foo.container",
+        ));
+        let auxiliar = UnitSummary::from(unidad(
+            "foo-volume.service",
+            "/home/lorenzo/.config/containers/systemd/foo-volume.volume",
+        ));
+        let sin_tipo = UnitSummary::from(unidad(
+            "algo.service",
+            "/home/lorenzo/.config/containers/systemd/algo.quadlet",
+        ));
+
+        let json_principal = serde_json::to_value(&principal).expect("la unidad se serializa");
+        let json_auxiliar = serde_json::to_value(&auxiliar).expect("la unidad se serializa");
+        let json_sin_tipo = serde_json::to_value(&sin_tipo).expect("la unidad se serializa");
+
+        assert_eq!(json_principal["stack"], "foo");
+        assert_eq!(json_auxiliar["stack"], "foo");
+        assert_eq!(json_sin_tipo["stack"], "algo");
+
+        // `.kube`, `.image` y `.build` no son tipos creables (`kind` es `null`),
+        // pero son principales a todos los efectos: el stack sale del stem.
+        for (nombre, extension) in [
+            ("foo-kube.service", "kube"),
+            ("foo-image.service", "image"),
+            ("foo-build.service", "build"),
+        ] {
+            let origen = format!("/home/lorenzo/.config/containers/systemd/foo.{extension}");
+            let json = serde_json::to_value(UnitSummary::from(unidad(nombre, &origen)))
+                .expect("la unidad se serializa");
+
+            assert!(json["kind"].is_null(), "la extensión no es creable: {json}");
+            assert_eq!(
+                json["stack"], "foo",
+                "el stack no depende del nombre: {json}"
+            );
+        }
+    }
+
+    /// Escenario «Estabilidad en vivo»: el estado cambia, la identidad no, y el
+    /// stack publicado tiene que permanecer intacto.
+    #[test]
+    fn el_stack_no_cambia_cuando_cambia_el_estado_en_vivo() {
+        let estado = |activa: bool| UnitStatus {
+            name: UnitName::sin_validar("foo.service"),
+            active_state: if activa {
+                ActiveState::Active
+            } else {
+                ActiveState::Inactive
+            },
+            sub_state: if activa { "running" } else { "dead" }.to_owned(),
+            unit_file_state: UnitFileState::Generated,
+            origin: UnitOrigin::desde("/home/lorenzo/.config/containers/systemd/foo.container"),
+        };
+
+        let activa =
+            serde_json::to_value(UnitSummary::from(estado(true))).expect("la unidad se serializa");
+        let parada =
+            serde_json::to_value(UnitSummary::from(estado(false))).expect("la unidad se serializa");
+
+        assert_eq!(activa["stack"], "foo");
+        assert_eq!(parada["stack"], activa["stack"]);
     }
 
     /// Escenario «Listado con la identidad real de cada quadlet»: cada unidad

@@ -1,10 +1,16 @@
-import { Button, Empty, Popconfirm, Space, Spin, Table, Tag, Typography } from 'antd'
+import { useMemo, useState } from 'react'
+import { Button, Empty, Popconfirm, Select, Space, Spin, Table, Tag, Typography } from 'antd'
 import type { TableProps } from 'antd'
 import { EstadoDeUnidad } from '../EstadoDeUnidad/EstadoDeUnidad'
 import { etiquetaDeAccionEnCurso } from '../../acciones'
 import { identidadDe } from '../../identidad'
+import { groupByStack } from '../../lib/groupByStack'
 import type { TrabajosEnCurso } from '../../hooks/useTrabajosEnVivo'
-import type { AccionDeUnidad, QuadletUnit } from '../../types/api'
+import type {
+  AccionDeUnidad,
+  QuadletUnit,
+  TipoDeQuadlet,
+} from '../../types/api'
 
 export interface TablaDeUnidadesProps {
   /** Quadlets a listar. */
@@ -64,7 +70,53 @@ export function TablaDeUnidades({
   enCurso = null,
   progresoPorUnidad = {},
 }: TablaDeUnidadesProps) {
+  const [tipo, setTipo] = useState<TipoDeQuadlet | null>(null)
+  const [estado, setEstado] = useState<string | null>(null)
+
+  // Derivación pura del estado actual: al llegar un evento SSE se recalcula con
+  // el mismo orden determinista y los filtros siguen aplicados. Los grupos sin
+  // coincidencias sencillamente no producen filas.
+  const { filas, celdasDeStack } = useMemo(() => {
+    const grupos = groupByStack(
+      unidades.filter(
+        (unidad) =>
+          (tipo === null || unidad.kind === tipo) &&
+          (estado === null || unidad.active_state === estado),
+      ),
+    )
+    const celdas = new Map<number, number>()
+    const datos: QuadletUnit[] = []
+    for (const grupo of grupos) {
+      // El primer renglón del grupo muestra la cabecera con `rowSpan` de todas
+      // sus filas: la cabecera informa del stack, cada fila conserva sus datos.
+      celdas.set(datos.length, grupo.unidades.length)
+      datos.push(...grupo.unidades)
+    }
+    return { filas: datos, celdasDeStack: celdas }
+  }, [unidades, tipo, estado])
+
+  const { tiposDisponibles, estadosDisponibles } = useMemo(
+    () => ({
+      tiposDisponibles: [...new Set(unidades.flatMap((unidad) => (unidad.kind === null ? [] : [unidad.kind])))].sort(),
+      estadosDisponibles: [...new Set(unidades.map((unidad) => unidad.active_state))].sort(),
+    }),
+    [unidades],
+  )
+
   const columnas: TableProps<QuadletUnit>['columns'] = [
+    {
+      title: 'Stack',
+      key: 'stack',
+      onCell: (_unidad, indice) => {
+        const tamano = celdasDeStack.get(indice ?? -1)
+        return tamano === undefined ? { rowSpan: 0 } : { rowSpan: tamano }
+      },
+      render: (_valor, unidad) => (
+        <Typography.Text strong aria-label={`Stack ${unidad.stack}`}>
+          {unidad.stack}
+        </Typography.Text>
+      ),
+    },
     {
       title: 'Unidad',
       key: 'unidad',
@@ -200,20 +252,54 @@ export function TablaDeUnidades({
     },
   ]
 
+  const hayFiltros = tipo !== null || estado !== null
+
   // `aria-label` llega al `<table>` real: antd lo reenvía a rc-table, que lo
   // esparce sobre el elemento (`pickAttrs(props, { aria: true })`).
   return (
-    <Table<QuadletUnit>
-      aria-label="Quadlets"
-      // El `file_name` es la identidad única de la quadlet: dos filas pueden
-      // compartir nombre de unidad (colisión no inyectiva), pero nunca fichero.
-      rowKey="file_name"
-      columns={columnas}
-      dataSource={unidades}
-      loading={cargando}
-      pagination={false}
-      scroll={{ x: 'max-content' }}
-      locale={{ emptyText: <Empty description="No hay quadlets" /> }}
-    />
+    <>
+      <Space size="small" wrap style={{ marginBottom: 12 }}>
+        <Select<TipoDeQuadlet>
+          aria-label="Filtrar por tipo"
+          allowClear
+          placeholder="Filtrar por tipo"
+          style={{ minWidth: 180 }}
+          value={tipo ?? undefined}
+          options={tiposDisponibles.map((valor) => ({ label: valor, value: valor }))}
+          onChange={(valor) => setTipo(valor ?? null)}
+        />
+        <Select<string>
+          aria-label="Filtrar por estado"
+          allowClear
+          placeholder="Filtrar por estado"
+          style={{ minWidth: 180 }}
+          value={estado ?? undefined}
+          options={estadosDisponibles.map((valor) => ({ label: valor, value: valor }))}
+          onChange={(valor) => setEstado(valor ?? null)}
+        />
+      </Space>
+      <Table<QuadletUnit>
+        aria-label="Quadlets"
+        // El `file_name` es la identidad única de la quadlet: dos filas pueden
+        // compartir nombre de unidad (colisión no inyectiva), pero nunca fichero.
+        rowKey="file_name"
+        columns={columnas}
+        dataSource={filas}
+        loading={cargando}
+        pagination={false}
+        scroll={{ x: 'max-content' }}
+        locale={{
+          emptyText: (
+            <Empty
+              description={
+                hayFiltros
+                  ? 'No hay quadlets que coincidan con los filtros'
+                  : 'No hay quadlets'
+              }
+            />
+          ),
+        }}
+      />
+    </>
   )
 }
