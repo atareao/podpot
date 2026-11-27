@@ -34,6 +34,7 @@ No requiere activación: está disponible al abrir el panel. No hay migración S
 ## Decisiones y follow-ups
 
 - El stack se calcula en el backend para tener una sola fuente de verdad; el frontend no reinterpreta nombres.
+- **Actualizado en PLAN-028**: la regla base ahora toma el prefijo antes del primer `-` y admite override vía `groups.toml`. Ver `docs/agrupacion-por-prefijo.md`.
 - No se amplió `QuadletKind`: eso cambiaría el contrato de creación y el descubrimiento.
 - Fuera de alcance: grupos explícitos del usuario (`X-Podpot-Group=`, `groups.toml`) y lectura del directorio `available` de qctl.
 - Follow-up posible: añadir un grupo explícito como override del stack derivado.

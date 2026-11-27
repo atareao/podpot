@@ -6,60 +6,84 @@
 //!estado en vivo, de modo que un evento de systemd no puede cambiar de grupo a
 //!una unidad.
 
+use std::collections::HashMap;
+
 use crate::quadlet::QuadletKind;
 use crate::systemd::QUADLET_EXTENSIONS;
 
 /// Deriva el nombre del stack de una unidad.
 ///
-/// La extensión **real** del fichero (`QUADLET_EXTENSIONS`) fija el stem y,
-/// cuando no hay un `kind` tipado, también la categoría: `volume` y `network`
-/// son auxiliares y el resto —incluidos `.kube`, `.image` y `.build`, que
-/// podpot no sabe crear— son principales. Si `kind` existe tiene que concordar
-/// con esa extensión; de lo contrario se cae al nombre de la unidad sin
-/// `.service`, como se hace también para una extensión desconocida o un
-/// `file_name` ausente. El resultado nunca es vacío y conserva la grafía.
+/// Regla base: el stack es el primer segmento del nombre base del fichero
+/// (stem) antes del primer `-`, conservando la grafía original. Si no hay
+/// `-`, el stack es el stem completo.
+///
+/// Si no hay `file_name`, o la extensión no es de quadlet, o el `kind` no
+/// concuerda con la extensión, se usa el nombre de la unidad sin `.service`
+/// y se le aplica la misma regla de prefijo. El resultado nunca es vacío.
 pub fn stack_name(file_name: Option<&str>, kind: Option<QuadletKind>, unit_name: &str) -> String {
-    let fallback = || {
-        let sin_sufijo = unit_name.strip_suffix(".service").unwrap_or(unit_name);
-        if sin_sufijo.is_empty() {
-            unit_name
-        } else {
-            sin_sufijo
-        }
-    };
+    let fallback = || stack_desde_unit_name(unit_name);
 
     let Some((stem, extension)) = file_name.and_then(stem_y_extension) else {
-        return fallback().to_owned();
+        return fallback();
     };
     if kind.is_some_and(|kind| kind.extension() != extension) {
-        return fallback().to_owned();
+        return fallback();
+    }
+    if stem.is_empty() {
+        return fallback();
     }
 
-    let categoria = match kind {
-        Some(QuadletKind::Volume) => Categoria::Auxiliar("-volume"),
-        Some(QuadletKind::Network) => Categoria::Auxiliar("-network"),
-        Some(QuadletKind::Container | QuadletKind::Pod) => Categoria::Principal,
-        None => categoria_de_extension(extension),
-    };
-    let stack = match categoria {
-        Categoria::Principal => stem,
-        Categoria::Auxiliar(sufijo) => recortar_auxiliar(stem, sufijo),
-    };
+    prefijo_de(stem)
+}
 
-    if stack.is_empty() {
-        fallback().to_owned()
-    } else {
-        stack.to_owned()
+/// Deriva el nombre del stack de una unidad, aplicando el mapeo de grupos si
+/// existe. Si `file_name` o `unit_name` tienen una entrada en `groups`,
+/// ese nombre de stack reemplaza al derivado.
+pub fn stack_name_with_groups(
+    file_name: Option<&str>,
+    kind: Option<QuadletKind>,
+    unit_name: &str,
+    groups: &HashMap<String, String>,
+) -> String {
+    if let Some(stack) = file_name
+        .and_then(|nombre| groups.get(nombre))
+        .filter(|stack| es_valido(stack))
+    {
+        return stack.clone();
+    }
+    if let Some(stack) = groups.get(unit_name).filter(|stack| es_valido(stack)) {
+        return stack.clone();
+    }
+    stack_name(file_name, kind, unit_name)
+}
+
+/// Un override sólo sustituye al stack derivado si dice algo: ni vacío ni
+/// formado sólo por espacios. De lo contrario se caería al `""` que promete no
+/// devolver este módulo.
+fn es_valido(stack: &str) -> bool {
+    !stack.trim().is_empty()
+}
+
+/// Primer segmento antes del primer `-`, conservando la grafía original.
+fn prefijo_de(nombre: &str) -> String {
+    if nombre.is_empty() {
+        return nombre.to_owned();
+    }
+    match nombre.split_once('-') {
+        Some((prefijo, _)) if !prefijo.is_empty() => prefijo.to_owned(),
+        _ => nombre.to_owned(),
     }
 }
 
-/// Categoría de una unidad a efectos de agrupación.
-#[derive(Clone, Copy)]
-enum Categoria {
-    /// Conserva el stem completo (`foo-volume.container` da `foo-volume`).
-    Principal,
-    /// Recorta su sufijo (`foo-volume.volume` da `foo`).
-    Auxiliar(&'static str),
+/// Fallback para cuando no hay `file_name`: usa `unit_name` sin `.service`
+/// y le aplica la regla de prefijo, pero nunca devuelve vacío.
+fn stack_desde_unit_name(unit_name: &str) -> String {
+    let nombre = unit_name.strip_suffix(".service").unwrap_or(unit_name);
+    if nombre.is_empty() {
+        unit_name.to_owned()
+    } else {
+        prefijo_de(nombre)
+    }
 }
 
 /// Devuelve el stem y la extensión sin el punto sólo si ésta es de quadlet.
@@ -71,36 +95,11 @@ fn stem_y_extension(file_name: &str) -> Option<(&str, &str)> {
     })
 }
 
-/// Clasifica una extensión reconocida. Las auxiliares son `volume` y `network`;
-/// `container`, `pod`, `kube`, `image` y `build` son principales.
-fn categoria_de_extension(extension: &str) -> Categoria {
-    match extension {
-        "volume" => Categoria::Auxiliar("-volume"),
-        "network" => Categoria::Auxiliar("-network"),
-        _ => Categoria::Principal,
-    }
-}
-
-/// Quita el sufijo de una unidad auxiliar con cualquier grafía, sin tocar la
-/// del prefijo, y sólo si queda algo delante del sufijo.
-fn recortar_auxiliar<'a>(stem: &'a str, sufijo: &str) -> &'a str {
-    let Some(inicio) = stem.len().checked_sub(sufijo.len()) else {
-        return stem;
-    };
-    if inicio == 0 {
-        return stem;
-    }
-
-    match stem.get(inicio..) {
-        Some(cola) if cola.eq_ignore_ascii_case(sufijo) => stem.get(..inicio).unwrap_or(stem),
-        _ => stem,
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::stack_name;
+    use super::{stack_name, stack_name_with_groups};
     use crate::quadlet::QuadletKind;
+    use std::collections::HashMap;
 
     #[test]
     fn principal_y_auxiliares_comparten_stack() {
@@ -161,7 +160,7 @@ mod tests {
             "foo-volume.service",
         );
 
-        assert_eq!(stack, "foo-volume");
+        assert_eq!(stack, "foo");
     }
 
     #[test]
@@ -176,8 +175,8 @@ mod tests {
         let sin_tipo = stack_name(Some("algo.quadlet"), None, "Mi-Servicio.service");
         let con_sufijo_de_auxiliar = stack_name(None, None, "algo-volume.service");
 
-        assert_eq!(sin_tipo, "Mi-Servicio");
-        assert_eq!(con_sufijo_de_auxiliar, "algo-volume");
+        assert_eq!(sin_tipo, "Mi");
+        assert_eq!(con_sufijo_de_auxiliar, "algo");
     }
 
     #[test]
@@ -267,5 +266,92 @@ mod tests {
         assert_eq!(volumen, "MiPila");
         assert_eq!(red, "MiPila");
         assert_eq!(sin_prefijo, "-VOLUME");
+    }
+
+    #[test]
+    fn regla_base_con_prefijo() {
+        assert_eq!(
+            stack_name(
+                Some("atareao-mariadb.container"),
+                Some(QuadletKind::Container),
+                "atareao-mariadb.service",
+            ),
+            "atareao"
+        );
+        assert_eq!(
+            stack_name(
+                Some("centinela-app.container"),
+                Some(QuadletKind::Container),
+                "centinela-app.service",
+            ),
+            "centinela"
+        );
+    }
+
+    #[test]
+    fn regla_base_sin_prefijo() {
+        assert_eq!(
+            stack_name(
+                Some("standalone.container"),
+                Some(QuadletKind::Container),
+                "standalone.service",
+            ),
+            "standalone"
+        );
+    }
+
+    #[test]
+    fn fallback_a_unit_name_con_prefijo() {
+        assert_eq!(
+            stack_name(None, Some(QuadletKind::Container), "centinela-app.service"),
+            "centinela"
+        );
+    }
+
+    #[test]
+    fn override_por_file_name_gana_sobre_la_regla_base() {
+        let grupos = HashMap::from([(
+            "atareao-mariadb.container".to_owned(),
+            "db-cluster".to_owned(),
+        )]);
+        let stack = stack_name_with_groups(
+            Some("atareao-mariadb.container"),
+            Some(QuadletKind::Container),
+            "atareao-mariadb.service",
+            &grupos,
+        );
+
+        assert_eq!(stack, "db-cluster");
+    }
+
+    #[test]
+    fn override_vacio_o_espacios_cae_a_la_regla_base() {
+        let grupos = HashMap::from([
+            ("vacio.container".to_owned(), "".to_owned()),
+            ("espacios.container".to_owned(), "   \t ".to_owned()),
+        ]);
+
+        for nombre in ["vacio.container", "espacios.container"] {
+            let stack = stack_name_with_groups(
+                Some(nombre),
+                Some(QuadletKind::Container),
+                &nombre.replace(".container", ".service"),
+                &grupos,
+            );
+            assert_eq!(stack, nombre.trim_end_matches(".container"));
+        }
+    }
+
+    #[test]
+    fn override_por_unit_name_gana_sobre_la_regla_base() {
+        let grupos = HashMap::from([("centinela-app.service".to_owned(), "monitoring".to_owned())]);
+        let stack = stack_name_with_groups(
+            Some("centinela-app.container"),
+            Some(QuadletKind::Container),
+            "centinela-app.service",
+            &grupos,
+        );
+
+        assert_eq!(stack, "monitoring");
     }
 }

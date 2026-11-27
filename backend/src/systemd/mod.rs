@@ -6,6 +6,7 @@
 //! pruebas viven en los submódulos.
 
 use std::fmt;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use serde::{Serialize, Serializer};
@@ -431,6 +432,22 @@ impl UnitOrigin {
         std::path::Path::new(&self.0)
             .file_name()
             .and_then(std::ffi::OsStr::to_str)
+    }
+
+    /// El directorio que contiene el fichero de origen.
+    ///
+    /// Es la fuente real de la quadlet: systemd genera la unidad desde ahí, y es
+    /// donde debe estar un eventual `groups.toml`. Una procedencia relativa sin
+    /// directorio (`web.container`) no produce un directorio ficticio.
+    pub fn directorio(&self) -> Option<PathBuf> {
+        if self.es_desconocido() {
+            return None;
+        }
+
+        Path::new(&self.0)
+            .parent()
+            .filter(|directorio| !directorio.as_os_str().is_empty())
+            .map(Path::to_path_buf)
     }
 
     /// ¿No se pudo leer la procedencia?

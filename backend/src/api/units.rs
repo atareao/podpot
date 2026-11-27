@@ -10,13 +10,16 @@
 //! publica la procedencia de la unidad —una ruta del sistema de ficheros del
 //! usuario— y una acción no repite el estado entero, que quien preguntó ya tiene.
 
+use std::collections::HashMap;
+
 use axum::extract::{Path, State};
 use serde::Serialize;
 
 use crate::api::response::ApiResponse;
 use crate::error::AppError;
 use crate::quadlet::QuadletKind;
-use crate::quadlet::stack::stack_name;
+use crate::quadlet::groups::load_groups_para;
+use crate::quadlet::stack::stack_name_with_groups;
 use crate::state::AppState;
 use crate::systemd::{ActiveState, UnitAction, UnitFileState, UnitName, UnitStatus};
 
@@ -47,38 +50,69 @@ pub struct UnitSummary {
 }
 
 impl From<UnitStatus> for UnitSummary {
-    /// Recorta el estado del dominio a lo que se publica.
+    /// Recorta el estado del dominio a lo que se publica: sin grupos es el
+    /// mismo mapper, con el mapa vacío.
     fn from(estado: UnitStatus) -> Self {
-        // Invariante: el listado sólo emite quadlets —`is_quadlet()` exige
-        // fichero de origen—, así que aquí **siempre** hay nombre de fichero. El
-        // `debug_assert!` lo documenta y lo comprueba en pruebas y desarrollo; en
-        // release se compila fuera y el valor por defecto no cambia nada.
-        debug_assert!(
-            estado.file_name().is_some(),
-            "una unidad sin fichero de origen llegó al listado: {}",
-            estado.name
-        );
-        let file_name = estado.file_name().unwrap_or_default().to_owned();
-
-        // El tipo sale de la extensión del nombre de fichero, y sólo de ella: una
-        // extensión que podpot no sepa crear (`.kube`, `.quadlet`, …) deja el
-        // `kind` en `null` sin descartar la unidad del listado.
-        let kind = std::path::Path::new(&file_name)
-            .extension()
-            .and_then(std::ffi::OsStr::to_str)
-            .and_then(|extension| QuadletKind::from_extension(extension).ok());
-        let stack = stack_name(Some(file_name.as_str()), kind, estado.name.as_str());
-
-        Self {
-            name: estado.name,
-            active_state: estado.active_state,
-            sub_state: estado.sub_state,
-            unit_file_state: estado.unit_file_state,
-            file_name,
-            kind,
-            stack,
-        }
+        from_con_grupos(estado, &HashMap::new())
     }
+}
+
+/// Convierte un `UnitStatus` en `UnitSummary` aplicando el mapeo de grupos.
+///
+/// Una unidad sin procedencia no es una quadlet, pero si llega aquí se publica
+/// con `file_name` vacío y se avisa: un `debug_assert!` haría panificar el
+/// servidor por un dato que systemd puede cambiar sin avisar.
+pub(crate) fn from_con_grupos(estado: UnitStatus, grupos: &HashMap<String, String>) -> UnitSummary {
+    let (file_name, kind, stack) = match estado.file_name() {
+        Some(nombre) => {
+            // El tipo sale de la extensión del nombre de fichero, y sólo de ella:
+            // una extensión que podpot no sepa crear (`.kube`, `.quadlet`, …)
+            // deja el `kind` en `null` sin descartar la unidad del listado.
+            let kind = std::path::Path::new(nombre)
+                .extension()
+                .and_then(std::ffi::OsStr::to_str)
+                .and_then(|extension| QuadletKind::from_extension(extension).ok());
+            let stack = stack_name_with_groups(Some(nombre), kind, estado.name.as_str(), grupos);
+
+            (nombre.to_owned(), kind, stack)
+        }
+        None => {
+            tracing::warn!(
+                unidad = %estado.name,
+                "una unidad sin procedencia llegó al listado; se publica sin file_name"
+            );
+            let stack = stack_name_with_groups(None, None, estado.name.as_str(), grupos);
+            (String::new(), None, stack)
+        }
+    };
+
+    UnitSummary {
+        name: estado.name,
+        active_state: estado.active_state,
+        sub_state: estado.sub_state,
+        unit_file_state: estado.unit_file_state,
+        file_name,
+        kind,
+        stack,
+    }
+}
+
+/// `GET /api/v1/units` — las quadlets del usuario y su estado.
+///
+/// Sin unidades el listado viene vacío y con `200`: un usuario sin quadlets es un
+/// usuario con el panel vacío, no un error.
+pub async fn listar(
+    State(state): State<AppState>,
+) -> Result<ApiResponse<Vec<UnitSummary>>, AppError> {
+    let unidades = state.systemd.quadlets().await?;
+    let grupos = load_groups_para(&unidades, &state.config);
+
+    Ok(ApiResponse::new(
+        unidades
+            .into_iter()
+            .map(|u| from_con_grupos(u, &grupos))
+            .collect(),
+    ))
 }
 
 /// Lo que devuelve una acción de control.
@@ -101,20 +135,6 @@ impl From<UnitStatus> for UnitActionOutcome {
             active_state: estado.active_state,
         }
     }
-}
-
-/// `GET /api/v1/units` — las quadlets del usuario y su estado.
-///
-/// Sin unidades el listado viene vacío y con `200`: un usuario sin quadlets es un
-/// usuario con el panel vacío, no un error.
-pub async fn listar(
-    State(state): State<AppState>,
-) -> Result<ApiResponse<Vec<UnitSummary>>, AppError> {
-    let unidades = state.systemd.quadlets().await?;
-
-    Ok(ApiResponse::new(
-        unidades.into_iter().map(UnitSummary::from).collect(),
-    ))
 }
 
 /// `POST /api/v1/units/{name}/{action}` — arranca, para o reinicia una unidad.
@@ -145,11 +165,14 @@ pub async fn accionar(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::io::Write;
     use std::sync::Arc;
 
     use axum::http::{Method, StatusCode};
+    use tempfile::TempDir;
 
-    use super::UnitSummary;
+    use super::{UnitSummary, from_con_grupos};
     use crate::systemd::{
         ActiveState, SystemdClient, SystemdError, UnitAction, UnitFileState, UnitName, UnitOrigin,
         UnitStatus, fake::FakeSystemd,
@@ -181,7 +204,7 @@ mod tests {
         assert_eq!(unidades[0]["unit_file_state"], "generated");
         assert_eq!(unidades[0]["file_name"], "podpot-demo-db.container");
         assert_eq!(unidades[0]["kind"], "container");
-        assert_eq!(unidades[0]["stack"], "podpot-demo-db");
+        assert_eq!(unidades[0]["stack"], "podpot");
 
         assert_eq!(
             unidades[0]
@@ -249,6 +272,70 @@ mod tests {
                 "el stack no depende del nombre: {json}"
             );
         }
+    }
+
+    /// Escenario «Override en el mapper»: el mapa de grupos llega al `stack`
+    /// publicado, por `file_name` y por `unit_name`, y se serializa en el JSON.
+    #[test]
+    fn el_mapper_aplica_el_override_de_grupos_al_json() {
+        let unidad = || UnitStatus {
+            name: UnitName::sin_validar("atareao-mariadb.service"),
+            active_state: ActiveState::Active,
+            sub_state: "running".to_owned(),
+            unit_file_state: UnitFileState::Generated,
+            origin: UnitOrigin::desde("/fuentes/atareao-mariadb.container"),
+        };
+
+        let por_fichero = HashMap::from([(
+            "atareao-mariadb.container".to_owned(),
+            "db-cluster".to_owned(),
+        )]);
+        let por_unidad = HashMap::from([(
+            "atareao-mariadb.service".to_owned(),
+            "monitoring".to_owned(),
+        )]);
+
+        for (grupos, esperado) in [(&por_fichero, "db-cluster"), (&por_unidad, "monitoring")] {
+            let json = serde_json::to_value(from_con_grupos(unidad(), grupos))
+                .expect("la unidad se serializa");
+            assert_eq!(json["stack"], esperado, "el override gana: {json}");
+            assert_eq!(json["file_name"], "atareao-mariadb.container");
+        }
+
+        // Sin mapa, el mismo mapper (y el `From`) caen a la regla base.
+        let sin_grupos =
+            serde_json::to_value(UnitSummary::from(unidad())).expect("la unidad se serializa");
+        assert_eq!(sin_grupos["stack"], "atareao");
+    }
+
+    /// Contrato HTTP: un `groups.toml` en el directorio de la procedencia
+    /// cambia el `stack` que publica `GET /api/v1/units`.
+    #[tokio::test]
+    async fn el_listado_publica_el_stack_del_groups_toml_de_la_fuente() {
+        let fuente = TempDir::new().expect("directorio fuente");
+        let mut fichero =
+            std::fs::File::create(fuente.path().join("groups.toml")).expect("crear groups.toml");
+        writeln!(fichero, "[mappings]\n\"web.container\" = \"proj-web\"")
+            .expect("escribir groups.toml");
+
+        let origen = fuente
+            .path()
+            .join("web.container")
+            .to_string_lossy()
+            .into_owned();
+        let cliente = Arc::new(FakeSystemd::con([UnitStatus {
+            name: UnitName::sin_validar("web.service"),
+            active_state: ActiveState::Active,
+            sub_state: "running".to_owned(),
+            unit_file_state: UnitFileState::Generated,
+            origin: UnitOrigin::desde(&origen),
+        }]));
+
+        let entorno = entorno_con(cliente).await;
+        let (_, cuerpo) = peticion(&entorno.app(), Method::GET, "/api/v1/units").await;
+
+        assert_eq!(cuerpo["data"][0]["stack"], "proj-web");
+        assert_eq!(cuerpo["data"][0]["file_name"], "web.container");
     }
 
     /// Escenario «Estabilidad en vivo»: el estado cambia, la identidad no, y el
