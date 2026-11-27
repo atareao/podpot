@@ -12,6 +12,7 @@
 //! divergente: el siguiente lo corrige. El precio —mandar la lista entera cada
 //! vez— es despreciable para las quadlets de un usuario.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::State;
@@ -21,8 +22,10 @@ use futures_util::stream::{self, Stream};
 use tokio::sync::{broadcast, watch};
 
 use crate::api::response::ApiResponse;
-use crate::api::units::UnitSummary;
+use crate::api::units::{UnitSummary, from_con_grupos};
+use crate::config::Config;
 use crate::error::AppError;
+use crate::quadlet::groups::load_groups_para;
 use crate::state::AppState;
 use crate::systemd::UnitStatus;
 
@@ -67,7 +70,13 @@ pub async fn stream(
     let eventos = state.eventos.subscribe();
     let inicial = state.systemd.quadlets().await?;
 
-    Ok(flujo(inicial, eventos, state.apagado.clone(), LATIDO))
+    Ok(flujo(
+        inicial,
+        eventos,
+        state.apagado.clone(),
+        LATIDO,
+        state.config.clone(),
+    ))
 }
 
 /// Compone la respuesta SSE a partir de la instantánea inicial y los canales.
@@ -80,8 +89,9 @@ fn flujo(
     eventos: broadcast::Receiver<Vec<UnitStatus>>,
     apagado: watch::Receiver<bool>,
     latido: Duration,
+    config: Arc<Config>,
 ) -> Sse<impl Stream<Item = Result<Event, std::io::Error>> + Send + 'static> {
-    Sse::new(instantaneas(inicial, eventos, apagado))
+    Sse::new(instantaneas(inicial, eventos, apagado, config))
         .keep_alive(KeepAlive::new().interval(latido).text("latido"))
 }
 
@@ -94,14 +104,18 @@ fn instantaneas(
     inicial: Vec<UnitStatus>,
     eventos: broadcast::Receiver<Vec<UnitStatus>>,
     apagado: watch::Receiver<bool>,
+    config: Arc<Config>,
 ) -> impl Stream<Item = Result<Event, std::io::Error>> + Send + 'static {
     stream::unfold(
-        (Some(inicial), eventos, apagado),
-        |(mut pendiente, mut eventos, mut apagado)| async move {
+        (Some(inicial), eventos, apagado, config),
+        |(mut pendiente, mut eventos, mut apagado, config)| async move {
             // La instantánea inicial sale en la primera vuelta, sin esperar a nada:
             // es lo que hace que conectar baste para pintar el panel.
             if let Some(instantanea) = pendiente.take() {
-                return Some((evento(instantanea), (pendiente, eventos, apagado)));
+                return Some((
+                    evento(instantanea, &config),
+                    (pendiente, eventos, apagado, config),
+                ));
             }
 
             loop {
@@ -132,7 +146,10 @@ fn instantaneas(
 
                 let instantanea = siguiente?;
 
-                return Some((evento(instantanea), (pendiente, eventos, apagado)));
+                return Some((
+                    evento(instantanea, &config),
+                    (pendiente, eventos, apagado, config),
+                ));
             }
         },
     )
@@ -143,8 +160,15 @@ fn instantaneas(
 /// Es el **mismo** recorte que hace el listado (`UnitStatus` → `UnitSummary`), así
 /// que el `data` del evento y el cuerpo de `GET /api/v1/units` son idénticos por
 /// construcción: el panel puede tratarlos igual.
-fn evento(instantanea: Vec<UnitStatus>) -> Result<Event, std::io::Error> {
-    let resumen: Vec<UnitSummary> = instantanea.into_iter().map(UnitSummary::from).collect();
+fn evento(instantanea: Vec<UnitStatus>, config: &Config) -> Result<Event, std::io::Error> {
+    // Los grupos se recargan **por instantánea**, no al conectar: el `GET` los
+    // lee en cada petición y el flujo tiene que ver el mismo cambio en el
+    // siguiente evento, sin obligar al cliente a reconectar.
+    let grupos = load_groups_para(&instantanea, config);
+    let resumen: Vec<UnitSummary> = instantanea
+        .into_iter()
+        .map(|u| from_con_grupos(u, &grupos))
+        .collect();
 
     // Serializar una lista de cadenas y enumeraciones no puede fallar, pero si
     // fallara no se puede fingir que hay evento: se devuelve el fallo y el flujo
@@ -159,6 +183,7 @@ fn evento(instantanea: Vec<UnitStatus>) -> Result<Event, std::io::Error> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -166,6 +191,9 @@ mod tests {
     use axum::http::{Method, StatusCode};
     use axum::response::IntoResponse;
     use futures_util::StreamExt;
+    use tempfile::TempDir;
+
+    use crate::config::Config;
 
     use crate::systemd::{
         ActiveState, SystemdError, UnitFileState, UnitName, UnitOrigin, UnitStatus,
@@ -303,6 +331,72 @@ mod tests {
         );
     }
 
+    /// Escenario «Recarga por instantánea»: editar `groups.toml` cambia el
+    /// `stack` del siguiente evento sin reconectar el flujo.
+    #[tokio::test]
+    async fn el_stream_recarga_los_grupos_en_cada_instantanea() {
+        let fuente = TempDir::new().expect("directorio fuente");
+        let defend = fuente.path().to_str().expect("ruta UTF-8").to_owned();
+        let config = Config::from_source(move |clave| match clave {
+            "DATABASE_URL" => Some("sqlite::memory:".to_owned()),
+            "HOME" => Some("/home/tester".to_owned()),
+            "XDG_RUNTIME_DIR" => Some("/run/user/1000".to_owned()),
+            "PODPOT_QUADLET_DIR" => Some(defend.clone()),
+            _ => None,
+        })
+        .expect("la configuración de prueba es válida");
+
+        let origen = fuente
+            .path()
+            .join("web.container")
+            .to_string_lossy()
+            .into_owned();
+        let escribir = |valor: &str| {
+            let mut fichero = std::fs::File::create(fuente.path().join("groups.toml"))
+                .expect("crear groups.toml");
+            writeln!(fichero, "[mappings]\n\"web.container\" = \"{valor}\"")
+                .expect("escribir groups.toml");
+        };
+        let publicar = || {
+            vec![UnitStatus {
+                name: UnitName::sin_validar("web.service"),
+                active_state: ActiveState::Active,
+                sub_state: "running".to_owned(),
+                unit_file_state: UnitFileState::Generated,
+                origin: UnitOrigin::desde(&origen),
+            }]
+        };
+
+        escribir("primero");
+        let entorno = entorno().await;
+        let state = entorno.state().clone();
+        let respuesta = flujo(
+            Vec::new(),
+            state.eventos.subscribe(),
+            state.apagado.clone(),
+            Duration::from_millis(1),
+            Arc::new(config),
+        )
+        .into_response();
+        let mut cuerpo = respuesta.into_body().into_data_stream();
+
+        // La instantánea inicial está vacía: se consume para llegar al vivo.
+        let _ = leer_cuadro(&mut cuerpo).await;
+
+        state.eventos.send(publicar()).expect("hay un suscriptor");
+        let primero = data_del_cuadro(&leer_cuadro(&mut cuerpo).await);
+        assert_eq!(primero["data"][0]["stack"], "primero");
+
+        // El fichero cambia con el flujo ya abierto.
+        escribir("segundo");
+        state.eventos.send(publicar()).expect("hay un suscriptor");
+        let segundo = data_del_cuadro(&leer_cuadro(&mut cuerpo).await);
+        assert_eq!(
+            segundo["data"][0]["stack"], "segundo",
+            "el evento tiene que ver el groups.toml actual sin reconectar"
+        );
+    }
+
     /// La suscripción al canal va **antes** de calcular la instantánea inicial.
     ///
     /// Al revés hay una carrera de verdad: un cambio que ocurra entre el listado y
@@ -371,6 +465,7 @@ mod tests {
             state.eventos.subscribe(),
             state.apagado.clone(),
             Duration::from_millis(1),
+            state.config.clone(),
         )
         .into_response();
 

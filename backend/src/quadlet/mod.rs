@@ -16,6 +16,7 @@
 //! generador sin ser una quadlet. La extensión que llega se lee con
 //! [`QuadletKind::from_extension`], que es la única puerta a un [`QuadletKind`].
 
+pub mod groups;
 pub mod service;
 pub mod stack;
 pub mod store;
