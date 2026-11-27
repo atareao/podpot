@@ -1,4 +1,41 @@
 # Changelog
+## [0.3.1] - 2026-11-27
+
+### Miscellaneous Tasks
+
+- Remove accidental /home/lorenzo artifact from release
+- Release v0.3.1 (fix accidental artifact)
+## [0.3.0] - 2026-11-27
+
+### Documentation
+
+- *(branch-protection)* Rulesets con bypass admin + PAT, y archivar PLAN-024 (#55)
+- *(openspec)* Propuesta antd-bundle-budget y PLAN-025
+- *(plan)* Archivar PLAN-026
+- *(openspec)* Sincronizar spec de autenticación y cerrar PLAN-026
+- *(openspec)* Archivar antd-bundle-budget y cerrar PLAN-025
+- *(openspec)* Archivar logout-epoch
+
+### Features
+
+- *(auth)* Logout epoch (#59)
+- *(ui)* Agrupar quadlets por stack
+
+### Miscellaneous Tasks
+
+- Release v0.3.0
+
+### Performance
+
+- *(frontend)* Reducir huella de antd por debajo de 500 kB raw
+
+### Refactor
+
+- *(ui)* Restaurar componentes de Ant Design
+
+### Testing
+
+- *(frontend)* Tipar y ampliar presupuesto por chunk de antd
 ## [0.2.0] - 2026-11-23
 
 ### Bug Fixes
@@ -63,6 +100,7 @@
 - Trigger release workflow (#52)
 - Trigger release workflow (#53)
 - *(release)* Usar PAT de admin (RELEASE_TOKEN) para saltar los rulesets (#54)
+- Release v0.2.0
 
 ### Performance
 

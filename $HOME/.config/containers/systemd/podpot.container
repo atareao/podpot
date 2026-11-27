@@ -1,0 +1,14 @@
+[Container]
+Image=localhost/podpot:dev
+ContainerName=podpot
+PublishPort=8080:8080
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=PODPOT_SYSTEMD=dbus
+Environment=BIND_ADDRESS=0.0.0.0:8080
+Environment=DATABASE_URL=sqlite:///app/data/podpot.db
+Environment=PODPOT_STATIC_DIR=/app/static
+Environment=HOME=/app
+Volume=/run/user/1000:/run/user/1000
+Volume=/run/user/1000/podman/podman.sock:/run/user/1000/podman/podman.sock
+Volume=${HOME}/.config/containers/systemd:${HOME}/.config/containers/systemd
