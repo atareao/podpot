@@ -1,6 +1,6 @@
 [package]
 name = "podpot"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 description = "Panel web para gestionar las quadlets de Podman del systemd de usuario (rootless)."
 license = "MIT"
