@@ -22,6 +22,8 @@ use crate::auth::{oidc, session};
 use crate::error::AppError;
 use crate::state::AppState;
 
+pub use session::SESSION_COOKIE_NAME;
+
 /// Mensaje único con el que se rechaza un intento de entrada que no cuadra.
 ///
 /// Los tres modos de fallo del `state` —desconocido, caducado y reutilizado— se
@@ -244,10 +246,28 @@ pub struct IdentidadDeSesion {
 /// `POST /api/v1/auth/logout` — pública. El logout es idempotente y borra la cookie aunque la sesión no verifique o falte.
 ///
 /// Borra la cookie de sesión —la **misma** cookie, con el mismo `Path` y con
-/// `Max-Age=0`— y contesta la envoltura. Se declara como `POST` y no como `GET`
-/// porque cambia estado: un `GET` lo dispararían un enlace, un prefetch o una
-/// imagen.
-pub async fn logout(jar: CookieJar) -> (CookieJar, ApiResponse<AcuseDeCierre>) {
+/// `Max-Age=0`— y marca la sesión como cerrada en la caché de revocación. La
+/// marca cierra la carrera logout↔refresh: cualquier petición ya en vuelo detecta
+/// el cierre al leer el *gate* la caché y contesta `401`.
+///
+/// Se declara como `POST` y no como `GET` porque cambia estado: un `GET` lo
+/// dispararían un enlace, un prefetch o una imagen.
+pub async fn logout(
+    jar: CookieJar,
+    State(state): State<AppState>,
+) -> (CookieJar, ApiResponse<AcuseDeCierre>) {
+    // Si hay una cookie, extraer su jti para marcarlo como cerrado por logout.
+    // El logout no se detiene si la cookie no verifica ni está ausente: sigue
+    // borrando la cookie del navegador. Pero sin jti válido no hay nada que
+    // cerrar en la caché.
+    if let Some(auth) = state.auth.as_ref()
+        && let Some(cookie) = jar.get(SESSION_COOKIE_NAME)
+        && let Ok(claims) = session::verify(&auth.secret, cookie.value())
+        && let Some(jti) = claims.jti.as_deref()
+    {
+        auth.cerrar_sesion_por_logout(jti).await;
+    }
+
     // La `Set-Cookie` de borrado viaja por el propio frasco de la petición: es lo
     // que hace que la respuesta lleve la cabecera y la envoltura a la vez. La
     // cookie la define [`session::cookie_de_borrado`], la misma que manda el `401`
@@ -281,7 +301,7 @@ mod tests {
     use crate::test_support::proveedor_falso::{IdToken, ProveedorFalso};
     use crate::test_support::{
         OIDC_CLIENT_ID, cookie_de_sesion, entorno_oidc_con_emisor, header_texto, peticion,
-        peticion_con_cookie, peticion_cruda,
+        peticion_con_cookie, peticion_cruda, valor_de_cookie,
     };
 
     /// Extrae el `state` y el `nonce` de la `Location` de un login.
@@ -604,6 +624,76 @@ mod tests {
 
         assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
         assert_eq!(cuerpo["error"]["code"], "method_not_allowed");
+    }
+
+    /// Escenario «Racing logout↔refresh»: tras el cierre, una petición en vuelo con
+    /// la cookie antigua no se renueva —el *gate* detecta que el logout cerró la
+    /// sesión (`esta_revocado_por_logout`) y contesta `401`. Es el cierre de la
+    /// carrera entre el logout del usuario y la renovación automática que
+    /// intentaría salvar la sesión.
+    #[tokio::test]
+    async fn el_logout_bloquea_la_renovacionautomatica_de_cookies_antiguas() {
+        let proveedor = ProveedorFalso::servir().await;
+        let entorno = entorno_oidc_con_emisor(&proveedor.issuer).await;
+
+        // Paso 1: login para obtener cookie válida.
+        let login = peticion_cruda(&entorno.app(), Method::GET, "/api/v1/auth/login").await;
+        let location =
+            header_texto(&login, header::LOCATION).expect("el login devuelve 302 con Location");
+        let (state, nonce) = state_y_nonce(&location);
+
+        proveedor
+            .montar_token_endpoint(&proveedor.firmar(&IdToken::valido(
+                &proveedor.issuer,
+                OIDC_CLIENT_ID,
+                &nonce,
+            )))
+            .await;
+
+        let callback_resp = peticion_cruda(
+            &entorno.app(),
+            Method::GET,
+            &format!("/api/v1/auth/callback?code=un-codigo&state={state}"),
+        )
+        .await;
+        assert_eq!(callback_resp.status(), StatusCode::FOUND);
+
+        // Extraer la cookie de sesión emitida por el callback.
+        let cookie_nueva =
+            header_texto(&callback_resp, header::SET_COOKIE).expect("el callback emite Set-Cookie");
+        let nombre_token = valor_de_cookie(&cookie_nueva, SESSION_COOKIE_NAME)
+            .expect("la Set-Cookie trae el token");
+        let token_sesion = format!("{SESSION_COOKIE_NAME}={nombre_token}");
+
+        // Paso 2: verificar que la ruta protegida responde 200 con la cookie.
+        let (status, _) =
+            peticion_con_cookie(&entorno.app(), Method::GET, "/api/v1/units", &token_sesion).await;
+        assert_eq!(status, StatusCode::OK, "una sesión válida accede a /units");
+
+        // Paso 3: cerrar la sesión (logout).
+        let logout = peticion_con_cookie_cruda(
+            &entorno.app(),
+            Method::POST,
+            "/api/v1/auth/logout",
+            &token_sesion,
+        )
+        .await;
+        assert_eq!(logout.status(), StatusCode::OK);
+
+        // Paso 4: reutilizar la misma cookie de sesión (sin renovar) —debe fallar.
+        // Esto reproduce una petición ya en vuelo cuando el logout acabó de responder.
+        let (status_revocada, cuerpo_revocada) =
+            peticion_con_cookie(&entorno.app(), Method::GET, "/api/v1/units", &token_sesion).await;
+
+        assert_eq!(
+            status_revocada,
+            StatusCode::UNAUTHORIZED,
+            "tras logout, la cookie antigua se rechaza con 401 (no se renueva)"
+        );
+        assert_eq!(
+            cuerpo_revocada["error"]["code"], "unauthorized",
+            "el rechazo lleva la envoltura JSON estándar"
+        );
     }
 
     /// Lanza una petición con cookie y devuelve la respuesta sin leer el cuerpo.

@@ -1,47 +1,91 @@
-# Protección de ramas — development
+# Protección de ramas — `development` y `main`
 
 ## Configuración aplicada (2026-11-23)
 
-Rama protegida: **development** (única rama remota, default).
+Ambas ramas de larga vida están protegidas mediante **rulesets** (no branch
+protection clásica, que no admite bypass).
 
-### Reglas
+| Rama | Ruleset | ID |
+|---|---|---|
+| `development` (default) | `development-protection` | 27879478 |
+| `main` | `main-protection` | 27879853 |
+
+### Reglas (idénticas en ambas)
+
 | Regla | Valor |
 |---|---|
 | **Pull request obligatorio** | Sí (sin push directo) |
 | **Status checks requeridos (strict)** | `Backend (fmt, clippy, test)` + `Frontend (typecheck, lint, test, build)` |
 | **Aprobaciones requeridas** | 0 (desarrollo en solitario) |
-| **Force-push** | Prohibido |
-| **Borrar rama** | Prohibido |
-| **Bloquear a admins** | Sí (`enforce_admins: true`) |
-| **Historial lineal** | No requerido |
-| **Bloquear creación de ramas** | No |
+| **Force-push** | Prohibido (`non_fast_forward`) |
+| **Borrar rama** | Prohibido (`deletion`) |
+| **Métodos de merge permitidos** | merge, squash, rebase |
+| **Bypass** | Rol **admin** del repositorio (`RepositoryRole` id 5), `bypass_mode: always` |
 
 ### Checks de CI vinculados
 - `Backend (fmt, clippy, test)` — `cargo fmt --check` + `cargo clippy --all-targets -- -D warnings` + `cargo test` (backend/)
 - `Frontend (typecheck, lint, test, build)` — `pnpm run typecheck` + `pnpm run lint` + `pnpm run test` + `pnpm run build` (frontend/)
 
-Ambos definidos en `.github/workflows/ci.yml` y reconocidos como checks de GitHub Actions (`app_id: 15368`).
+Ambos definidos en `.github/workflows/ci.yml` (GitHub Actions, `app_id: 15368`).
 
-### Comportamiento
-- Un push directo a `development` falla con `GH006: Protected branch update failed`.
-- Un PR a `development` exige que **ambos checks** estén en verde (y al día, `strict: true`) antes de permitir merge.
-- El dueño del repo también queda bloqueado (`enforce_admins: true`): evita accidentes.
+## Bypass para `release.yml` (PAT de admin)
 
-### Futuro: bypass para automatizaciones (releases)
-Cuando se cree `main` y `release.yml` necesite resincronizar `development` tras un release:
-1. Crear un **ruleset** (no branch protection clásico) que permita a `github-actions` hacer push a `development`.
-2. O añadir una **GitHub App** con permisos y meterla en `restrictions`/`bypass_actors` de la protección actual.
-3. Documentar aquí el bypass elegido.
+`release.yml` empuja el commit de versión a `main` y resincroniza `development`
+tras cada release. Ese push lo hace el job `prepare`, cuyo `actions/checkout`
+usa ahora `token: ${{ secrets.RELEASE_TOKEN }}`.
 
-### Verificación
+### Por qué un PAT y no el `GITHUB_TOKEN`
+
+En **repositorios personales** GitHub **no permite** que la integración de
+GitHub Actions (ni `GITHUB_TOKEN`) sea bypass actor de un ruleset: la API
+responde `422 Actor GitHub Actions integration must be part of the ruleset
+source or owner organization`. Una **deploy key** como bypass **tampoco surte
+efecto** en rulesets de rama (verificado empíricamente: push rechazado). La
+única vía soportada es un actor con **rol admin** (o un App de organización).
+
+Por eso:
+1. Los rulesets tienen como bypass `RepositoryRole` id **5 (admin)**.
+2. El workflow usa `secrets.RELEASE_TOKEN`: un PAT de un admin del repo
+   (permisos `Contents: read/write` y `Workflows: read/write`, limitado al repo
+   `podpot`). Al autenticarse como admin, salta el ruleset.
+
+El token vive además en `crypta` como `github_podpot_release_token`.
+
+### Rotación del token
+
 ```sh
-gh api repos/:owner/:repo/branches/development/protection
-# Debe devolver los contextos exactos arriba y enforce_admins: true
+# 1. Genera un PAT fine-grained en https://github.com/settings/personal-access-tokens/new
+#    (Contents: read/write, Workflows: read/write, solo el repo podpot)
+# 2. Guárdalo en crypta y actualiza el secreto del repo
+crypta set github_podpot_release_token --value 'github_pat_...'
+gh secret set RELEASE_TOKEN --repo atareao/podpot \
+  --body "$(crypta lookup github_podpot_release_token)"
 ```
 
-### Cambiar la protección
-Modificar vía API (ejemplo para ajustar aprobaciones a 1):
+## Verificación
+
 ```sh
-gh api --method PUT repos/:owner/:repo/branches/development/protection \
-  -f 'required_pull_request_reviews[required_approving_review_count]=1'
+gh api repos/:owner/:repo/rulesets --jq '.[] | {id,name}'
+gh api repos/:owner/:repo/rulesets/27879478 --jq '{name,bypass_actors,rules:[.rules[].type]}'
+gh api repos/:owner/:repo/rulesets/27879853 --jq '{name,bypass_actors,rules:[.rules[].type]}'
+gh api repos/:owner/:repo/rules/branches/main --jq '[.[].type]'
 ```
+
+## Cambiar las reglas
+
+Los rulesets se editan con PUT (hay que enviar el objeto completo):
+
+```sh
+gh api repos/:owner/:repo/rulesets/27879853 > /tmp/rs.json
+# editar /tmp/rs.json (p. ej. subir required_approving_review_count a 1)
+gh api --method PUT repos/:owner/:repo/rulesets/27879853 --input /tmp/rs.json
+```
+
+## Notas
+
+- `development` sigue siendo la rama **default** del repositorio.
+- La branch protection clásica que había en `development` (PLAN-023) se retiró:
+  la sustituye el ruleset, equivalente y además con soporte de bypass.
+- El push de `release.yml` **no es atómico**: si el push de `main` falla pero el
+  del tag tiene éxito, queda un tag huérfano que rompe la siguiente release
+  (`fatal: tag already exists`). Si ocurre, bórralo: `git push origin :refs/tags/vX.Y.Z`.

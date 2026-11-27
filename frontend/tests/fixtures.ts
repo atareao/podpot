@@ -18,6 +18,9 @@ export function unidad(campos: Partial<QuadletUnit> & { name: string }): Quadlet
     active_state: 'active',
     sub_state: 'running',
     unit_file_state: 'generated',
+    // Valor por defecto solo para las pruebas: cada caso que afirme algo sobre
+    // la agrupación pasa su propio `stack` explícitamente.
+    stack: campos.name.replace(/\.service$/, ''),
     ...campos,
   }
 }

@@ -35,6 +35,18 @@ const vendorChunk = (id: string): string | undefined => {
 export default defineConfig({
   plugins: [react()],
   build: {
+    minify: 'terser',
+    terserOptions: {
+      compress: {
+        passes: 2,
+        drop_console: true,
+        drop_debugger: true,
+        pure_funcs: ['console.log', 'console.info', 'console.debug'],
+      },
+      mangle: {
+        safari10: true,
+      },
+    },
     rollupOptions: {
       output: {
         manualChunks: vendorChunk,
@@ -54,5 +66,6 @@ export default defineConfig({
     setupFiles: './tests/setupTests.ts',
     globals: true,
     css: true,
+    testTimeout: 60000,
   },
 })

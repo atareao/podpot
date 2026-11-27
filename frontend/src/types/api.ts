@@ -41,6 +41,12 @@ export interface QuadletUnit {
   active_state: ActiveState
   sub_state: string
   unit_file_state: string
+  /**
+   * Stack al que pertenece la unidad, calculado por el backend. El panel solo
+   * lo usa para agrupar: no reconstruye esta relación desde el nombre de la
+   * unidad ni desde el `file_name`.
+   */
+  stack: string
 }
 
 /** Tipos de quadlet que el panel puede crear. `.desktop` queda excluida. */

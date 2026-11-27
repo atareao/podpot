@@ -50,7 +50,7 @@ En modo `oidc`, la aplicación SHALL exponer `GET /api/v1/auth/login`, que SHALL
 
 ### Requirement: Sesión en cookie
 
-La sesión SHALL ser un JWT firmado con un secreto de la configuración, transportado en una cookie `HttpOnly` y `SameSite=Strict`, con `Secure` únicamente cuando el redirect sea https. Cada token de sesión SHALL caducar; la sesión puede renovarse de forma deslizante sin tope absoluto de vida. `GET /api/v1/auth/session` SHALL devolver la identidad autenticada de la sesión actual. `POST /api/v1/auth/logout` SHALL borrar la cookie de sesión siempre, con independencia de que la cookie presentada verifique o no. En modo `oidc`, el *gate* SHALL renovar la sesión de forma deslizante cuando a un token válido le queden la ventana de renovación o menos. SHALL emitir una cookie nueva con la misma identidad (`sub` y `email`), con `iat` y `exp` nuevos y con la vida completa. Un token fuera de la ventana NO SHALL renovarse. Salvo en el caso de refresh rechazado por el proveedor descrito en el requisito «Refresco del ID token del proveedor», la renovación NO SHALL cambiar el cuerpo ni el código de la respuesta.
+La sesión SHALL ser un JWT firmado con un secreto de la configuración, transportado en una cookie `HttpOnly` y `SameSite=Strict`, con `Secure` únicamente cuando el redirect sea https. Cada token de sesión SHALL caducar y llevar un claim `logout_epoch` (0 si activo, >0 como instante de cierre); la sesión puede renovarse de forma deslizante sin tope absoluto de vida. `GET /api/v1/auth/session` SHALL devolver la identidad autenticada de la sesión actual. `POST /api/v1/auth/logout` SHALL borrar la cookie de sesión siempre, con independencia de que la cookie presentada verifique o no. En modo `oidc`, el *gate* SHALL renovar la sesión de forma deslizante cuando a un token válido le queden la ventana de renovación o menos. SHALL emitir una cookie nueva con la misma identidad (`sub` y `email`), con `iat` y `exp` nuevos y con la vida completa. Un token fuera de la ventana NO SHALL renovarse. Salvo en el caso de refresh rechazado por el proveedor descrito en el requisito «Refresco del ID token del proveedor», la renovación NO SHALL cambiar el cuerpo ni el código de la respuesta.
 
 #### Scenario: Identidad de la sesión
 
@@ -103,6 +103,29 @@ La sesión SHALL ser un JWT firmado con un secreto de la configuración, transpo
 - **WHEN** la aplicación está en modo `disabled`
 - **THEN** NO SHALL haber renovación de sesión
 
+
+
+#### Scenario: Cierre de sesión con epoch
+
+- **WHEN** un cliente pide `POST /api/v1/auth/logout`
+- **THEN** SHALL eliminar la cookie de sesión y SHALL establecer un `logout_epoch` futuro en el mapa de revocados por logout
+
+#### Scenario: Renovación rechazada por logout_epoch
+
+- **WHEN** un cliente con sesión válida pide una ruta de negocio y su `jti` está marcado como cerrado por logout
+- **THEN** SHALL recibir `401` con la envoltura y NO SHALL recibir una `Set-Cookie` de renovación
+
+#### Scenario: Renovación conserva logout_epoch
+
+- **WHEN** un cliente con sesión válida pide una ruta de negocio y su `jti` sigue marcado como cerrado por logout pero ya expiró el bloqueo
+- **THEN** SHALL recibir `200` con la misma respuesta y una `Set-Cookie` con una sesión nueva
+- **AND** la sesión nueva SHALL mantener sin marca de bloqueo de logout
+
+#### Scenario: Renovación sin logout_epoch
+
+- **WHEN** un cliente con sesión válida pide una ruta de negocio y su `jti` NO tiene marca de cierre por logout
+- **THEN** SHALL recibir `200` con la misma respuesta y una `Set-Cookie` con una sesión nueva
+- **AND** la sesión nueva NO SHALL tener ninguna marca de bloqueo
 ### Requirement: Protección de la superficie de negocio
 
 En modo `oidc`, la aplicación SHALL exigir sesión válida para toda la superficie de negocio (unidades, acciones, quadlets, stream y la ruta de sesión), y SHALL dejar públicas únicamente la salud, el login, el callback y el logout. Sin sesión, una petición a una ruta protegida SHALL responder `401` con la envoltura `{error}` habitual (nunca una redirección ni HTML). El stream SSE SHALL quedar protegido por el mismo mecanismo, de modo que sin sesión no se abra el flujo.
