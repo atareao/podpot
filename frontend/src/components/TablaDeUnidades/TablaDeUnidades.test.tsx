@@ -441,4 +441,36 @@ describe('TablaDeUnidades — controles de acción con iconos', () => {
       expect(icono).not.toBeNull()
     }
   })
+
+  // rc-tooltip inyecta el `title` en un nodo con role="tooltip" al hacer hover;
+  // en jsdom funciona sin temporizadores ficticios, así que se comprueba el
+  // texto de cada tooltip (la etiqueta centralizada del módulo de mapeo).
+  it.each(ACCIONES)('muestra el tooltip «%s» al pasar el cursor', async (accion) => {
+    const usuario = userEvent.setup()
+    tabla([unidad({ name: 'web.service', file_name: 'web.container' })])
+
+    await usuario.hover(botonDeAccion(accion))
+
+    expect(await screen.findByRole('tooltip')).toHaveTextContent(accion)
+  })
+
+  it('conserva la llamada a onAccion al parar desde el botón con icono', async () => {
+    const usuario = userEvent.setup()
+    const objetivo = unidad({ name: 'web.service', file_name: 'web.container' })
+    const { onAccion } = tabla([objetivo])
+
+    await usuario.click(botonDeAccion('Parar'))
+
+    expect(onAccion).toHaveBeenCalledWith(objetivo, 'stop')
+  })
+
+  it('conserva la llamada a onAccion al reiniciar desde el botón con icono', async () => {
+    const usuario = userEvent.setup()
+    const objetivo = unidad({ name: 'web.service', file_name: 'web.container' })
+    const { onAccion } = tabla([objetivo])
+
+    await usuario.click(botonDeAccion('Reiniciar'))
+
+    expect(onAccion).toHaveBeenCalledWith(objetivo, 'restart')
+  })
 })

@@ -3,7 +3,7 @@ import { Button, Empty, Popconfirm, Select, Space, Spin, Table, Tag, Tooltip, Ty
 import type { TableProps } from 'antd'
 import { EstadoDeUnidad } from '../EstadoDeUnidad/EstadoDeUnidad'
 import { etiquetaDeAccionEnCurso } from '../../acciones'
-import { iconoYAccion } from '../../acciones-icono'
+import { etiquetaDeAccion, iconoYAccion } from '../../acciones-icono'
 import { identidadDe } from '../../identidad'
 import { groupByStack } from '../../lib/groupByStack'
 import type { TrabajosEnCurso } from '../../hooks/useTrabajosEnVivo'
@@ -191,7 +191,7 @@ export function TablaDeUnidades({
         const { nombre: borrar, icono: iconoBorrar } = iconoYAccion('borrar')
         return (
           <Space size="small" wrap>
-            <Tooltip title="Arrancar">
+            <Tooltip title={etiquetaDeAccion('start')}>
               <Button
                 size="small"
                 aria-label={arrancar(identidad)}
@@ -201,7 +201,7 @@ export function TablaDeUnidades({
                 {iconoArrancar}
               </Button>
             </Tooltip>
-            <Tooltip title="Parar">
+            <Tooltip title={etiquetaDeAccion('stop')}>
               <Button
                 size="small"
                 aria-label={parar(identidad)}
@@ -211,7 +211,7 @@ export function TablaDeUnidades({
                 {iconoParar}
               </Button>
             </Tooltip>
-            <Tooltip title="Reiniciar">
+            <Tooltip title={etiquetaDeAccion('restart')}>
               <Button
                 size="small"
                 aria-label={reiniciar(identidad)}
@@ -221,7 +221,7 @@ export function TablaDeUnidades({
                 {iconoReiniciar}
               </Button>
             </Tooltip>
-            <Tooltip title="Editar">
+            <Tooltip title={etiquetaDeAccion('edit')}>
               <Button
                 size="small"
                 aria-label={editar(identidad)}
@@ -233,7 +233,7 @@ export function TablaDeUnidades({
             </Tooltip>
             {/* Los logs solo se leen: no se bloquean con una operación en curso
                 sobre la fila (no encadenan nada destructivo). */}
-            <Tooltip title="Logs">
+            <Tooltip title={etiquetaDeAccion('logs')}>
               <Button size="small" aria-label={logs(identidad)} onClick={() => onVerRegistros(unidad)}>
                 {iconoLogs}
               </Button>
@@ -250,7 +250,7 @@ export function TablaDeUnidades({
               okButtonProps={{ danger: true }}
               onConfirm={() => onBorrar(unidad)}
             >
-              <Tooltip title="Borrar">
+              <Tooltip title={etiquetaDeAccion('borrar')}>
                 <Button
                   size="small"
                   danger
