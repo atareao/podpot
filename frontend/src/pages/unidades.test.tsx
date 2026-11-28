@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react'
+import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { App as AppDeAntd } from 'antd'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
@@ -64,8 +64,16 @@ describe('pantalla de quadlets', () => {
 
     expect(await screen.findByText('web.service')).toBeInTheDocument()
     expect(screen.getByText('db.service')).toBeInTheDocument()
-    expect(screen.getByText('En ejecución')).toBeInTheDocument()
-    expect(screen.getByText('Fallida')).toBeInTheDocument()
+    // El resumen también dice «En ejecución»: el estado se comprueba dentro de
+    // la tarjeta de la unidad, no en el panel de métricas.
+    expect(
+      within(screen.getByRole('listitem', { name: 'Unidad web.container' })).getByText(
+        'En ejecución',
+      ),
+    ).toBeInTheDocument()
+    expect(
+      within(screen.getByRole('listitem', { name: 'Unidad db.container' })).getByText('Fallida'),
+    ).toBeInTheDocument()
   })
 
   it('muestra un aviso cuando no hay quadlets', async () => {
@@ -111,8 +119,15 @@ describe('pantalla de quadlets', () => {
 
     expect(await screen.findByText(/Quadlet «web.container» arrancada/i)).toBeInTheDocument()
     expect(vi.mocked(accionDeUnidad)).toHaveBeenCalledWith('web.service', 'start')
-    // El refresco vuelve a pedir la lista y termina mostrando el estado nuevo.
-    expect(await screen.findByText('En ejecución')).toBeInTheDocument()
+    // El refresco vuelve a pedir la lista y termina mostrando el estado nuevo
+    // en la tarjeta (el resumen de métricas repite la misma etiqueta).
+    await waitFor(() =>
+      expect(
+        within(screen.getByRole('listitem', { name: 'Unidad web.container' })).getByText(
+          'En ejecución',
+        ),
+      ).toBeInTheDocument(),
+    )
     await waitFor(() => expect(vi.mocked(listarUnidades)).toHaveBeenCalledTimes(2))
   })
 

@@ -1,4 +1,4 @@
-import { render, screen, within } from '@testing-library/react'
+import { render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { unidad } from '../../../tests/fixtures'
 import { TablaDeUnidades } from './TablaDeUnidades'
@@ -50,22 +50,24 @@ describe('TablaDeUnidades — agrupación y filtros', () => {
     expect(screen.getByText('alpha').compareDocumentPosition(screen.getByText('zeta'))).toBe(
       Node.DOCUMENT_POSITION_FOLLOWING,
     )
-    expect(screen.getByText('alpha').closest('td')).toHaveAttribute('rowspan', '2')
+    // Las tarjetas del grupo van juntas, bajo la cabecera, antes del siguiente
+    // grupo (antes había una celda con `rowSpan` en la tabla).
+    expect(
+      screen.getByText('alpha').compareDocumentPosition(screen.getByText('alpha.container')),
+    ).toBe(Node.DOCUMENT_POSITION_FOLLOWING)
+    expect(
+      screen.getByText('alpha-volume.volume').compareDocumentPosition(screen.getByText('zeta')),
+    ).toBe(Node.DOCUMENT_POSITION_FOLLOWING)
     expect(ordenDeFilas()).toEqual([
       'Arrancar alpha.container',
       'Arrancar alpha-volume.volume',
       'Arrancar zeta.container',
     ])
 
-    // Cada fila conserva su estado y sus acciones: la cabecera del grupo no las sustituye.
-    const filaZeta = screen.getByRole('button', { name: 'Arrancar zeta.container' }).closest('tr')
-    expect(filaZeta).not.toBeNull()
-    expect(within(filaZeta as HTMLElement).getByText('En ejecución')).toBeInTheDocument()
-    const filaVolumen = screen
-      .getByRole('button', { name: 'Arrancar alpha-volume.volume' })
-      .closest('tr')
-    expect(filaVolumen).not.toBeNull()
-    expect(within(filaVolumen as HTMLElement).getByText('Fallida')).toBeInTheDocument()
+    // Cada tarjeta conserva su estado y sus acciones: la cabecera del grupo no
+    // las sustituye (la asociación por tarjeta se comprueba en GrupoDeUnidades).
+    expect(screen.getByText('En ejecución')).toBeInTheDocument()
+    expect(screen.getByText('Fallida')).toBeInTheDocument()
   })
 
   it('filtra por tipo y mantiene la agrupación por stack', async () => {
@@ -185,7 +187,6 @@ describe('TablaDeUnidades — agrupación y filtros', () => {
     )
 
     expect(ordenDeFilas()).toEqual(['Arrancar web-volume.volume'])
-    const fila = screen.getByRole('button', { name: 'Arrancar web-volume.volume' }).closest('tr')
-    expect(within(fila as HTMLElement).getByText('Fallida')).toBeInTheDocument()
+    expect(screen.getByText('Fallida')).toBeInTheDocument()
   })
 })

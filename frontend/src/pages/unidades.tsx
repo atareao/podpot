@@ -1,8 +1,11 @@
 import { useState } from 'react'
 import { Alert, App, Button, Card, Space, Spin, Typography } from 'antd'
 import { TablaDeUnidades } from '../components/TablaDeUnidades/TablaDeUnidades'
+import { MetricasDelPanel } from '../components/MetricasDelPanel/MetricasDelPanel'
+import { BarraDeBusqueda } from '../components/BarraDeBusqueda/BarraDeBusqueda'
+import { ModalDeRegistros } from '../components/ModalDeRegistros/ModalDeRegistros'
+import { ModalDeDetalles } from '../components/ModalDeDetalles/ModalDeDetalles'
 import { identidadDe } from '../identidad'
-import { VisorDeRegistros } from '../components/VisorDeRegistros/VisorDeRegistros'
 import { FormularioDeCreacion } from '../components/FormularioDeCreacion/FormularioDeCreacion'
 import type { ValoresDeFormulario } from '../components/FormularioDeCreacion/FormularioDeCreacion'
 import {
@@ -23,6 +26,14 @@ import type {
   QuadletDetalle,
   QuadletUnit,
 } from '../types/api'
+
+/** Duración de las notificaciones de éxito y error. */
+const DURACION_DE_AVISO_S = 3
+
+/** Lista vacía estable: evita recalcular la búsqueda en cada render de carga. */
+const SIN_UNIDADES: QuadletUnit[] = []
+
+type TipoDeAviso = 'success' | 'error'
 
 /** Valores de arranque del formulario: los que expone, tal cual se leyeron. */
 function valoresDeEdicion(definicion: QuadletDetalle): Partial<ValoresDeFormulario> {
@@ -59,7 +70,7 @@ function completarConDefinicion(
  * Pantalla principal: el listado de quadlets, sus acciones de control y el
  * formulario de creación —que se reutiliza, precargado, para editar—.
  *
- * Una acción avisa por `message` con su desenlace y deja que la mutación
+ * Una acción avisa por `notification` con su desenlace y deja que la mutación
  * refresque el listado (el estado lo manda systemd). Mientras corre, los
  * botones de esa unidad se deshabilitan para no encadenar acciones.
  *
@@ -83,7 +94,14 @@ function completarConDefinicion(
  * edición a medias.
  */
 export default function Unidades() {
-  const { message } = App.useApp()
+  const { notification } = App.useApp()
+  /**
+   * Avisos breves del desenlace de cada operación. `notification` (no
+   * `message`) deja el texto en un recuadro legible también en móvil.
+   */
+  const avisar = (tipo: TipoDeAviso, texto: string): void => {
+    notification[tipo]({ message: texto, duration: DURACION_DE_AVISO_S })
+  }
   const unidades = useUnits()
   // Canal de trabajos: alimenta el indicador «en curso» por unidad. Es aditivo;
   // la acción sigue por su cauce (API + notificación) y el estado, por el canal
@@ -101,9 +119,16 @@ export default function Unidades() {
   // Unidad con un borrado en vuelo (verificación o `DELETE`): la operación va por
   // nombre de fichero, pero la fila a deshabilitar se identifica por unidad.
   const [enBorrado, setEnBorrado] = useState<QuadletUnit | null>(null)
+  // Resultado de la búsqueda: `BarraDeBusqueda` lo publica y el listado lo
+  // consume. Es estado porque el cuadro de texto vive en ese componente.
+  const [unidadesFiltradas, setUnidadesFiltradas] = useState<QuadletUnit[]>([])
+  // Unidad que se inspecciona sin entrar en edición: sus campos se leen con el
+  // mismo endpoint, pero el formulario sigue siendo el de `enEdicion`.
+  const [enInspeccion, setEnInspeccion] = useState<QuadletUnit | null>(null)
   // La definición se pide al entrar en edición; hasta que llegue, no hay
   // formulario: precargarlo a medias sería enseñar valores que no son.
   const lectura = useDetalleDeQuadlet(enEdicion?.file_name ?? null)
+  const inspeccion = useDetalleDeQuadlet(enInspeccion?.file_name ?? null)
 
   /**
    * Unidad con alguna operación en vuelo, si la hay. Se deriva —nunca se
@@ -127,19 +152,19 @@ export default function Unidades() {
   const alAccionar = async (unidad: QuadletUnit, tipo: AccionDeUnidad) => {
     try {
       const resultado = await accion.mutateAsync({ name: unidad.name, accion: tipo })
-      message.success(`Quadlet «${identidadDe(unidad)}» ${VERBOS[tipo]} (${resultado.active_state}).`)
+      avisar('success', `Quadlet «${identidadDe(unidad)}» ${VERBOS[tipo]} (${resultado.active_state}).`)
     } catch (error) {
-      message.error(mensajeDeError(error))
+      avisar('error', mensajeDeError(error))
     }
   }
 
   const alCrear = async (peticion: PeticionDeCreacion): Promise<boolean> => {
     try {
       const creada = await creacion.mutateAsync(peticion)
-      message.success(`Quadlet «${creada.file_name}» creada.`)
+      avisar('success', `Quadlet «${creada.file_name}» creada.`)
       return true
     } catch (error) {
-      message.error(mensajeDeError(error))
+      avisar('error', mensajeDeError(error))
       return false
     }
   }
@@ -161,12 +186,12 @@ export default function Unidades() {
         nombre: enEdicion.file_name,
         datos: completarConDefinicion(peticion, lectura.data),
       })
-      message.success(`Quadlet «${identidadDe(enEdicion)}» editada.`)
+      avisar('success', `Quadlet «${identidadDe(enEdicion)}» editada.`)
       setEnEdicion(null)
       return true
     } catch (error) {
       // Sin salir de la edición: lo escrito se conserva para corregirlo.
-      message.error(mensajeDeError(error))
+      avisar('error', mensajeDeError(error))
       return false
     }
   }
@@ -179,17 +204,17 @@ export default function Unidades() {
       // panel. Un `404` aquí aborta el `DELETE`.
       await verificacion.mutateAsync(unidad.file_name)
     } catch (error) {
-      message.error(mensajeDeError(error))
+      avisar('error', mensajeDeError(error))
       setEnBorrado(null)
       return
     }
     try {
       await borrado.mutateAsync(unidad.file_name)
-      message.success(`Quadlet «${identidadDe(unidad)}» borrada.`)
+      avisar('success', `Quadlet «${identidadDe(unidad)}» borrada.`)
       // Si se estaba editando esa misma quadlet, el formulario ya no tiene sentido.
       setEnEdicion((actual) => (actual?.file_name === unidad.file_name ? null : actual))
     } catch (error) {
-      message.error(mensajeDeError(error))
+      avisar('error', mensajeDeError(error))
     } finally {
       setEnBorrado(null)
     }
@@ -200,6 +225,14 @@ export default function Unidades() {
       <Typography.Title id="titulo-de-la-pantalla" level={1} style={{ marginTop: 0 }}>
         Quadlets
       </Typography.Title>
+
+      <div className="podpot-resumen">
+        <MetricasDelPanel unidades={unidades.data ?? SIN_UNIDADES} />
+        <BarraDeBusqueda
+          unidades={unidades.data ?? SIN_UNIDADES}
+          onResultados={setUnidadesFiltradas}
+        />
+      </div>
 
       {unidades.error !== null && (
         <Alert
@@ -267,7 +300,8 @@ export default function Unidades() {
       )}
 
       <TablaDeUnidades
-        unidades={unidades.data ?? []}
+        unidades={unidadesFiltradas}
+        instantanea={unidades.data ?? SIN_UNIDADES}
         cargando={unidades.isPending}
         enCurso={enCurso}
         progresoPorUnidad={trabajosEnCurso}
@@ -275,12 +309,26 @@ export default function Unidades() {
         onEditar={alEditar}
         onVerRegistros={alVerRegistros}
         onBorrar={(unidad) => void alBorrar(unidad)}
+        onInspeccionar={setEnInspeccion}
       />
 
-      <VisorDeRegistros
-        unidad={enRegistros?.name ?? null}
-        onCerrar={() => setEnRegistros(null)}
-      />
+      {enRegistros !== null && (
+        <ModalDeRegistros
+          abierto
+          unidad={enRegistros}
+          onCerrar={() => setEnRegistros(null)}
+        />
+      )}
+
+      {enInspeccion !== null && (
+        <ModalDeDetalles
+          abierto
+          unidad={enInspeccion}
+          detalle={inspeccion.data ?? null}
+          error={inspeccion.error !== null ? mensajeDeError(inspeccion.error) : null}
+          onCerrar={() => setEnInspeccion(null)}
+        />
+      )}
     </section>
   )
 }
