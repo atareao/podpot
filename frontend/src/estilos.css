@@ -12,9 +12,188 @@ body {
 }
 
 .podpot-pagina {
-  max-width: 1100px;
+  max-width: 1200px;
   margin: 0 auto;
   padding: 24px;
+}
+
+/* Cabecera fija: la marca y las acciones siguen visibles al recorrer el listado. */
+.podpot-cabecera {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  border-bottom: 1px solid color-mix(in srgb, var(--ant-color-border, CanvasText) 30%, transparent);
+  background: color-mix(in srgb, var(--ant-color-bg-container, Canvas) 92%, transparent);
+  color: var(--ant-color-text, CanvasText);
+  backdrop-filter: blur(8px);
+}
+
+.podpot-cabecera__contenido {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 10px 24px;
+}
+
+.podpot-cabecera__acciones {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.podpot-contenido {
+  min-height: calc(100vh - 56px);
+}
+
+.podpot-resumen {
+  display: grid;
+  gap: 16px;
+  margin-bottom: 20px;
+}
+
+.podpot-listado {
+  display: grid;
+  gap: 20px;
+}
+
+.podpot-grupo__cabecera {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  margin-bottom: 10px;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  font-size: 16px;
+  font-weight: 600;
+  text-align: left;
+}
+
+.podpot-grupo__cabecera:hover,
+.podpot-grupo__cabecera:focus-visible {
+  background: rgba(22, 119, 255, 0.08);
+}
+
+.podpot-grupo__chevron {
+  transition: transform 120ms ease;
+}
+
+.podpot-grupo__chevron--cerrado {
+  transform: rotate(-90deg);
+}
+
+.podpot-grupo__tarjetas {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 12px;
+}
+
+.podpot-tarjeta {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid color-mix(in srgb, var(--ant-color-border, CanvasText) 24%, transparent);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--ant-color-bg-container, Canvas) 72%, transparent);
+  color: var(--ant-color-text, CanvasText);
+}
+
+/* El bloque de identidad conserva la asociación celda/unidad del legacy; el
+   rol de presentación y `display: block` lo convierten en texto normal. */
+.podpot-tarjeta__identidad,
+.podpot-tarjeta__identidad tbody,
+.podpot-tarjeta__identidad tr,
+.podpot-tarjeta__identidad td {
+  display: block;
+  width: 100%;
+}
+
+.podpot-tarjeta__identidad td > * {
+  display: block;
+}
+
+.podpot-tarjeta__enlace {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+
+.podpot-tarjeta__enlace:hover,
+.podpot-tarjeta__enlace:focus-visible {
+  text-decoration: underline;
+}
+
+.podpot-tarjeta__datos {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 2px 10px;
+  margin: 0;
+  font-size: 12px;
+}
+
+.podpot-tarjeta__datos dt {
+  color: var(--ant-color-text-secondary, #595959);
+}
+
+.podpot-tarjeta__datos dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.podpot-tarjeta__acciones {
+  margin-top: auto;
+}
+
+.podpot-tarjeta--resaltada {
+  animation: podpot-resaltado 2s ease-out;
+}
+
+@keyframes podpot-resaltado {
+  0% {
+    border-color: #1677ff;
+    box-shadow: 0 0 0 3px rgba(22, 119, 255, 0.28);
+  }
+  100% {
+    border-color: rgba(128, 128, 128, 0.24);
+    box-shadow: none;
+  }
+}
+
+@media (max-width: 767px) {
+  .podpot-pagina,
+  .podpot-cabecera__contenido {
+    padding: 12px;
+  }
+
+  .podpot-cabecera__contenido {
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+
+  .podpot-grupo__tarjetas {
+    grid-template-columns: 1fr;
+  }
+
+  .podpot-tarjeta {
+    padding: 12px;
+  }
+
+  .podpot-tarjeta__acciones {
+    justify-content: flex-start;
+  }
 }
 
 /* Visor de logs: fondo oscuro y monoespaciado, como una consola. */

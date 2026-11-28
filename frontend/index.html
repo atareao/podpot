@@ -8,6 +8,21 @@
       name="description"
       content="Panel para gestionar los quadlets de Podman de la instancia rootless de systemd."
     />
+    <!-- Fija el esquema antes del bundle: evita el flash blanco con tema oscuro. -->
+    <script>
+      try {
+        var elegido = localStorage.getItem('podpot-tema')
+        var oscuro =
+          elegido === 'dark' ||
+          (elegido !== 'light' && matchMedia('(prefers-color-scheme: dark)').matches)
+        document.documentElement.style.cssText = oscuro
+          ? 'color-scheme:dark;background:#141414;color:rgba(255,255,255,0.88)'
+          : 'color-scheme:light;background:#fff;color:rgba(0,0,0,0.88)'
+      } catch (error) {
+        document.documentElement.style.cssText =
+          'color-scheme:light;background:#fff;color:rgba(0,0,0,0.88)'
+      }
+    </script>
   </head>
   <body>
     <div id="root"></div>

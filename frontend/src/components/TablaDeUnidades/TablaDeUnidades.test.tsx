@@ -23,7 +23,7 @@ function tabla(unidades: Parameters<typeof TablaDeUnidades>[0]['unidades']) {
 }
 
 describe('TablaDeUnidades', () => {
-  it('expone el nombre accesible del listado en el <table> real', () => {
+  it('expone el nombre accesible del listado de tarjetas', () => {
     render(
       <TablaDeUnidades
         unidades={[]}
@@ -35,7 +35,10 @@ describe('TablaDeUnidades', () => {
       />,
     )
 
-    expect(screen.getByRole('table', { name: 'Quadlets' })).toBeInTheDocument()
+    // El render pasa de <table> a grupos de tarjetas: se conserva el nombre
+    // accesible del listado, ahora en un contenedor con role="list".
+    expect(screen.getByRole('list', { name: 'Quadlets' })).toBeInTheDocument()
+    expect(screen.queryByRole('table')).not.toBeInTheDocument()
   })
 
   it('llama a onAccion con la unidad y la acción al pulsar «Arrancar»', async () => {
@@ -100,6 +103,28 @@ describe('TablaDeUnidades', () => {
 
     expect(screen.getByRole('button', { name: 'Arrancar web.container' })).toBeDisabled()
     expect(screen.getByRole('button', { name: 'Reiniciar web.container' })).toBeDisabled()
+  })
+
+  it('muestra Spin y deshabilita las acciones mientras haya un job en curso', () => {
+    render(
+      <TablaDeUnidades
+        unidades={[unidad({ name: 'web.service', file_name: 'web.container', active_state: 'inactive' })]}
+        cargando={false}
+        progresoPorUnidad={{ 'web.service': ['start'] }}
+        onAccion={vi.fn()}
+        onEditar={vi.fn()}
+        onVerRegistros={vi.fn()}
+        onBorrar={vi.fn()}
+      />,
+    )
+
+    const estado = screen.getByRole('status', {
+      name: 'Acción en curso en web.container: arrancada',
+    })
+    expect(estado.querySelector('.ant-spin')).not.toBeNull()
+    // El progreso SSE, sin `enCurso` de la mutación, también bloquea la fila.
+    expect(screen.getByRole('button', { name: 'Arrancar web.container' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Editar web.container' })).toBeDisabled()
   })
 
   it('muestra el estado vacío cuando no hay quadlets', () => {
@@ -472,5 +497,64 @@ describe('TablaDeUnidades — controles de acción con iconos', () => {
     await usuario.click(botonDeAccion('Reiniciar'))
 
     expect(onAccion).toHaveBeenCalledWith(objetivo, 'restart')
+  })
+})
+
+describe('resaltado tras un cambio en vivo', () => {
+  const props = {
+    cargando: false,
+    onAccion: vi.fn(),
+    onEditar: vi.fn(),
+    onVerRegistros: vi.fn(),
+    onBorrar: vi.fn(),
+  }
+  const antes = [
+    unidad({ name: 'web.service', file_name: 'web.container', active_state: 'active' }),
+    unidad({ name: 'db.service', file_name: 'db.container', active_state: 'inactive' }),
+  ]
+
+  it('no resalta al cambiar de filtros si la instantánea completa no cambia', () => {
+    const vista = render(<TablaDeUnidades {...props} unidades={[antes[0]]} instantanea={antes} />)
+
+    vista.rerender(<TablaDeUnidades {...props} unidades={[antes[1]]} instantanea={antes} />)
+
+    expect(vista.container.querySelectorAll('.podpot-tarjeta--resaltada')).toHaveLength(0)
+  })
+
+  it('resalta cuando cambia el estado en la instantánea, no al filtrar', () => {
+    const despues = [unidad({ ...antes[0], active_state: 'inactive' }), antes[1]]
+    const vista = render(<TablaDeUnidades {...props} unidades={[antes[0]]} instantanea={antes} />)
+
+    vista.rerender(<TablaDeUnidades {...props} unidades={[despues[0]]} instantanea={despues} />)
+
+    expect(screen.getByRole('listitem', { name: 'Unidad web.container' }).className).toContain(
+      'podpot-tarjeta--resaltada',
+    )
+  })
+
+  it('no resalta una unidad que aparece por primera vez en la instantánea', () => {
+    const vista = render(<TablaDeUnidades {...props} unidades={[]} instantanea={[]} />)
+
+    vista.rerender(<TablaDeUnidades {...props} unidades={[antes[1]]} instantanea={antes} />)
+
+    expect(vista.container.querySelectorAll('.podpot-tarjeta--resaltada')).toHaveLength(0)
+  })
+
+  it('apaga el resaltado al llegar otra instantánea sin cambios de estado', () => {
+    const despues = [unidad({ ...antes[0], active_state: 'inactive' }), antes[1]]
+    const vista = render(<TablaDeUnidades {...props} unidades={[antes[0]]} instantanea={antes} />)
+
+    vista.rerender(<TablaDeUnidades {...props} unidades={[despues[0]]} instantanea={despues} />)
+    expect(screen.getByRole('listitem', { name: 'Unidad web.container' }).className).toContain(
+      'podpot-tarjeta--resaltada',
+    )
+
+    // El cleanup canceló el temporizador: sin un nuevo cambio que lo reinicie,
+    // una instantánea posterior debe apagar el resaltado.
+    vista.rerender(
+      <TablaDeUnidades {...props} unidades={[despues[0]]} instantanea={[...despues]} />,
+    )
+
+    expect(vista.container.querySelectorAll('.podpot-tarjeta--resaltada')).toHaveLength(0)
   })
 })
