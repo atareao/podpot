@@ -1,8 +1,9 @@
 import { useMemo, useState } from 'react'
-import { Button, Empty, Popconfirm, Select, Space, Spin, Table, Tag, Typography } from 'antd'
+import { Button, Empty, Popconfirm, Select, Space, Spin, Table, Tag, Tooltip, Typography } from 'antd'
 import type { TableProps } from 'antd'
 import { EstadoDeUnidad } from '../EstadoDeUnidad/EstadoDeUnidad'
 import { etiquetaDeAccionEnCurso } from '../../acciones'
+import { iconoYAccion } from '../../acciones-icono'
 import { identidadDe } from '../../identidad'
 import { groupByStack } from '../../lib/groupByStack'
 import type { TrabajosEnCurso } from '../../hooks/useTrabajosEnVivo'
@@ -182,49 +183,61 @@ export function TablaDeUnidades({
         // `aria-label`, en cambio, usa la identidad mostrada (`file_name`).
         const bloqueada = enCurso === unidad.name
         const identidad = identidadDe(unidad)
+        const { nombre: arrancar, icono: iconoArrancar } = iconoYAccion('start')
+        const { nombre: parar, icono: iconoParar } = iconoYAccion('stop')
+        const { nombre: reiniciar, icono: iconoReiniciar } = iconoYAccion('restart')
+        const { nombre: editar, icono: iconoEditar } = iconoYAccion('edit')
+        const { nombre: logs, icono: iconoLogs } = iconoYAccion('logs')
+        const { nombre: borrar, icono: iconoBorrar } = iconoYAccion('borrar')
         return (
           <Space size="small" wrap>
-            <Button
-              size="small"
-              aria-label={`Arrancar ${identidad}`}
-              disabled={bloqueada || EN_MARCHA.has(unidad.active_state)}
-              onClick={() => onAccion(unidad, 'start')}
-            >
-              Arrancar
-            </Button>
-            <Button
-              size="small"
-              aria-label={`Parar ${identidad}`}
-              disabled={bloqueada || PARADA.has(unidad.active_state)}
-              onClick={() => onAccion(unidad, 'stop')}
-            >
-              Parar
-            </Button>
-            <Button
-              size="small"
-              aria-label={`Reiniciar ${identidad}`}
-              disabled={bloqueada}
-              onClick={() => onAccion(unidad, 'restart')}
-            >
-              Reiniciar
-            </Button>
-            <Button
-              size="small"
-              aria-label={`Editar ${identidad}`}
-              disabled={bloqueada}
-              onClick={() => onEditar(unidad)}
-            >
-              Editar
-            </Button>
+            <Tooltip title="Arrancar">
+              <Button
+                size="small"
+                aria-label={arrancar(identidad)}
+                disabled={bloqueada || EN_MARCHA.has(unidad.active_state)}
+                onClick={() => onAccion(unidad, 'start')}
+              >
+                {iconoArrancar}
+              </Button>
+            </Tooltip>
+            <Tooltip title="Parar">
+              <Button
+                size="small"
+                aria-label={parar(identidad)}
+                disabled={bloqueada || PARADA.has(unidad.active_state)}
+                onClick={() => onAccion(unidad, 'stop')}
+              >
+                {iconoParar}
+              </Button>
+            </Tooltip>
+            <Tooltip title="Reiniciar">
+              <Button
+                size="small"
+                aria-label={reiniciar(identidad)}
+                disabled={bloqueada}
+                onClick={() => onAccion(unidad, 'restart')}
+              >
+                {iconoReiniciar}
+              </Button>
+            </Tooltip>
+            <Tooltip title="Editar">
+              <Button
+                size="small"
+                aria-label={editar(identidad)}
+                disabled={bloqueada}
+                onClick={() => onEditar(unidad)}
+              >
+                {iconoEditar}
+              </Button>
+            </Tooltip>
             {/* Los logs solo se leen: no se bloquean con una operación en curso
                 sobre la fila (no encadenan nada destructivo). */}
-            <Button
-              size="small"
-              aria-label={`Logs ${identidad}`}
-              onClick={() => onVerRegistros(unidad)}
-            >
-              Logs
-            </Button>
+            <Tooltip title="Logs">
+              <Button size="small" aria-label={logs(identidad)} onClick={() => onVerRegistros(unidad)}>
+                {iconoLogs}
+              </Button>
+            </Tooltip>
             {/* El borrado es destructivo: la confirmación vive aquí y solo al
                 confirmarla se emite `onBorrar`; cancelar no sale de la fila.
                 La confirmación nombra el fichero real (identidad publicada por
@@ -237,14 +250,16 @@ export function TablaDeUnidades({
               okButtonProps={{ danger: true }}
               onConfirm={() => onBorrar(unidad)}
             >
-              <Button
-                size="small"
-                danger
-                aria-label={`Borrar ${identidad}`}
-                disabled={bloqueada}
-              >
-                Borrar
-              </Button>
+              <Tooltip title="Borrar">
+                <Button
+                  size="small"
+                  danger
+                  aria-label={borrar(identidad)}
+                  disabled={bloqueada}
+                >
+                  {iconoBorrar}
+                </Button>
+              </Tooltip>
             </Popconfirm>
           </Space>
         )

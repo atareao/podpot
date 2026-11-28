@@ -403,3 +403,42 @@ describe('TablaDeUnidades', () => {
     })
   })
 })
+
+describe('TablaDeUnidades — controles de acción con iconos', () => {
+  const ACCIONES = ['Arrancar', 'Parar', 'Reiniciar', 'Editar', 'Logs', 'Borrar']
+
+  function botonDeAccion(accion: string) {
+    return screen.getByRole('button', { name: `${accion} web.container` })
+  }
+
+  it('no muestra la palabra de la acción como texto visible dentro del control', () => {
+    tabla([unidad({ name: 'web.service', file_name: 'web.container' })])
+
+    for (const accion of ACCIONES) {
+      const boton = botonDeAccion(accion)
+
+      // No debe quedar texto visible de la acción dentro del botón.
+      expect(boton.textContent).not.toContain(accion)
+      // `getByText` tampoco debe localizar la etiqueta textual.
+      expect(screen.queryByText(accion)).not.toBeInTheDocument()
+    }
+  })
+
+  it('expone el nombre accesible de cada acción por su file_name', () => {
+    tabla([unidad({ name: 'web.service', file_name: 'web.container' })])
+
+    for (const accion of ACCIONES) {
+      expect(botonDeAccion(accion)).toBeInTheDocument()
+    }
+  })
+
+  it('presenta cada acción con un icono en lugar de texto', () => {
+    tabla([unidad({ name: 'web.service', file_name: 'web.container' })])
+
+    for (const accion of ACCIONES) {
+      const boton = botonDeAccion(accion)
+      const icono = boton.querySelector('svg, [role="img"], .anticon')
+      expect(icono).not.toBeNull()
+    }
+  })
+})
